@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stock Screener Pro</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Outfit:wght@500;700&display=swap"
+        rel="stylesheet">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Stock Screener <span class="accent">Pro</span></h1>
+            <p class="subtitle">AI-Powered Market Analysis</p>
+        </header>
+
+        <main>
+            <div class="controls">
+                <button id="screenBtn" class="primary-btn">
+                    <span class="btn-text">スクリーニング実行</span>
+                    <span class="loader hidden"></span>
+                </button>
+            </div>
+
+            <div id="resultsWrapper" class="results-wrapper hidden">
+                <div class="table-container">
+                    <table id="resultsTable">
+                        <thead>
+                            <tr>
+                                <th>コード</th>
+                                <th>ネーム</th>
+                                <th>株価</th>
+                                <th>前日比 (%)</th>
+                                <th>PER</th>
+                                <th>PBR</th>
+                            </tr>
+                        </thead>
+                        <tbody id="resultsBody">
+                            <!-- Results will be injected here -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="emptyState" class="empty-state">
+                <p>ボタンを押して最新のスクリーニング結果を表示します。</p>
+            </div>
+        </main>
+
+        <footer>
+            <p>&copy; 2026 Stock Screener Pro. All rights reserved.</p>
+        </footer>
+    </div>
+    <script src="script.js"></script>
+</body>
+
+</html>
