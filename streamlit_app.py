@@ -99,12 +99,15 @@ def get_history_list():
     if conn is None:
         return []
     try:
-        df = conn.read()
-        if df.empty or 'screening_id' not in df.columns:
+        # キャッシュを無効にして最新データを取得
+        df = conn.read(ttl=0)
+        if df is None or df.empty or 'screening_id' not in df.columns:
             return []
         ids = df['screening_id'].unique().tolist()
         return sorted(ids, reverse=True)
-    except Exception:
+    except Exception as e:
+        # エラー時はデバッグ用に表示（必要に応じて）
+        # st.sidebar.error(f"履歴取得エラー: {e}")
         return []
 
 def load_history(screening_id):
@@ -317,25 +320,35 @@ if 'result_df' not in st.session_state:
 with st.sidebar:
     st.subheader("スクリーニング操作")
     
-    # 履歴読み込みと削除
-    history_ids = get_history_list()
-    if history_ids:
-        selected_id = st.selectbox("履歴から読み込み", ["-- 選択してください --"] + history_ids)
-        if selected_id != "-- 選択してください --":
-            if st.session_state.get('last_loaded_id') != selected_id:
-                st.session_state.result_df = load_history(selected_id)
-                st.session_state.last_loaded_id = selected_id
+    # --- 履歴管理セクション ---
+    with st.expander("📂 履歴から読み込み", expanded=True):
+        history_ids = get_history_list()
+        if history_ids:
+            selected_id = st.selectbox("過去の結果を選択", ["-- 選択してください --"] + history_ids, key="history_select")
+            if selected_id != "-- 選択してください --":
+                if st.session_state.get('last_loaded_id') != selected_id:
+                    with st.spinner("読み込み中..."):
+                        st.session_state.result_df = load_history(selected_id)
+                        st.session_state.last_loaded_id = selected_id
+                    st.success(f"読み込み完了: {selected_id}")
             
-            # 削除機能
-            with st.expander("履歴の削除"):
-                st.warning("選択中の履歴を削除します。")
-                confirm_delete = st.checkbox("削除を確認")
-                if st.button("この履歴を完全に削除", type="primary", disabled=not confirm_delete, use_container_width=True):
+            # 削除機能 (読み込み時のみ表示)
+            if selected_id != "-- 選択してください --":
+                st.divider()
+                st.caption("履歴の削除")
+                confirm_delete = st.checkbox("この履歴を削除する", key="confirm_delete")
+                if st.button("完全に削除", type="primary", disabled=not confirm_delete, use_container_width=True):
                     if delete_history(selected_id):
-                        st.success(f"削除しました: {selected_id}")
+                        st.success("削除しました")
                         st.session_state.result_df = pd.DataFrame()
                         st.session_state.last_loaded_id = None
                         st.rerun()
+        else:
+            st.info("保存された履歴はありません。")
+            if st.button("履歴を再読込"):
+                st.rerun()
+
+    st.divider()
     
     # スクリーニング開始ボタン
     if st.button("スクリーニング開始", use_container_width=True):
