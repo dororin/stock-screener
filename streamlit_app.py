@@ -8,6 +8,10 @@ import io
 import base64
 import matplotlib.pyplot as plt
 import traceback
+import os
+import json
+from datetime import datetime
+from streamlit_gsheets import GSheetsConnection
 
 # --- ページ設定 ---
 st.set_page_config(
@@ -15,6 +19,40 @@ st.set_page_config(
     page_icon="📈",
     layout="wide"
 )
+
+# --- カスタムCSS (デザインのコンパクト化) ---
+st.markdown("""
+    <style>
+    /* 全体のフォントサイズ縮小 */
+    html, body, [class*="st-"] {
+        font-size: 0.95rem !important;
+    }
+    /* メトリクスの余白とサイズ調整 */
+    [data-testid="stMetricValue"] {
+        font-size: 1.1rem !important;
+        font-weight: 600;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.8rem !important;
+    }
+    /* カードの余白削減 */
+    .stMainContainer {
+        padding-top: 2rem !important;
+    }
+    .stVerticalBlock {
+        gap: 0.5rem !important;
+    }
+    /* セクション間の区切り線を細く */
+    hr {
+        margin: 0.8rem 0 !important;
+    }
+    /* サブヘッダーのサイズ調整 */
+    h3 {
+        font-size: 1.1rem !important;
+        margin-bottom: 0.3rem !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
 # --- パラメータ設定 (TradingViewの設定に合わせる) ---
 pdh = 11       # WVFの期間 (LookBack Period)
@@ -25,6 +63,71 @@ ph = 0.85      # 最高値の係数 (Highest Percentile - e.g. 0.85 = 85%)
 SMA_LONG_PERIOD = 200 # トレンドフィルター用移動平均線
 SMA_MID_PERIOD = 50   # チャート表示用移動平均線
 threshold = 2.0 # WVFの閾値
+
+# --- 保存・読み込み設定 (Google Sheets) ---
+# ※ .streamlit/secrets.toml または Streamlit Cloud の Secrets 設定が必要
+try:
+    conn = st.connection("gsheets", type=GSheetsConnection)
+except Exception:
+    conn = None
+
+def save_history(df):
+    """結果をGoogle Sheetsに保存 (1銘柄1行)"""
+    if conn is None:
+        st.error("Google Sheets への接続設定が見つかりません。")
+        return None
+        
+    screening_id = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # 保存用データフレームの作成
+    save_df = df.copy()
+    save_df['screening_id'] = screening_id
+    
+    # 既存データの取得
+    try:
+        existing_data = conn.read()
+        updated_data = pd.concat([existing_data, save_df], ignore_index=True)
+    except Exception:
+        # シートが空、または初回の場合
+        updated_data = save_df
+        
+    conn.update(data=updated_data)
+    return screening_id
+
+def get_history_list():
+    """保存されたIDのリストを取得（新しい順）"""
+    if conn is None:
+        return []
+    try:
+        df = conn.read()
+        if df.empty or 'screening_id' not in df.columns:
+            return []
+        ids = df['screening_id'].unique().tolist()
+        return sorted(ids, reverse=True)
+    except Exception:
+        return []
+
+def load_history(screening_id):
+    """Google Sheetsから指定IDのデータを読み込み"""
+    if conn is None:
+        return pd.DataFrame()
+    try:
+        df = conn.read()
+        return df[df['screening_id'] == screening_id].copy()
+    except Exception:
+        return pd.DataFrame()
+
+def delete_history(screening_id):
+    """Google Sheetsから指定IDのデータを削除"""
+    if conn is None:
+        return False
+    try:
+        df = conn.read()
+        new_df = df[df['screening_id'] != screening_id].copy()
+        conn.update(data=new_df)
+        return True
+    except Exception:
+        return False
 
 # --- チャート画像生成関数 ---
 def generate_mini_chart_base64(df):
@@ -90,9 +193,24 @@ def analyze_market_streamlit(df_jpx):
     status_text = st.empty()
 
     try:
-        status_text.text("株価データを一括ダウンロード中...")
-        # auto_adjust=False で調整前終値を取得
-        data = yf.download(tickers, period="1y", interval="1d", group_by='ticker', auto_adjust=False, threads=True)
+        status_text.text("株価データをダウンロード中 (分割取得)...")
+        # 銘柄をバッチに分けてダウンロード (Windowsの Errno 22 / CPU100% 回避)
+        batch_size = 50
+        all_dfs = []
+        for i in range(0, len(tickers), batch_size):
+            batch = tickers[i : i + batch_size]
+            status_text.text(f"ダウンロード中... ({i}〜{min(i+batch_size, len(tickers))} / {len(tickers)})")
+            # threads=True を維持しつつバッチ化
+            batch_data = yf.download(batch, period="1y", interval="1d", group_by='ticker', auto_adjust=False, threads=True, progress=False)
+            if not batch_data.empty:
+                all_dfs.append(batch_data)
+        
+        if not all_dfs:
+            st.error("データの取得に失敗しました。")
+            return pd.DataFrame()
+            
+        # ダウンロードしたデータを結合
+        data = pd.concat(all_dfs, axis=1)
     except Exception as e:
         st.error(f"データダウンロードエラー: {e}")
         return pd.DataFrame()
@@ -166,8 +284,10 @@ def analyze_market_streamlit(df_jpx):
                 ext_price_thresh = latest['highest_close'] * (1 - threshold / 100)
                 
                 # シグナルは「upperBand または rangeHigh」のいずれかを越えていれば点灯するため、
-                # 消灯するには「両方を下回る」必要があります。よって、より高い方の価格（安値がそこまで上がれば両方下回る）を採用。
-                extinction_price = max(ext_price_upper, ext_price_range, ext_price_thresh)
+                # 消灯するには「その高い方の価格を下回る」必要があります。
+                # ただし、そもそも WVF が閾値 (threshold) を下回れば消灯するため、
+                # 「(UpperかRangeHighを割る) か (Thresholdを割る)」のいずれか早い方（低い価格）が目安となります。
+                extinction_price = min(max(ext_price_upper, ext_price_range), ext_price_thresh)
 
                 results.append({
                     'チャート': img_base64,
@@ -189,7 +309,52 @@ def analyze_market_streamlit(df_jpx):
     status_text.empty()
     return pd.DataFrame(results)
 
-# --- UI実装 ---
+# --- セッション状態の初期化 ---
+if 'result_df' not in st.session_state:
+    st.session_state.result_df = pd.DataFrame()
+
+# --- サイドバー UI ---
+with st.sidebar:
+    st.subheader("スクリーニング操作")
+    
+    # 履歴読み込みと削除
+    history_ids = get_history_list()
+    if history_ids:
+        selected_id = st.selectbox("履歴から読み込み", ["-- 選択してください --"] + history_ids)
+        if selected_id != "-- 選択してください --":
+            if st.session_state.get('last_loaded_id') != selected_id:
+                st.session_state.result_df = load_history(selected_id)
+                st.session_state.last_loaded_id = selected_id
+            
+            # 削除機能
+            with st.expander("履歴の削除"):
+                st.warning("選択中の履歴を削除します。")
+                confirm_delete = st.checkbox("削除を確認")
+                if st.button("この履歴を完全に削除", type="primary", disabled=not confirm_delete, use_container_width=True):
+                    if delete_history(selected_id):
+                        st.success(f"削除しました: {selected_id}")
+                        st.session_state.result_df = pd.DataFrame()
+                        st.session_state.last_loaded_id = None
+                        st.rerun()
+    
+    # スクリーニング開始ボタン
+    if st.button("スクリーニング開始", use_container_width=True):
+        df_jpx = get_jpx_list()
+        if not df_jpx.empty:
+            st.session_state.result_df = analyze_market_streamlit(df_jpx)
+            st.session_state.last_loaded_id = None # 新規実行時はIDなし
+            if st.session_state.result_df.empty:
+                st.warning("該当する銘柄はありませんでした。")
+    
+    # 保存ボタン (結果がある場合のみ表示)
+    if not st.session_state.result_df.empty:
+        if st.button("スクリーニング結果を保存", use_container_width=True):
+            saved_id = save_history(st.session_state.result_df)
+            if saved_id:
+                st.success(f"保存しました: {saved_id}")
+                st.rerun()
+
+# --- メインコンテンツ UI ---
 st.title("WVF + Trend Screener :blue[Pro]")
 st.markdown("""
 Google Colabで実行していたスクリーニングをWebアプリ化しました。
@@ -197,34 +362,36 @@ Google Colabで実行していたスクリーニングをWebアプリ化しま�
 - **最新データ反映**: yfinanceの仕様に合わせて最新の営業日データを取得するように調整済みです。
 """)
 
-if st.sidebar.button("スクリーニング開始"):
-    df_jpx = get_jpx_list()
-    if not df_jpx.empty:
-        result_df = analyze_market_streamlit(df_jpx)
-        
-        if not result_df.empty:
-            st.success(f"該当銘柄が {len(result_df)} 銘柄見つかりました。")
-            
-            # 各銘柄をカード形式で表示
-            for idx, row in result_df.iterrows():
-                with st.container():
-                    col1, col2 = st.columns([1, 3])
-                    with col1:
-                        if row['チャート']:
-                            st.image(row['チャート'], caption=f"{row['コード']} {row['銘柄']}")
-                    with col2:
-                        st.subheader(f"{row['コード']} {row['銘柄']}")
-                        metrics_cols = st.columns(6)
-                        metrics_cols[0].metric("シグナル日", row['シグナル日'])
-                        metrics_cols[1].metric("現在値", f"¥{row['現在値']:,.1f}")
-                        metrics_cols[2].metric("消灯目安(安値)", f"¥{row['消灯目安(安値)']:,.1f}")
-                        metrics_cols[3].metric("200日線乖離", f"{row['乖離率(%)']}%")
-                        metrics_cols[4].metric("WVF", row['WVF'])
-                        metrics_cols[5].metric("WVF Upper", row['WVF Upper'])
+if not st.session_state.result_df.empty:
+    result_df = st.session_state.result_df
+    st.success(f"該当銘柄が {len(result_df)} 銘柄見つかりました。")
+    
+    # 銘柄を縦2列（PC時）に並べるためのロジック
+    for i in range(0, len(result_df), 2):
+        cols = st.columns(2)
+        for j in range(2):
+            if i + j < len(result_df):
+                row = result_df.iloc[i + j]
+                with cols[j]:
+                    card_container = st.container(border=True) # 枠線を追加して見やすく
+                    with card_container:
+                        title_col, link_col = st.columns([4, 1])
+                        title_col.subheader(f"{row['コード']} {row['銘柄']}")
+                        link_col.markdown(f"[TVで表示](https://jp.tradingview.com/chart/?symbol=TSE%3A{row['コード']})")
                         
-                        st.markdown(f"[TradingViewで表示](https://jp.tradingview.com/chart/?symbol=TSE%3A{row['コード']})")
-                st.divider()
-        else:
-            st.warning("該当する銘柄はありませんでした。")
+                        img_col, info_col = st.columns([1, 2])
+                        with img_col:
+                            if row['チャート']:
+                                st.image(row['チャート'], use_container_width=True) # 幅いっぱいに
+                        with info_col:
+                            m_cols = st.columns(3)
+                            m_cols[0].metric("現在値", f"¥{row['現在値']:,.1f}" if isinstance(row['現在値'], (int, float)) else row['現在値'])
+                            m_cols[1].metric("消灯目安", f"¥{row['消灯目安(安値)']:,.1f}" if isinstance(row['消灯目安(安値)'], (int, float)) else row['消灯目安(安値)'])
+                            m_cols[2].metric("200日乖離", f"{row['乖離率(%)']}%")
+                            
+                            m_cols2 = st.columns(3)
+                            m_cols2[0].metric("WVF", row['WVF'])
+                            m_cols2[1].metric("WVF Upper", row['WVF Upper'])
+                            m_cols2[2].metric("シグナル日", row['シグナル日'])
 else:
-    st.info("左の「スクリーニング開始」ボタンを押してください。")
+    st.info("左の「スクリーニング開始」ボタンを押すか、履歴から読み込んでください。")

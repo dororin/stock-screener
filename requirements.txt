@@ -6,3 +6,4 @@ mplfinance
 matplotlib
 xlrd
 openpyxl
+st-gsheets-connection
