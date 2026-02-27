@@ -38,3 +38,5 @@ ENV/
 # Project specific
 *.log
 .env
+
+secrets.toml
