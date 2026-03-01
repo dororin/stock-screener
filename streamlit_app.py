@@ -116,7 +116,11 @@ def load_history(screening_id):
         return pd.DataFrame()
     try:
         df = conn.read()
-        return df[df['screening_id'] == screening_id].copy()
+        target_df = df[df['screening_id'] == screening_id].copy()
+        # 銘柄コードの整形 (.0 が付くのを防止)
+        if not target_df.empty and 'コード' in target_df.columns:
+            target_df['コード'] = target_df['コード'].astype(str).str.replace(r'\.0$', '', regex=True)
+        return target_df
     except Exception:
         return pd.DataFrame()
 
@@ -388,9 +392,9 @@ if not st.session_state.result_df.empty:
                 with cols[j]:
                     card_container = st.container(border=True) # 枠線を追加して見やすく
                     with card_container:
-                        title_col, link_col = st.columns([4, 1])
-                        title_col.subheader(f"{row['コード']} {row['銘柄']}")
-                        link_col.markdown(f"[TVで表示](https://jp.tradingview.com/chart/?symbol=TSE%3A{row['コード']})")
+                        # 銘柄コードをTradingViewへのリンクにする
+                        tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{row['コード']}"
+                        st.subheader(f"[{row['コード']}]({tv_url}) {row['銘柄']}")
                         
                         img_col, info_col = st.columns([1, 2])
                         with img_col:
