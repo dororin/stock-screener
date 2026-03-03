@@ -236,7 +236,8 @@ def analyze_market_streamlit(df_jpx):
                 df = data.copy()
 
             df.dropna(how='all', inplace=True)
-            if len(df) < SMA_LONG_PERIOD + pdh:
+            # 200日線 + 傾き計算用(20日) のデータを確保
+            if len(df) < SMA_LONG_PERIOD + 20:
                 continue
 
             # カラム名の正規化
@@ -263,9 +264,18 @@ def analyze_market_streamlit(df_jpx):
             latest = df.iloc[-1]
             prev = df.iloc[-2]
             
+            # --- 200MAの傾き計算 (直近20日間) ---
+            sma200_window = df['sma200'].tail(20).values
+            x = np.arange(len(sma200_window))
+            slope, _ = np.polyfit(x, sma200_window, 1)
+            # 傾きを価格で割って正規化 (率にする)
+            slope_rate = slope / latest['close']
+
             # 条件判定
-            # 上昇トレンド
-            is_uptrend = latest['close'] > latest['sma200'] and latest['sma50'] > latest['sma200']
+            # 上昇トレンド判定の変更 (以下のどちらかを満たせばOK)
+            # 1. 200日移動平均線より当日の価格が上か
+            # 2. 200MAの傾き率が -0.0001 以上 (上昇または横ばい)
+            is_uptrend = (latest['close'] > latest['sma200']) or (slope_rate >= -0.0001)
             
             # 当日点灯（本日バンドを上回っている、またはrangeHighを上回っている銘柄を抽出）
             is_wvf_lit = latest['wvf'] >= latest['wvf_upper'] or latest['wvf'] >= latest['range_high']
@@ -305,6 +315,7 @@ def analyze_market_streamlit(df_jpx):
                     '消灯目安(安値)': round(extinction_price, 1),
                     'SMA200': round(latest['sma200'], 1),
                     '乖離率(%)': round((latest['close'] - latest['sma200']) / latest['sma200'] * 100, 2),
+                    '200MA傾き率': round(slope_rate, 6),
                     'WVF': round(latest['wvf'], 2),
                     'WVF Upper': round(latest['wvf_upper'], 2)
                 })
@@ -406,9 +417,10 @@ if not st.session_state.result_df.empty:
                             m_cols[1].metric("消灯目安", f"¥{row['消灯目安(安値)']:,.1f}" if isinstance(row['消灯目安(安値)'], (int, float)) else row['消灯目安(安値)'])
                             m_cols[2].metric("200日乖離", f"{row['乖離率(%)']}%")
                             
-                            m_cols2 = st.columns(3)
+                            m_cols2 = st.columns(4)
                             m_cols2[0].metric("WVF", row['WVF'])
                             m_cols2[1].metric("WVF Upper", row['WVF Upper'])
-                            m_cols2[2].metric("シグナル日", row['シグナル日'])
+                            m_cols2[2].metric("200MA傾き率", f"{row['200MA傾き率']:.5f}")
+                            m_cols2[3].metric("シグナル日", row['シグナル日'])
 else:
     st.info("左の「スクリーニング開始」ボタンを押すか、履歴から読み込んでください。")
