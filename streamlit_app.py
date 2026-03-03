@@ -120,6 +120,9 @@ def load_history(screening_id):
         # 銘柄コードの整形 (.0 が付くのを防止)
         if not target_df.empty and 'コード' in target_df.columns:
             target_df['コード'] = target_df['コード'].astype(str).str.replace(r'\.0$', '', regex=True)
+        # お気に入りカラムの存在確認と初期化
+        if not target_df.empty and 'お気に入り' not in target_df.columns:
+            target_df['お気に入り'] = False
         return target_df
     except Exception:
         return pd.DataFrame()
@@ -317,7 +320,8 @@ def analyze_market_streamlit(df_jpx):
                     '乖離率(%)': round((latest['close'] - latest['sma200']) / latest['sma200'] * 100, 2),
                     '200MA傾き率': round(slope_rate, 6),
                     'WVF': round(latest['wvf'], 2),
-                    'WVF Upper': round(latest['wvf_upper'], 2)
+                    'WVF Upper': round(latest['wvf_upper'], 2),
+                    'お気に入り': False
                 })
 
         except Exception as e:
@@ -405,7 +409,19 @@ if not st.session_state.result_df.empty:
                     with card_container:
                         # 銘柄コードをTradingViewへのリンクにする
                         tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{row['コード']}"
-                        st.subheader(f"[{row['コード']}]({tv_url}) {row['銘柄']}")
+                        
+                        # お気に入り(星)と銘柄名を表示
+                        title_col, fav_col = st.columns([0.85, 0.15])
+                        with title_col:
+                            st.subheader(f"[{row['コード']}]({tv_url}) {row['銘柄']}")
+                        with fav_col:
+                            # インデックスを使ってユニークなキーを作成
+                            fav_key = f"fav_{row['コード']}_{i+j}"
+                            # toggleを使って星マークを表現
+                            is_fav = st.toggle("⭐", value=row['お気に入り'], key=fav_key, label_visibility="collapsed")
+                            # セッション状態を更新
+                            if is_fav != row['お気に入り']:
+                                st.session_state.result_df.at[i + j, 'お気に入り'] = is_fav
                         
                         img_col, info_col = st.columns([1, 2])
                         with img_col:
