@@ -62,7 +62,7 @@ lb = 100       # rangeHighのルックバック期間 (Look Back Period Percenti
 ph = 0.85      # 最高値の係数 (Highest Percentile - e.g. 0.85 = 85%)
 SMA_LONG_PERIOD = 200 # トレンドフィルター用移動平均線
 SMA_MID_PERIOD = 50   # チャート表示用移動平均線
-threshold = 2.0 # WVFの閾値
+threshold = 5.0 # WVFの閾値
 
 # --- 保存・読み込み設定 (Google Sheets) ---
 # ※ .streamlit/secrets.toml または Streamlit Cloud の Secrets 設定が必要
@@ -210,8 +210,7 @@ def analyze_market_streamlit(df_jpx):
         for i in range(0, len(tickers), batch_size):
             batch = tickers[i : i + batch_size]
             status_text.text(f"ダウンロード中... ({i}〜{min(i+batch_size, len(tickers))} / {len(tickers)})")
-            # threads=True を維持しつつバッチ化
-            batch_data = yf.download(batch, period="1y", interval="1d", group_by='ticker', auto_adjust=False, threads=True, progress=False)
+            batch_data = yf.download(batch, period="1y", interval="1d", group_by='ticker', auto_adjust=False, actions=True, threads=True, progress=False)
             if not batch_data.empty:
                 all_dfs.append(batch_data)
         
@@ -252,12 +251,24 @@ def analyze_market_streamlit(df_jpx):
                     new_cols.append(str(c).lower())
             df.columns = new_cols
 
+            if 'stock splits' in df.columns:
+                # 0以外の分割情報を抽出し、累積比率を逆算（現在を1.0として過去を修正）
+                splits = df['stock splits'].copy()
+                splits.replace(0, 1, inplace=True)
+                # 過去に遡って累積の分割係数を計算
+                df['split_factor'] = (1 / splits).iloc[::-1].cumprod().iloc[::-1]
+                df['split_factor'] = df['split_factor'].shift(-1).fillna(1.0)
+                
+                # 4値を分割修正（配当落ちは含まない）
+                for col in ['open', 'high', 'low', 'close']:
+                    df[col] = df[col] * df['split_factor']
+            
             # ロジック計算
             df['sma50'] = df['close'].rolling(window=SMA_MID_PERIOD).mean()
             df['sma200'] = df['close'].rolling(window=SMA_LONG_PERIOD).mean()
             df['highest_close'] = df['close'].rolling(window=pdh).max()
             df['wvf'] = (df['highest_close'] - df['low']) / df['highest_close'] * 100
-            df['wvf_std'] = df['wvf'].rolling(window=bbl).std()
+            df['wvf_std'] = df['wvf'].rolling(window=bbl).std(ddof=0) # ddof=0 で計算精度を同期
             df['wvf_mid'] = df['wvf'].rolling(window=bbl).mean()
             df['wvf_upper'] = df['wvf_mid'] + (mult * df['wvf_std'])
             # PINEスクリプトの rangeHigh ロジックを追加
