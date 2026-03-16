@@ -188,11 +188,11 @@ def get_jpx_list():
         return pd.DataFrame()
 
 # --- 分析実行関数 ---
-def analyze_market_streamlit(df_jpx):
-    if df_jpx.empty:
+def analyze_market_streamlit(df_targets):
+    if df_targets.empty:
         return pd.DataFrame()
 
-    tickers = [f"{code}.T" for code in df_jpx['symbol'].tolist()]
+    tickers = [f"{code}.T" for code in df_targets['symbol'].tolist()]
     total_count = len(tickers)
     
     st.info(f"対象銘柄数: {total_count} の分析を開始します...")
@@ -299,7 +299,8 @@ def analyze_market_streamlit(df_jpx):
 
             if is_uptrend and is_wvf_lit and is_above_threshold:
                 code_num = int(ticker_symbol.replace('.T', ''))
-                stock_name = df_jpx[df_jpx['symbol'] == code_num]['name'].values[0]
+                matching_rows = df_targets[df_targets['symbol'] == code_num]
+                stock_name = matching_rows['name'].values[0] if not matching_rows.empty else "-"
                 
                 # シグナル日（最新データの日付）
                 signal_date = latest.name.strftime('%Y-%m-%d')
@@ -380,11 +381,56 @@ with st.sidebar:
 
     st.divider()
     
+    st.subheader("対象銘柄リスト")
+    list_source = st.radio("取得元を選択", ["JPX (TOPIX)", "CSVファイルアップロード"], label_visibility="collapsed")
+    
+    csv_file = None
+    if list_source == "CSVファイルアップロード":
+        csv_file = st.file_uploader("CSVファイルを選択", type=["csv"], help="「コード」や「銘柄コード」といった列が含まれている必要があります。")
+    
     # スクリーニング開始ボタン
     if st.button("スクリーニング開始", use_container_width=True):
-        df_jpx = get_jpx_list()
-        if not df_jpx.empty:
-            st.session_state.result_df = analyze_market_streamlit(df_jpx)
+        df_targets = pd.DataFrame()
+        if list_source == "JPX (TOPIX)":
+            df_targets = get_jpx_list()
+        else:
+            if csv_file is not None:
+                try:
+                    # CSVの読み込み。エンコーディングはShift-JISも考慮
+                    try:
+                        df_csv = pd.read_csv(csv_file)
+                    except UnicodeDecodeError:
+                        csv_file.seek(0)
+                        df_csv = pd.read_csv(csv_file, encoding='shift_jis')
+                        
+                    code_col = None
+                    # コード列を探す
+                    for col in ["コード", "銘柄コード", "symbol", "Code", "Ticker"]:
+                        if col in df_csv.columns:
+                            code_col = col
+                            break
+                    if code_col is None:
+                        code_col = df_csv.columns[0] # 見つからない場合は1列目を強制的にコードとする
+                    
+                    df_targets['symbol'] = pd.to_numeric(df_csv[code_col], errors='coerce').dropna().astype(int)
+                    
+                    name_col = None
+                    for col in ["銘柄", "銘柄名", "名称", "name", "Name"]:
+                        if col in df_csv.columns:
+                            name_col = col
+                            break
+                    if name_col:
+                        df_targets['name'] = df_csv[name_col]
+                    else:
+                        df_targets['name'] = "-"
+                        
+                except Exception as e:
+                    st.error(f"CSVファイルの読み込みエラー: {e}")
+            else:
+                st.warning("CSVファイルがアップロードされていません。")
+
+        if not df_targets.empty:
+            st.session_state.result_df = analyze_market_streamlit(df_targets)
             st.session_state.last_loaded_id = None # 新規実行時はIDなし
             if st.session_state.result_df.empty:
                 st.warning("該当する銘柄はありませんでした。")
