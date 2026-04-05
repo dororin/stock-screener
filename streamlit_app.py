@@ -226,6 +226,10 @@ def plot_saitei_and_nikkei(saitei_df):
     if saitei_df.empty:
         return None
     
+    # 日付の型変換 (GSheetsから読み込まれた際に文字列になっている可能性があるため)
+    saitei_df = saitei_df.copy()
+    saitei_df['Date'] = pd.to_datetime(saitei_df['Date'])
+    
     # 期間の取得
     start_date = saitei_df['Date'].min()
     end_date = saitei_df['Date'].max() + pd.Timedelta(days=7)
