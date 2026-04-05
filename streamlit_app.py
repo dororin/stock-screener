@@ -265,8 +265,12 @@ def plot_saitei_and_nikkei(saitei_df):
             temp_saitei = saitei_df.copy()
             temp_saitei.columns = [str(c).lower() for c in temp_saitei.columns]
             
+            # 日付の精度を「日」単位に統一 (マイクロ秒[us]と秒[s]の混在エラー回避)
+            temp_saitei['date'] = pd.to_datetime(temp_saitei['date']).dt.floor('D')
+            
             temp_n225 = n225[['date', 'close']].copy()
             temp_n225.columns = ['date', 'n225_close']
+            temp_n225['date'] = pd.to_datetime(temp_n225['date']).dt.floor('D')
             
             # 直近の日足終値でマージして比率を算出 (重複日付排除とソートを徹底)
             ratio_df = pd.merge_asof(
