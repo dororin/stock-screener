@@ -12,6 +12,10 @@ import os
 import json
 from datetime import datetime
 from streamlit_gsheets import GSheetsConnection
+import requests
+from bs4 import BeautifulSoup
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # --- ページ設定 ---
 st.set_page_config(
@@ -138,6 +142,108 @@ def delete_history(screening_id):
         return True
     except Exception:
         return False
+
+# --- マーケット情報用機能 ---
+def parse_jp_amount(text):
+    text = str(text).replace('億円', '').replace(',', '').strip()
+    if '兆' in text:
+        parts = text.split('兆')
+        trillion = int(parts[0]) if parts[0] else 0
+        hundred_mil = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+        return trillion * 10000 + hundred_mil
+    else:
+        try:
+            return int(text)
+        except:
+            return 0
+
+def fetch_saitei_data():
+    url = "https://karauri.net/saitei/"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    res = requests.get(url, headers=headers)
+    res.encoding = 'utf-8'
+    soup = BeautifulSoup(res.text, "html.parser")
+    tables = soup.find_all("table")
+    data = []
+    if tables:
+        rows = tables[0].find_all("tr")
+        for row in rows[1:]:
+            cols = [td.text.strip() for td in row.find_all(["td", "th"])]
+            if len(cols) >= 3:
+                date_str = cols[0].replace('年', '-').replace('月', '-').replace('日', '')
+                sell_amt = cols[1]
+                buy_amt = cols[2]
+                data.append({'Date': date_str, 'Sell(Oku-yen)': parse_jp_amount(sell_amt), 'Buy(Oku-yen)': parse_jp_amount(buy_amt)})
+    df = pd.DataFrame(data)
+    if not df.empty:
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.sort_values('Date').reset_index(drop=True)
+    return df
+
+def update_and_load_saitei_data():
+    if conn is None:
+        st.error("Google Sheets への接続設定が見つかりません。")
+        return pd.DataFrame()
+    try:
+        existing_df = conn.read(worksheet="saitei_data", ttl=0)
+    except Exception:
+        existing_df = pd.DataFrame(columns=['Date', 'Sell(Oku-yen)', 'Buy(Oku-yen)'])
+    
+    web_df = fetch_saitei_data()
+    if web_df.empty:
+        return existing_df
+    
+    if not existing_df.empty and 'Date' in existing_df.columns:
+        existing_df['Date'] = pd.to_datetime(existing_df['Date'])
+        merged_df = pd.concat([existing_df, web_df]).drop_duplicates(subset=['Date'], keep='last')
+        merged_df = merged_df.sort_values('Date').reset_index(drop=True)
+    else:
+        merged_df = web_df.copy()
+        
+    try:
+        save_df = merged_df.copy()
+        save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
+        conn.update(worksheet="saitei_data", data=save_df)
+    except Exception as e:
+        st.error(f"裁定残データの保存に失敗しました: {e}")
+        
+    return merged_df
+
+def plot_saitei_and_nikkei(saitei_df):
+    if saitei_df.empty:
+        return None
+    start_date = saitei_df['Date'].min()
+    end_date = saitei_df['Date'].max() + pd.Timedelta(days=7)
+    
+    n225 = yf.download('^N225', start=start_date, end=end_date, interval='1wk', progress=False)
+    if not n225.empty:
+        n225.reset_index(inplace=True)
+        if isinstance(n225.columns, pd.MultiIndex):
+            n225.columns = [c[0] for c in n225.columns]
+        n225.rename(columns={'index': 'Date', 'Date': 'Date'}, inplace=True)
+        if 'Date' in n225.columns:
+            n225['Date'] = pd.to_datetime(n225['Date']).dt.tz_localize(None)
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.05, row_heights=[0.6, 0.4],
+                        subplot_titles=('日経平均 (週足)', '裁定買残 (億円)'))
+                        
+    if not n225.empty and 'Date' in n225.columns:
+        fig.add_trace(go.Candlestick(x=n225['Date'],
+                                    open=n225['Open'], high=n225['High'],
+                                    low=n225['Low'], close=n225['Close'],
+                                    name='N225'), row=1, col=1)
+                                    
+    fig.add_trace(go.Bar(x=saitei_df['Date'], y=saitei_df['Buy(Oku-yen)'],
+                         name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
+                         
+    fig.update_layout(height=650, margin=dict(l=20, r=20, t=40, b=20),
+                      xaxis_rangeslider_visible=False,
+                      showlegend=False,
+                      dragmode='zoom')
+    # Update axes to link hovering
+    fig.update_xaxes(spikemode='across', spikethickness=1, spikedash='solid', spikecolor='grey')
+    return fig
 
 # --- チャート画像生成関数 ---
 def generate_mini_chart_base64(df):
@@ -346,6 +452,31 @@ def analyze_market_streamlit(df_targets):
 # --- セッション状態の初期化 ---
 if 'result_df' not in st.session_state:
     st.session_state.result_df = pd.DataFrame()
+if 'saitei_df' not in st.session_state:
+    st.session_state.saitei_df = pd.DataFrame()
+
+# --- サイドバー ナビゲーション ---
+with st.sidebar:
+    selected_page = st.radio("画面選択", ["スクリーニング", "マーケット情報"])
+    st.divider()
+
+if selected_page == "マーケット情報":
+    st.title("📈 マーケット情報")
+    if st.button("データ取得・更新", type="primary"):
+        with st.spinner("データを取得・更新中... (初回は時間がかかる場合があります)"):
+            df = update_and_load_saitei_data()
+            if not df.empty:
+                st.session_state.saitei_df = df
+                st.success("最新データを読み込みました。")
+    
+    if not st.session_state.saitei_df.empty:
+        fig = plot_saitei_and_nikkei(st.session_state.saitei_df)
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("上の「データ取得・更新」ボタンを押して最新データを取得してください。")
+    
+    st.stop() # ここで実行を停止し、スクリーニング側のUIを描画しない
 
 # --- サイドバー UI ---
 with st.sidebar:

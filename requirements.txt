@@ -7,3 +7,6 @@ matplotlib
 xlrd
 openpyxl
 st-gsheets-connection
+plotly
+requests
+beautifulsoup4
