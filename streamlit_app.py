@@ -143,7 +143,9 @@ def delete_history(screening_id):
     except Exception:
         return False
 
-# --- マーケット情報用機能 ---
+# --- マーケット情報用定数 ---
+MARKET_DATA_URL = "https://docs.google.com/spreadsheets/d/1vaX2dKcHO_fo_KMffNiC98pY1fzfMkHCRkHE1IFE0PI/edit"
+
 def parse_jp_amount(text):
     text = str(text).replace('億円', '').replace(',', '').strip()
     if '兆' in text:
@@ -170,10 +172,15 @@ def fetch_saitei_data():
         for row in rows[1:]:
             cols = [td.text.strip() for td in row.find_all(["td", "th"])]
             if len(cols) >= 3:
+                # 日付形式の統一
                 date_str = cols[0].replace('年', '-').replace('月', '-').replace('日', '')
                 sell_amt = cols[1]
                 buy_amt = cols[2]
-                data.append({'Date': date_str, 'Sell(Oku-yen)': parse_jp_amount(sell_amt), 'Buy(Oku-yen)': parse_jp_amount(buy_amt)})
+                data.append({
+                    'Date': date_str, 
+                    'Sell(Oku-yen)': parse_jp_amount(sell_amt), 
+                    'Buy(Oku-yen)': parse_jp_amount(buy_amt)
+                })
     df = pd.DataFrame(data)
     if not df.empty:
         df['Date'] = pd.to_datetime(df['Date'])
@@ -184,8 +191,10 @@ def update_and_load_saitei_data():
     if conn is None:
         st.error("Google Sheets への接続設定が見つかりません。")
         return pd.DataFrame()
+        
     try:
-        existing_df = conn.read(worksheet="saitei_data", ttl=0)
+        # マーケットデータ専用の別ファイルを読み込み
+        existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", ttl=0)
     except Exception:
         existing_df = pd.DataFrame(columns=['Date', 'Sell(Oku-yen)', 'Buy(Oku-yen)'])
     
@@ -203,37 +212,62 @@ def update_and_load_saitei_data():
     try:
         save_df = merged_df.copy()
         save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
-        conn.update(worksheet="saitei_data", data=save_df)
+        # マーケットデータ専用の別ファイルへ保存
+        conn.update(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", data=save_df)
     except Exception as e:
-        st.error(f"裁定残データの保存に失敗しました: {e}")
+        if "saitei_data" in str(e):
+             st.error(f"新しいスプレッドシート（marketdata）の中に 'saitei_data' という名前のタブが見つかりません。タブ名を正確に設定しているか確認してください。")
+        else:
+             st.error(f"裁定残データの保存に失敗しました: {e}")
         
     return merged_df
 
 def plot_saitei_and_nikkei(saitei_df):
     if saitei_df.empty:
         return None
+    
+    # 期間の取得
     start_date = saitei_df['Date'].min()
     end_date = saitei_df['Date'].max() + pd.Timedelta(days=7)
     
-    n225 = yf.download('^N225', start=start_date, end=end_date, interval='1wk', progress=False)
-    if not n225.empty:
-        n225.reset_index(inplace=True)
-        if isinstance(n225.columns, pd.MultiIndex):
-            n225.columns = [c[0] for c in n225.columns]
-        n225.rename(columns={'index': 'Date', 'Date': 'Date'}, inplace=True)
-        if 'Date' in n225.columns:
-            n225['Date'] = pd.to_datetime(n225['Date']).dt.tz_localize(None)
+    # 日経平均データの取得 (Ticker.historyの方が安定しているため切り替え)
+    try:
+        n225_ticker = yf.Ticker('^N225')
+        n225 = n225_ticker.history(start=start_date, end=end_date, interval='1wk')
+        if n225.empty:
+            # historyが空の場合のフォールバック
+            n225 = yf.download('^N225', start=start_date, end=end_date, interval='1wk', progress=False)
+            
+        if not n225.empty:
+            n225.reset_index(inplace=True)
+            # カラム名の正規化 (MultiIndex対応 & 小文字化して安定させる)
+            new_cols = []
+            for c in n225.columns:
+                if isinstance(c, tuple):
+                    new_cols.append(c[0].lower())
+                else:
+                    new_cols.append(str(c).lower())
+            n225.columns = new_cols
+            
+            # 日付のクリーニング
+            if 'date' in n225.columns:
+                n225['date'] = pd.to_datetime(n225['date']).dt.tz_localize(None)
+    except Exception as e:
+        st.warning(f"日経平均データの取得中にエラーが発生しました: {e}")
+        n225 = pd.DataFrame()
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.05, row_heights=[0.6, 0.4],
+                        vertical_spacing=0.08, row_heights=[0.6, 0.4],
                         subplot_titles=('日経平均 (週足)', '裁定買残 (億円)'))
                         
-    if not n225.empty and 'Date' in n225.columns:
-        fig.add_trace(go.Candlestick(x=n225['Date'],
-                                    open=n225['Open'], high=n225['High'],
-                                    low=n225['Low'], close=n225['Close'],
-                                    name='N225'), row=1, col=1)
+    # 上段: 日経平均ローソク足
+    if not n225.empty and 'date' in n225.columns:
+        fig.add_trace(go.Candlestick(x=n225['date'],
+                                    open=n225['open'], high=n225['high'],
+                                    low=n225['low'], close=n225['close'],
+                                    name='日経平均'), row=1, col=1)
                                     
+    # 下段: 裁定買残棒グラフ
     fig.add_trace(go.Bar(x=saitei_df['Date'], y=saitei_df['Buy(Oku-yen)'],
                          name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
                          
@@ -241,8 +275,11 @@ def plot_saitei_and_nikkei(saitei_df):
                       xaxis_rangeslider_visible=False,
                       showlegend=False,
                       dragmode='zoom')
-    # Update axes to link hovering
+    # 軸の設定
     fig.update_xaxes(spikemode='across', spikethickness=1, spikedash='solid', spikecolor='grey')
+    fig.update_yaxes(title_text="株価", row=1, col=1)
+    fig.update_yaxes(title_text="億円", row=2, col=1)
+    
     return fig
 
 # --- チャート画像生成関数 ---
