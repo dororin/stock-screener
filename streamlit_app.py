@@ -261,22 +261,31 @@ def plot_saitei_and_nikkei(saitei_df):
     ratio_df = pd.DataFrame()
     if not n225.empty and not saitei_df.empty:
         try:
+            # 計算用にコピーとカラム名正規化
             temp_saitei = saitei_df.copy()
-            temp_saitei.columns = [c.lower() for c in temp_saitei.columns]
-            # 直近の日足終値でマージして比率を算出
+            temp_saitei.columns = [str(c).lower() for c in temp_saitei.columns]
+            
+            temp_n225 = n225[['date', 'close']].copy()
+            temp_n225.columns = ['date', 'n225_close']
+            
+            # 直近の日足終値でマージして比率を算出 (重複日付排除とソートを徹底)
             ratio_df = pd.merge_asof(
-                temp_saitei.sort_values('date'),
-                n225[['date', 'close']].sort_values('date'),
+                temp_saitei.sort_values('date').drop_duplicates(subset=['date']),
+                temp_n225.sort_values('date').drop_duplicates(subset=['date']),
                 on='date',
                 direction='nearest'
             )
-            ratio_df['ratio'] = ratio_df['buy(oku-yen)'] / ratio_df['close']
-        except Exception:
+            # 比率算出
+            ratio_df['ratio'] = ratio_df['buy(oku-yen)'] / ratio_df['n225_close']
+            # NaNを除去
+            ratio_df = ratio_df.dropna(subset=['ratio'])
+        except Exception as e:
+            st.error(f"比率の計算中にエラーが発生しました: {e}")
             ratio_df = pd.DataFrame()
 
-    # サブプロットの作成 (3段構成)
+    # サブプロットの作成 (3段構成: バランス調整)
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.05, row_heights=[0.5, 0.25, 0.25],
+                        vertical_spacing=0.07, row_heights=[0.4, 0.3, 0.3],
                         subplot_titles=('日経平均 (日足)', '裁定買残 (億円)', '裁定買残 / 日経平均 (倍率)'))
                         
     # 1段目: 日経平均ローソク足
@@ -297,7 +306,7 @@ def plot_saitei_and_nikkei(saitei_df):
                                  line=dict(color='red', width=2),
                                  fill='tozeroy', fillcolor='rgba(255, 0, 0, 0.1)'), row=3, col=1)
                          
-    fig.update_layout(height=800, margin=dict(l=20, r=20, t=40, b=20),
+    fig.update_layout(height=900, margin=dict(l=20, r=20, t=40, b=20),
                       xaxis_rangeslider_visible=False,
                       showlegend=False,
                       dragmode='zoom')
