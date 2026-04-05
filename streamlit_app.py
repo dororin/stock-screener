@@ -230,17 +230,15 @@ def plot_saitei_and_nikkei(saitei_df):
     start_date = saitei_df['Date'].min()
     end_date = saitei_df['Date'].max() + pd.Timedelta(days=7)
     
-    # 日経平均データの取得 (Ticker.historyの方が安定しているため切り替え)
+    # 日経平均データの取得 (1d: 日足に変更)
     try:
         n225_ticker = yf.Ticker('^N225')
-        n225 = n225_ticker.history(start=start_date, end=end_date, interval='1wk')
+        n225 = n225_ticker.history(start=start_date, end=end_date, interval='1d')
         if n225.empty:
-            # historyが空の場合のフォールバック
-            n225 = yf.download('^N225', start=start_date, end=end_date, interval='1wk', progress=False)
+            n225 = yf.download('^N225', start=start_date, end=end_date, interval='1d', progress=False)
             
         if not n225.empty:
             n225.reset_index(inplace=True)
-            # カラム名の正規化 (MultiIndex対応 & 小文字化して安定させる)
             new_cols = []
             for c in n225.columns:
                 if isinstance(c, tuple):
@@ -249,36 +247,61 @@ def plot_saitei_and_nikkei(saitei_df):
                     new_cols.append(str(c).lower())
             n225.columns = new_cols
             
-            # 日付のクリーニング
             if 'date' in n225.columns:
                 n225['date'] = pd.to_datetime(n225['date']).dt.tz_localize(None)
     except Exception as e:
         st.warning(f"日経平均データの取得中にエラーが発生しました: {e}")
         n225 = pd.DataFrame()
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.08, row_heights=[0.6, 0.4],
-                        subplot_titles=('日経平均 (週足)', '裁定買残 (億円)'))
+    # 比率（裁定買残 / 日経平均）の計算
+    ratio_df = pd.DataFrame()
+    if not n225.empty and not saitei_df.empty:
+        try:
+            temp_saitei = saitei_df.copy()
+            temp_saitei.columns = [c.lower() for c in temp_saitei.columns]
+            # 直近の日足終値でマージして比率を算出
+            ratio_df = pd.merge_asof(
+                temp_saitei.sort_values('date'),
+                n225[['date', 'close']].sort_values('date'),
+                on='date',
+                direction='nearest'
+            )
+            ratio_df['ratio'] = ratio_df['buy(oku-yen)'] / ratio_df['close']
+        except Exception:
+            ratio_df = pd.DataFrame()
+
+    # サブプロットの作成 (3段構成)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.05, row_heights=[0.5, 0.25, 0.25],
+                        subplot_titles=('日経平均 (日足)', '裁定買残 (億円)', '裁定買残 / 日経平均 (倍率)'))
                         
-    # 上段: 日経平均ローソク足
+    # 1段目: 日経平均ローソク足
     if not n225.empty and 'date' in n225.columns:
         fig.add_trace(go.Candlestick(x=n225['date'],
                                     open=n225['open'], high=n225['high'],
                                     low=n225['low'], close=n225['close'],
                                     name='日経平均'), row=1, col=1)
                                     
-    # 下段: 裁定買残棒グラフ
+    # 2段目: 裁定買残棒グラフ
     fig.add_trace(go.Bar(x=saitei_df['Date'], y=saitei_df['Buy(Oku-yen)'],
                          name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
+    
+    # 3段目: 比率折れ線グラフ
+    if not ratio_df.empty and 'ratio' in ratio_df.columns:
+        fig.add_trace(go.Scatter(x=ratio_df['date'], y=ratio_df['ratio'],
+                                 mode='lines+markers', name='倍率',
+                                 line=dict(color='red', width=2),
+                                 fill='tozeroy', fillcolor='rgba(255, 0, 0, 0.1)'), row=3, col=1)
                          
-    fig.update_layout(height=650, margin=dict(l=20, r=20, t=40, b=20),
+    fig.update_layout(height=800, margin=dict(l=20, r=20, t=40, b=20),
                       xaxis_rangeslider_visible=False,
                       showlegend=False,
                       dragmode='zoom')
-    # 軸の設定
+                      
     fig.update_xaxes(spikemode='across', spikethickness=1, spikedash='solid', spikecolor='grey')
     fig.update_yaxes(title_text="株価", row=1, col=1)
     fig.update_yaxes(title_text="億円", row=2, col=1)
+    fig.update_yaxes(title_text="倍率", row=3, col=1)
     
     return fig
 
