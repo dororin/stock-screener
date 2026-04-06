@@ -259,7 +259,7 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         m_df['Date'] = pd.to_datetime(m_df['Date'])
         m_df['ratio'] = m_df['Buy(M-yen)'] / m_df['Nikkei225']
     # 3段構成 (信用比率)
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.07,
                         row_heights=[0.5, 0.25, 0.25], specs=[[{"secondary_y": True}], [{}], [{}]],
                         subplot_titles=('日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)', '信用比率 (買残 / 日経平均)'))
     if not s_df.empty:
@@ -270,7 +270,7 @@ def plot_market_dashboard(saitei_df, sinyou_df):
     if not m_df.empty:
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['ratio'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
 
-    # 全体レイアウト設定 (全段を確実に一本の線で貫く設定)
+    # 全体レイアウト
     fig.update_layout(
         height=1000,
         margin=dict(l=20, r=60, t=50, b=20),
@@ -281,31 +281,25 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         spikedistance=-1
     )
     
-    # 物理的なx軸の一本化 (全トレースが 'xaxis1' を使うように強制)
-    fig.update_traces(xaxis='x')
-
-    # X軸の設定 (全段に適用)
-    fig.update_xaxes(
+    # 共通のX軸設定 (同期させつつ、全段でラベルを表示)
+    common_x_config = dict(
         showspikes=True,
         spikemode='across',
         spikesnap='cursor',
         spikethickness=1,
         spikecolor='#ff4b4b',
         showline=True,
-        showticklabels=True, # 全段で目盛りを表示
-        nticks=10,           # 表示密度の抑制
-        dtick=None,          # Plotlyにおまかせ(ズームによる動的切り替え)
-        tickformatstops=[    # ズームレベルに応じたフォーマット
-            dict(dtickrange=[None, 1000*60*60*24*7], value="%m/%d"), # 週以下
-            dict(dtickrange=[1000*60*60*24*7, None], value="%Y/%m")  # 週以上
-        ],
-        selector=dict(id='xaxis')
+        showticklabels=True, # 全段で表示
+        nticks=8,            # 密度を抑えて重なりを防止
+        tickformatstops=[
+            dict(dtickrange=[None, 1000*60*60*24*7], value="%m/%d"), # ズーム時
+            dict(dtickrange=[1000*60*60*24*7, None], value="%Y/%m")  # 広域時
+        ]
     )
+    
+    fig.update_xaxes(common_x_config)
 
-    # 不要な重なりを避けるための設定
-    fig.update_layout(xaxis2_visible=False, xaxis3_visible=False)
-
-    # Y軸タイトルの再設定
+    # Y軸タイトルの設定
     fig.update_yaxes(showspikes=False)
     fig.update_yaxes(title_text="株価", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True)
