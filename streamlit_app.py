@@ -290,7 +290,7 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         spikecolor='#ff4b4b',
         showline=True,
         showticklabels=True, # 全段で表示
-        nticks=8,            # 密度を抑えて重なりを防止
+        nticks=16,           # 密度を従来の2倍以上に強化
         tickformatstops=[
             dict(dtickrange=[None, 1000*60*60*24*7], value="%m/%d"),   # 1週間以内は月日
             dict(dtickrange=[1000*60*60*24*7, None], value="%y/%m/%d") # それ以上は年月日
@@ -299,8 +299,8 @@ def plot_market_dashboard(saitei_df, sinyou_df):
     
     fig.update_xaxes(common_x_config)
 
-    # Y軸タイトルの設定
-    fig.update_yaxes(showspikes=False)
+    # Y軸タイトルの設定 (目盛り密度を高める)
+    fig.update_yaxes(showspikes=False, nticks=15) # Y軸の密度も各段で強化
     fig.update_yaxes(title_text="株価", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True)
     fig.update_yaxes(title_text="億円", row=2, col=1)
