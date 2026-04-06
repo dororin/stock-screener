@@ -235,91 +235,40 @@ def plot_saitei_and_nikkei(saitei_df):
     if saitei_df.empty:
         return None
     
-    # 日付の型変換 (GSheetsから読み込まれた際に文字列になっている可能性があるため)
+    # 日付の型変換
     saitei_df = saitei_df.copy()
     saitei_df['Date'] = pd.to_datetime(saitei_df['Date'])
     
-    # 期間の取得
-    start_date = saitei_df['Date'].min()
-    end_date = saitei_df['Date'].max() + pd.Timedelta(days=7)
+    # カラム名を小文字に統一して処理を安定させる
+    temp_df = saitei_df.copy()
+    temp_df.columns = [str(c).lower() for c in temp_df.columns]
     
-    # 日経平均データの取得 (1d: 日足に変更)
-    try:
-        n225_ticker = yf.Ticker('^N225')
-        n225 = n225_ticker.history(start=start_date, end=end_date, interval='1d')
-        if n225.empty:
-            n225 = yf.download('^N225', start=start_date, end=end_date, interval='1d', progress=False)
-            
-        if not n225.empty:
-            n225.reset_index(inplace=True)
-            new_cols = []
-            for c in n225.columns:
-                if isinstance(c, tuple):
-                    new_cols.append(c[0].lower())
-                else:
-                    new_cols.append(str(c).lower())
-            n225.columns = new_cols
-            
-            if 'date' in n225.columns:
-                n225['date'] = pd.to_datetime(n225['date']).dt.tz_localize(None)
-    except Exception as e:
-        st.warning(f"日経平均データの取得中にエラーが発生しました: {e}")
-        n225 = pd.DataFrame()
-
     # 比率（裁定買残 / 日経平均）の計算
-    ratio_df = pd.DataFrame()
-    if not saitei_df.empty:
-        try:
-            # 計算用にコピーとカラム名正規化
-            temp_saitei = saitei_df.copy()
-            temp_saitei.columns = [str(c).lower() for c in temp_saitei.columns]
-            temp_saitei['date'] = pd.to_datetime(temp_saitei['date']).astype('datetime64[ns]')
-            
-            # 新しいソース(nikkei225jp.com)から取得した日経平均データがある場合
-            if 'nikkei225' in temp_saitei.columns and not temp_saitei['nikkei225'].isna().all():
-                ratio_df = temp_saitei.copy()
-                ratio_df['ratio'] = ratio_df['buy(oku-yen)'] / ratio_df['nikkei225']
-            else:
-                # 既存データやyfinanceからのマージが必要な場合
-                if not n225.empty:
-                    temp_n225 = n225[['date', 'close']].copy()
-                    temp_n225.columns = ['date', 'n225_close']
-                    temp_n225['date'] = pd.to_datetime(temp_n225['date']).astype('datetime64[ns]')
-                    
-                    ratio_df = pd.merge_asof(
-                        temp_saitei.sort_values('date').drop_duplicates(subset=['date']),
-                        temp_n225.sort_values('date').drop_duplicates(subset=['date']),
-                        on='date',
-                        direction='nearest'
-                    )
-                    ratio_df['ratio'] = ratio_df['buy(oku-yen)'] / ratio_df['n225_close']
-            
-            if not ratio_df.empty:
-                # NaNを除去
-                ratio_df = ratio_df.dropna(subset=['ratio'])
-        except Exception as e:
-            st.error(f"比率の計算中にエラーが発生しました: {e}")
-            ratio_df = pd.DataFrame()
+    if 'nikkei225' in temp_df.columns and not temp_df['nikkei225'].isna().all():
+        temp_df['ratio'] = temp_df['buy(oku-yen)'] / temp_df['nikkei225']
+    else:
+        # 万が一列がない場合の空データフレーム
+        temp_df['ratio'] = np.nan
 
-    # サブプロットの作成 (3段構成: バランス調整)
+    # サブプロットの作成 (3段構成)
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
                         vertical_spacing=0.07, row_heights=[0.4, 0.3, 0.3],
-                        subplot_titles=('日経平均 (日足)', '裁定買残 (億円)', '裁定買残 / 日経平均 (倍率)'))
+                        subplot_titles=('日経平均', '裁定買残 (億円)', '裁定買残 / 日経平均 (倍率)'))
                         
-    # 1段目: 日経平均ローソク足
-    if not n225.empty and 'date' in n225.columns:
-        fig.add_trace(go.Candlestick(x=n225['date'],
-                                    open=n225['open'], high=n225['high'],
-                                    low=n225['low'], close=n225['close'],
-                                    name='日経平均'), row=1, col=1)
+    # 1段目: 日経平均 (折れ線グラフ)
+    if 'nikkei225' in temp_df.columns:
+        fig.add_trace(go.Scatter(x=temp_df['date'], y=temp_df['nikkei225'],
+                                 mode='lines+markers', name='日経平均',
+                                 line=dict(color='orange', width=2)), row=1, col=1)
                                     
     # 2段目: 裁定買残棒グラフ
-    fig.add_trace(go.Bar(x=saitei_df['Date'], y=saitei_df['Buy(Oku-yen)'],
-                         name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
+    if 'buy(oku-yen)' in temp_df.columns:
+        fig.add_trace(go.Bar(x=temp_df['date'], y=temp_df['buy(oku-yen)'],
+                             name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
     
     # 3段目: 比率折れ線グラフ
-    if not ratio_df.empty and 'ratio' in ratio_df.columns:
-        fig.add_trace(go.Scatter(x=ratio_df['date'], y=ratio_df['ratio'],
+    if 'ratio' in temp_df.columns and not temp_df['ratio'].isna().all():
+        fig.add_trace(go.Scatter(x=temp_df['date'], y=temp_df['ratio'],
                                  mode='lines+markers', name='倍率',
                                  line=dict(color='red', width=2),
                                  fill='tozeroy', fillcolor='rgba(255, 0, 0, 0.1)'), row=3, col=1)
