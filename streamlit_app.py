@@ -150,7 +150,7 @@ def parse_saitei_amount(text):
     """nikkei225jp.comの数値を億円単位に変換 (3,512,558 -> 35125)"""
     try:
         val = int(str(text).replace(',', '').strip())
-        return val // 100 # 百万円単位を100で割って億円にする
+        return val // 100
     except:
         return 0
 
@@ -163,13 +163,22 @@ def parse_nikkei_val(text):
 
 def fetch_saitei_data():
     url = "https://nikkei225jp.com/data/saitei.php"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    res = requests.get(url, headers=headers)
-    res.encoding = 'utf-8'
-    soup = BeautifulSoup(res.text, "html.parser")
-    table = soup.find("table", id="datatbl")
-    data = []
-    if table:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"}
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        res.encoding = 'utf-8'
+        if res.status_code != 200:
+            st.error(f"データ取得元へのアクセスに失敗しました (HTTP {res.status_code})")
+            return pd.DataFrame()
+            
+        soup = BeautifulSoup(res.text, "html.parser")
+        table = soup.find("table", id="datatbl")
+        
+        if not table:
+            st.error("サイトの構造に変更があったか、テーブルが見つかりません。")
+            return pd.DataFrame()
+            
+        data = []
         rows = table.find_all("tr")
         for row in rows[1:]: # ヘッダー飛ばし
             cols = [td.text.strip() for td in row.find_all(["td", "th"])]
@@ -186,48 +195,65 @@ def fetch_saitei_data():
                     'Sell(Oku-yen)': sell_val,
                     'Buy(Oku-yen)': buy_val
                 })
-    df = pd.DataFrame(data)
-    if not df.empty:
-        df['Date'] = pd.to_datetime(df['Date'])
-        # 最新100件が降順で並んでいるので昇順に直す
-        df = df.sort_values('Date').reset_index(drop=True)
-    return df
+        
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df = df.dropna(subset=['Date'])
+            df = df.sort_values('Date').reset_index(drop=True)
+        return df
+    except Exception as e:
+        st.error(f"スクレイピング中にエラーが発生しました: {e}")
+        return pd.DataFrame()
 
 def update_and_load_saitei_data():
     if conn is None:
         st.error("Google Sheets への接続設定が見つかりません。")
         return pd.DataFrame()
         
+    # 既存データの読み込み
     try:
-        # マーケットデータ専用の別ファイルを読み込み
         existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", ttl=0)
-    except Exception:
+        # カラムの型と内容を整理
+        if not existing_df.empty:
+            existing_df['Date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
+            # 列が足りない場合は補完
+            if 'Nikkei225' not in existing_df.columns:
+                existing_df['Nikkei225'] = np.nan
+    except Exception as e:
+        st.warning(f"既存データの読み込みに失敗しました (新規作成します): {e}")
         existing_df = pd.DataFrame(columns=['Date', 'Nikkei225', 'Sell(Oku-yen)', 'Buy(Oku-yen)'])
     
+    # 新規データの取得
     web_df = fetch_saitei_data()
-    if web_df.empty:
-        return existing_df
     
-    if not existing_df.empty and 'Date' in existing_df.columns:
-        existing_df['Date'] = pd.to_datetime(existing_df['Date'])
+    if web_df.empty:
+        # 取得失敗時は既存データのみ返す
+        if not existing_df.empty:
+            return existing_df
+        return pd.DataFrame()
+    
+    # マージ処理
+    if not existing_df.empty:
         merged_df = pd.concat([existing_df, web_df]).drop_duplicates(subset=['Date'], keep='last')
         merged_df = merged_df.sort_values('Date').reset_index(drop=True)
     else:
         merged_df = web_df.copy()
         
+    # 保存処理
     try:
         save_df = merged_df.copy()
         save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
-        # カラム順を整理
+        # カラムを確実に揃える
         cols = ['Date', 'Nikkei225', 'Sell(Oku-yen)', 'Buy(Oku-yen)']
+        for c in cols:
+            if c not in save_df.columns:
+                save_df[c] = np.nan
         save_df = save_df[cols]
-        # マーケットデータ専用の別ファイルへ保存
+        
         conn.update(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", data=save_df)
     except Exception as e:
-        if "saitei_data" in str(e):
-             st.error(f"スプレッドシートの中に 'saitei_data' というタブが見つかりません。")
-        else:
-             st.error(f"裁定残データの保存に失敗しました: {e}")
+        st.error(f"裁定残データの保存に失敗しました: {e}")
         
     return merged_df
 
