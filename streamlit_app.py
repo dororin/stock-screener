@@ -215,17 +215,20 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['ratio'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['Buy(M-yen)'], mode='lines+markers', name='信用買い残', line=dict(color='rgba(255, 0, 0, 0.8)', width=2)), row=4, col=1)
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['Sell(M-yen)'], mode='lines+markers', name='信用売り残', line=dict(color='rgba(0, 0, 255, 0.8)', width=2)), row=4, col=1)
-    # 全体レイアウト設定 (エラーの原因となっていたspikedash等の不正な引数を削除)
+    # 全体レイアウト設定 (一本の線を共有する x unified モード)
     fig.update_layout(
         height=1000,
         margin=dict(l=20, r=60, t=50, b=20),
         showlegend=False,
-        hovermode='x',
-        dragmode='pan'
+        hovermode='x unified', # これが全段を一本の線で貫くための設定
+        dragmode='pan',
+        hoverdistance=-1, # カーソル位置に関わらず表示
+        spikedistance=-1  # カーソル位置に関わらず表示
     )
     
-    # 全てのx軸に対して縦線（クロスヘア）の設定を適用
+    # 全てのx軸を同期 (matches='x' を指定することで表示イベントが連動する)
     fig.update_xaxes(
+        matches='x',
         showspikes=True,
         spikemode='across',
         spikesnap='cursor',
@@ -235,7 +238,7 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         showline=True
     )
     
-    # 2段目以降のx軸のスパイクも確実に出すための調整
+    # Y軸タイトルの再設定
     fig.update_yaxes(showspikes=False)
     fig.update_yaxes(title_text="株価", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True)
