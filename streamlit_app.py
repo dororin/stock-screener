@@ -215,7 +215,7 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['ratio'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['Buy(M-yen)'], mode='lines+markers', name='信用買い残', line=dict(color='rgba(255, 0, 0, 0.8)', width=2)), row=4, col=1)
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['Sell(M-yen)'], mode='lines+markers', name='信用売り残', line=dict(color='rgba(0, 0, 255, 0.8)', width=2)), row=4, col=1)
-    # 全体レイアウト設定 (全段を一本の線で貫く x unified モード)
+    # 全体レイアウト設定 (全段を確実に一本の線で貫く設定)
     fig.update_layout(
         height=1000,
         margin=dict(l=20, r=60, t=50, b=20),
@@ -226,25 +226,30 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         spikedistance=-1
     )
     
-    # 共通のクロスヘア（縦線）設定
-    spike_config = dict(
-        showspikes=True,
-        spikemode='across', # 段を跨いで描画
-        spikesnap='cursor',
-        spikethickness=1,
-        spikedash='solid',
-        spikecolor='#ff4b4b', # より目立つ赤色系の細い線に変更（確実に表示されているか確認用）
-        showline=True,
-        visible=True # 軸自体は可視化（これが必要な場合が多い）
+    # 物理的なx軸の一本化 (全トレースが 'xaxis1' を使うように強制)
+    fig.update_traces(xaxis='x')
+
+    # 唯一のx軸に対して縦線（クロスヘア）の設定を徹底
+    fig.update_xaxes(
+        patch=dict(
+            showspikes=True,
+            spikemode='across', # これで全段を貫通させる
+            spikesnap='cursor',
+            spikethickness=1,
+            spikedash='solid',
+            spikecolor='#ff4b4b',
+            showline=True,
+            visible=True
+        ),
+        selector=dict(id='xaxis') # 1番目のx軸のみを調整（他は使われない）
     )
 
-    # 各段のx軸を一括設定（matches='x' で同期を強制）
-    fig.update_xaxes(matches='x', **spike_config)
-    
-    # 上段3つのx軸の目盛りラベルだけを消す（見た目はスッキリさせる）
+    # 2段目以降の不要になったx軸の定義を削除/非表示にする
+    fig.update_layout(xaxis2_visible=False, xaxis3_visible=False, xaxis4_visible=False)
+
+    # 見た目の調整
     fig.update_xaxes(showticklabels=False, row=1, col=1)
-    fig.update_xaxes(showticklabels=False, row=2, col=1)
-    fig.update_xaxes(showticklabels=False, row=3, col=1)
+    fig.update_xaxes(showticklabels=True, row=4, col=1) # 一番下だけラベルを出す
     
     # Y軸タイトルの再設定
     fig.update_yaxes(showspikes=False)
