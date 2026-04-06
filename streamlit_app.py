@@ -146,6 +146,97 @@ def delete_history(screening_id):
 # --- マーケット情報用定数 ---
 MARKET_DATA_URL = "https://docs.google.com/spreadsheets/d/1vaX2dKcHO_fo_KMffNiC98pY1fzfMkHCRkHE1IFE0PI/edit"
 
+def fetch_sinyou_data():
+    """nikkei225jp.comのJSONから信用残高（2市場合計・週次）を抽出"""
+    url = "https://nikkei225jp.com/_data/_nfsWEB/DAY/dailyweek2.json"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+        "Referer": "https://nikkei225jp.com/data/sinyou.php"
+    }
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        res.encoding = 'utf-8'
+        if res.status_code != 200:
+            return pd.DataFrame()
+            
+        json_text = res.text.strip().replace("var DAILY =", "").strip().rstrip(";")
+        import json
+        raw_rows = json.loads(json_text)
+        
+        data = []
+        for r in raw_rows:
+            # 週次・金額データは r[4]:売り残(百万), r[6]:買い残(百万)
+            if len(r) >= 7:
+                sell_amt = r[4]
+                buy_amt = r[6]
+                if sell_amt != "" and buy_amt != "":
+                    data.append({
+                        'Date': pd.to_datetime(r[0], unit='ms'),
+                        'Nikkei225': float(r[1]) if r[1] != "" else np.nan,
+                        'Sell(M-yen)': int(str(sell_amt).replace(',', '')),
+                        'Buy(M-yen)': int(str(buy_amt).replace(',', ''))
+                    })
+        
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df['Date'] = df['Date'].dt.tz_localize(None)
+            df = df.sort_values('Date').reset_index(drop=True)
+        return df
+    except Exception as e:
+        st.error(f"信用データ解析中にエラーが発生しました: {e}")
+        return pd.DataFrame()
+
+def update_and_load_sinyou_data():
+    if conn is None: return pd.DataFrame()
+    web_df = fetch_sinyou_data()
+    if web_df.empty:
+        try: return conn.read(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", ttl=0)
+        except: return pd.DataFrame()
+    
+    try:
+        existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", ttl=0)
+        if existing_df is not None and not existing_df.empty:
+            existing_df['Date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
+            merged_df = pd.concat([existing_df, web_df]).drop_duplicates(subset=['Date'], keep='last')
+            merged_df = merged_df.sort_values('Date').reset_index(drop=True)
+        else:
+            merged_df = web_df
+    except:
+        merged_df = web_df
+        
+    try:
+        save_df = merged_df.copy()
+        save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
+        conn.update(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", data=save_df)
+    except Exception as e:
+        st.error(f"信用データの保存に失敗しました: {e}")
+    return merged_df
+
+def plot_sinyou_charts(sinyou_df):
+    if sinyou_df.empty: return None
+    
+    df = sinyou_df.copy()
+    df['Date'] = pd.to_datetime(df['Date'])
+    df['ratio'] = df['Buy(M-yen)'] / df['Nikkei225']
+    
+    # 1. 信用買い残/日経平均 のチャート
+    fig_ratio = go.Figure()
+    fig_ratio.add_trace(go.Scatter(x=df['Date'], y=df['ratio'],
+                                   mode='lines+markers', name='信用買残/日経平均',
+                                   line=dict(color='green', width=2),
+                                   fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'))
+    fig_ratio.update_layout(title="信用買い残 / 日経平均 (比率)", height=400,
+                            margin=dict(l=20, r=20, t=40, b=20), hovermode='x unified')
+    
+    # 2. 売り残買い残（重ね書き）のチャート
+    fig_overlap = go.Figure()
+    fig_overlap.add_trace(go.Bar(x=df['Date'], y=df['Buy(M-yen)'], name='買い残', marker_color='rgba(255, 0, 0, 0.6)'))
+    fig_overlap.add_trace(go.Bar(x=df['Date'], y=df['Sell(M-yen)'], name='売り残', marker_color='rgba(0, 0, 255, 0.6)'))
+    fig_overlap.update_layout(title="信用売り残・買い残 推移 (百万円)", barmode='overlay', height=400,
+                             margin=dict(l=20, r=20, t=40, b=20), hovermode='x unified')
+                             
+    return fig_ratio, fig_overlap
+
 def parse_saitei_amount(val):
     """億円単位に変換 (3,512,558 -> 35125)"""
     try:
@@ -271,7 +362,10 @@ def plot_saitei_and_nikkei(saitei_df):
         if not n225.empty:
             n225.reset_index(inplace=True)
             # カラム名を小文字に
-            n225.columns = [str(c[0]).lower() if isinstance(c, tuple) else str(c).lower() for c in n225.columns]
+            if hasattr(n225.columns, 'levels'): # MultiIndex対応
+                 n225.columns = [c[0].lower() for c in n225.columns]
+            else:
+                 n225.columns = [str(c).lower() for c in n225.columns]
             n225['date'] = pd.to_datetime(n225['date']).dt.tz_localize(None)
 
         # サブプロットの作成 (2段構成, 1段目は左右2軸)
@@ -300,7 +394,7 @@ def plot_saitei_and_nikkei(saitei_df):
             fig.add_trace(go.Bar(x=df['date'], y=df[buy_col],
                                  name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
                              
-        fig.update_layout(height=900, margin=dict(l=20, r=60, t=50, b=20),
+        fig.update_layout(height=800, margin=dict(l=20, r=60, t=50, b=20),
                           xaxis_rangeslider_visible=False,
                           showlegend=False,
                           dragmode='zoom',
@@ -312,11 +406,6 @@ def plot_saitei_and_nikkei(saitei_df):
         fig.update_yaxes(title_text="億円", row=2, col=1)
         
         return fig
-
-    except Exception as e:
-        st.error(f"チャート描画中に例外が発生しました: {e}")
-        st.text(traceback.format_exc())
-        return None
 
     except Exception as e:
         st.error(f"チャート描画中に例外が発生しました: {e}")
@@ -532,6 +621,8 @@ if 'result_df' not in st.session_state:
     st.session_state.result_df = pd.DataFrame()
 if 'saitei_df' not in st.session_state:
     st.session_state.saitei_df = pd.DataFrame()
+if 'sinyou_df' not in st.session_state:
+    st.session_state.sinyou_df = pd.DataFrame()
 
 # --- サイドバー ナビゲーション ---
 with st.sidebar:
@@ -541,17 +632,37 @@ with st.sidebar:
 if selected_page == "マーケット情報":
     st.title("📈 マーケット情報")
     if st.button("データ取得・更新", type="primary"):
-        with st.spinner("データを取得・更新中... (初回は時間がかかる場合があります)"):
-            df = update_and_load_saitei_data()
-            if not df.empty:
-                st.session_state.saitei_df = df
-                st.success("最新データを読み込みました。")
+        with st.spinner("データを取得・更新中... (週次データのため数十秒かかる場合があります)"):
+            # 1. 裁定データ更新
+            df_saitei = update_and_load_saitei_data()
+            if not df_saitei.empty:
+                st.session_state.saitei_df = df_saitei
+            
+            # 2. 信用データ更新
+            df_sinyou = update_and_load_sinyou_data()
+            if not df_sinyou.empty:
+                st.session_state.sinyou_df = df_sinyou
+                
+            st.success("最新データを取得・保存しました。")
     
+    # 裁定取引セクション
     if not st.session_state.saitei_df.empty:
-        fig = plot_saitei_and_nikkei(st.session_state.saitei_df)
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
-    else:
+        st.subheader("1. 裁定取引の状況")
+        fig_saitei = plot_saitei_and_nikkei(st.session_state.saitei_df)
+        if fig_saitei:
+            st.plotly_chart(fig_saitei, use_container_width=True)
+            
+    # 信用残高セクション
+    if not st.session_state.sinyou_df.empty:
+        st.divider()
+        st.subheader("2. 信用残高の状況 (2市場合計)")
+        sinyou_charts = plot_sinyou_charts(st.session_state.sinyou_df)
+        if sinyou_charts:
+            fig_ratio, fig_overlap = sinyou_charts
+            st.plotly_chart(fig_ratio, use_container_width=True)
+            st.plotly_chart(fig_overlap, use_container_width=True)
+            
+    if st.session_state.saitei_df.empty and st.session_state.sinyou_df.empty:
         st.info("上の「データ取得・更新」ボタンを押して最新データを取得してください。")
     
     st.stop() # ここで実行を停止し、スクリーニング側のUIを描画しない
