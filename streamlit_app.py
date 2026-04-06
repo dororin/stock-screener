@@ -217,8 +217,9 @@ def update_and_load_sinyou_data():
         existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", ttl=0)
         if existing_df is not None and not existing_df.empty:
             existing_df['Date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
-            existing_df = existing_df.dropna(subset=['Sell(M-yen)', 'Buy(M-yen)'], how='any').copy()
-        else: existing_df = pd.DataFrame()
+        # 信用残シートに裁定データが混入するのを防ぐため、必要な列のみに絞る
+        valid_cols = ['Date', 'Nikkei225', 'Sell(M-yen)', 'Buy(M-yen)']
+        existing_df = existing_df[[c for c in valid_cols if c in existing_df.columns]].dropna(subset=['Sell(M-yen)', 'Buy(M-yen)'], how='any').copy()
     except: existing_df = pd.DataFrame()
     web_df = fetch_sinyou_data()
     
@@ -285,8 +286,10 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         # 同一日の重複を削除してから再インデックス
         m_df = m_df.set_index('Date').sort_index()
         m_df = m_df[~m_df.index.duplicated(keep='last')]
-        m_df = m_df.reindex(common_idx).ffill().reset_index().rename(columns={'index': 'Date'})
-        m_df['ratio'] = m_df['Buy(M-yen)'] / m_df['Nikkei225']
+        # 小文字の 'date' に統一してホバーを確実に連動させる
+        m_df = m_df.reindex(common_idx).ffill().reset_index().rename(columns={'index': 'date'})
+        m_df.columns = [str(c).lower().strip() for c in m_df.columns]
+        m_df['ratio'] = m_df['buy(m-yen)'] / m_df['nikkei225']
 
     # 3段構成
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
@@ -299,7 +302,7 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         fig.add_trace(go.Bar(x=s_df['date'], y=s_df[buy_col], name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
     
     if not m_df.empty:
-        fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['ratio'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
+        fig.add_trace(go.Scatter(x=m_df['date'], y=m_df['ratio'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
 
     # 全体レイアウト
     fig.update_layout(
