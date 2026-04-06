@@ -156,7 +156,7 @@ def parse_saitei_amount(val):
         return np.nan
 
 def fetch_saitei_data():
-    """nikkei225jp.comの背後にあるJSONデータファイルから直接取得"""
+    """nikkei225jp.comのJSONから『週次・金額』データのみを抽出"""
     url = "https://nikkei225jp.com/_data/_nfsWEB/HS_DATA_DAY/daily_saitei.json"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
@@ -166,10 +166,8 @@ def fetch_saitei_data():
         res = requests.get(url, headers=headers, timeout=15)
         res.encoding = 'utf-8'
         if res.status_code != 200:
-            st.error(f"データファイルの取得に失敗しました (HTTP {res.status_code})")
             return pd.DataFrame()
             
-        # "var DAILY = [ ... ];" 形式なので整形してパース
         json_text = res.text.strip()
         if json_text.startswith("var DAILY ="):
              json_text = json_text.replace("var DAILY =", "").strip()
@@ -181,20 +179,21 @@ def fetch_saitei_data():
         
         data = []
         for r in raw_rows:
-            # r[0]:timestamp, r[1]:nikkei, r[3]:sell, r[4]:buy
-            if len(r) >= 5:
-                # 裁定データ(r[3], r[4])が空でない行のみ抽出（週次更新のため）
-                if r[3] != "" and r[4] != "":
+            # 週次・金額データは r[7]:売り残, r[8]:買い残 に格納されている
+            # これらが空('')でない行が、週次の公表日データ
+            if len(r) >= 9:
+                sell_val = r[7]
+                buy_val = r[8]
+                if sell_val != "" and buy_val != "":
                     data.append({
                         'Date': pd.to_datetime(r[0], unit='ms'),
                         'Nikkei225': float(r[1]) if r[1] != "" else np.nan,
-                        'Sell(Oku-yen)': parse_saitei_amount(r[3]),
-                        'Buy(Oku-yen)': parse_saitei_amount(r[4])
+                        'Sell(Oku-yen)': parse_saitei_amount(sell_val),
+                        'Buy(Oku-yen)': parse_saitei_amount(buy_val)
                     })
         
         df = pd.DataFrame(data)
         if not df.empty:
-            # タイムゾーンを消す
             df['Date'] = df['Date'].dt.tz_localize(None)
             df = df.dropna(subset=['Date', 'Buy(Oku-yen)'])
             df = df.sort_values('Date').reset_index(drop=True)
