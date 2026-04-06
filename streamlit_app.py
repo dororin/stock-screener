@@ -182,8 +182,7 @@ def plot_individual_margin(df, code):
         spikesnap='cursor', 
         spikedash='solid', 
         spikethickness=1, 
-        spikecolor='#ff4b4b',
-        spikedistance=-1
+        spikecolor='#ff4b4b'
     )
     return fig
 
@@ -301,7 +300,6 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         spikethickness=1,
         spikecolor='#ff4b4b',
         spikedash='solid',
-        spikedistance=-1,
         showline=True,
         tickformatstops=[
             dict(dtickrange=[None, 1000*60*60*24*7], value="%m/%d"),
