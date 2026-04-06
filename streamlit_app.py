@@ -263,57 +263,64 @@ def update_and_load_sinyou_data():
 def plot_market_dashboard(saitei_df, sinyou_df):
     if saitei_df.empty and sinyou_df.empty: return None
     
-    # 全データからユニークな日付のリスト（共通タイムライン）を作成
-    # これにより、日付が微妙にずれていても全てのチャートでガイド線が連動します
-    combined_dates = pd.to_datetime(pd.concat([saitei_df['Date'], sinyou_df['Date']])).unique()
-    common_idx = pd.DatetimeIndex(sorted(combined_dates))
+    # 2つのデータソースを「共通の日付」で結合する (最も強力な同期方法)
+    # これにより信用残チャートも、裁定データが存在する2024年以降からの描画になります
+    d1 = saitei_df.copy()
+    d2 = sinyou_df.copy()
+    d1['Date'] = pd.to_datetime(d1['Date']).dt.normalize()
+    d2['Date'] = pd.to_datetime(d2['Date']).dt.normalize()
+    
+    # how='inner' にすることで、裁定データの開始日に合わせて信用残の古いデータをカット
+    df = pd.merge(d1, d2, on='Date', how='inner', suffixes=('_sai', '_sin')).sort_values('Date')
+    # 重複削除
+    df = df[~df['Date'].duplicated(keep='last')]
+    # カラム名を整理
+    df.columns = [str(c).lower().strip() for c in df.columns]
+    
+    # 統合テーブルから列名を特定
+    nik_col = 'nikkei225_sai' if 'nikkei225_sai' in df.columns else 'nikkei225'
+    buy_sai_col = 'buy(oku-yen)'
+    buy_sin_col = 'buy(m-yen)'
+    
+    # 比率の再計算 (マージ後のデータで行うことでズレを解消)
+    df['ratio_sai'] = df[buy_sai_col] / df[nik_col]
+    df['ratio_sin'] = df[buy_sin_col] / df[nik_col]
 
-    s_df = saitei_df.copy()
-    if not s_df.empty:
-        s_df['Date'] = pd.to_datetime(s_df['Date'])
-        # 同一日の重複を削除してから再インデックス
-        s_df = s_df.set_index('Date').sort_index()
-        s_df = s_df[~s_df.index.duplicated(keep='last')]
-        s_df = s_df.reindex(common_idx).ffill().reset_index().rename(columns={'index': 'date'})
-        s_df.columns = [str(c).lower().strip() for c in s_df.columns]
-        nik_col = 'nikkei225' if 'nikkei225' in s_df.columns else 'nikkei'
-        buy_col = 'buy(oku-yen)' if 'buy(oku-yen)' in s_df.columns else 'buy'
-        s_df['ratio'] = s_df[buy_col] / s_df[nik_col]
-        
-    m_df = sinyou_df.copy()
-    if not m_df.empty:
-        m_df['Date'] = pd.to_datetime(m_df['Date'])
-        # 同一日の重複を削除してから再インデックス
-        m_df = m_df.set_index('Date').sort_index()
-        m_df = m_df[~m_df.index.duplicated(keep='last')]
-        # 小文字の 'date' に統一してホバーを確実に連動させる
-        m_df = m_df.reindex(common_idx).ffill().reset_index().rename(columns={'index': 'date'})
-        m_df.columns = [str(c).lower().strip() for c in m_df.columns]
-        m_df['ratio'] = m_df['buy(m-yen)'] / m_df['nikkei225']
-
-    # 3段構成
+    # 3段構成のフィギュア作成
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
                         row_heights=[0.5, 0.25, 0.25], specs=[[{"secondary_y": True}], [{}], [{}]],
                         subplot_titles=('日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)', '信用比率 (買残 / 日経平均)'))
     
-    if not s_df.empty:
-        fig.add_trace(go.Scatter(x=s_df['date'], y=s_df[nik_col], mode='lines+markers', name='日経平均', line=dict(color='orange', width=2), marker=dict(size=4)), row=1, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=s_df['date'], y=s_df['ratio'], mode='lines+markers', name='裁定倍率', line=dict(color='red', width=2), marker=dict(size=4)), row=1, col=1, secondary_y=True)
-        fig.add_trace(go.Bar(x=s_df['date'], y=s_df[buy_col], name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
-    
-    if not m_df.empty:
-        fig.add_trace(go.Scatter(x=m_df['date'], y=m_df['ratio'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
+    # 全ての段で統合テーブルの共通 'date' 列を使用
+    fig.add_trace(go.Scatter(x=df['date'], y=df[nik_col], mode='lines+markers', name='日経平均', line=dict(color='orange', width=2), marker=dict(size=4)), row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['ratio_sai'], mode='lines+markers', name='裁定倍率', line=dict(color='red', width=2), marker=dict(size=4)), row=1, col=1, secondary_y=True)
+    fig.add_trace(go.Bar(x=df['date'], y=df[buy_sai_col], name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['ratio_sin'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
 
-    # 全体レイアウト
+    # レイアウト設定
     fig.update_layout(
-        height=1000,
-        margin=dict(l=20, r=60, t=50, b=20),
-        showlegend=False,
-        hovermode='x unified', # 強力な同期ホバーモード
-        dragmode='pan',
-        hoverdistance=-1,
-        spikedistance=-1
+        height=1000, margin=dict(l=20, r=60, t=50, b=20), showlegend=False,
+        hovermode='x unified', # これで全段に統合ガイド線が出ます
+        dragmode='pan', hoverdistance=-1, spikedistance=-1
     )
+    
+    fig.update_xaxes(
+        showticklabels=True, nticks=16, matches='x', showspikes=True,
+        spikemode='across', spikesnap='cursor', spikethickness=1,
+        spikecolor='#ff4b4b', spikedash='solid', showline=True,
+        tickformatstops=[
+            dict(dtickrange=[None, 1000*60*60*24*7], value="%m/%d"),
+            dict(dtickrange=[1000*60*60*24*7, None], value="%y/%m/%d")
+        ]
+    )
+    # 各 y 軸のラベル等
+    fig.update_yaxes(showspikes=False)
+    fig.update_yaxes(title_text="株価", row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True, range=[0.2, 1.6])
+    fig.update_yaxes(title_text="億円", row=2, col=1)
+    fig.update_yaxes(title_text="比率", row=3, col=1)
+        
+    return fig
     
     # 各軸の個別設定
     fig.update_xaxes(
