@@ -159,14 +159,36 @@ def update_and_load_sinyou_data():
         else: existing_df = pd.DataFrame()
     except: existing_df = pd.DataFrame()
     web_df = fetch_sinyou_data()
-    if web_df.empty: return existing_df
-    merged_df = pd.concat([existing_df, web_df]).drop_duplicates(subset=['Date'], keep='last') if not existing_df.empty else web_df
-    merged_df = merged_df.sort_values('Date').reset_index(drop=True)
+    
+    # 統合処理
+    if web_df.empty:
+        merged_df = existing_df
+    elif existing_df.empty:
+        merged_df = web_df
+    else:
+        merged_df = pd.concat([existing_df, web_df])
+        
+    if not merged_df.empty:
+        # 日付の正規化と重複排除を徹底
+        merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.normalize()
+        merged_df = merged_df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
+        
+    # 保存の必要性チェック（最新日付が既存データより新しい場合のみ保存）
     try:
-        save_df = merged_df.copy()
-        save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
-        conn.update(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", data=save_df)
-    except: pass
+        should_update = True
+        if not existing_df.empty and not merged_df.empty:
+            last_existing = pd.to_datetime(existing_df['Date']).max()
+            last_merged = merged_df['Date'].max()
+            if last_merged <= last_existing:
+                should_update = False
+        
+        if should_update and not merged_df.empty:
+            save_df = merged_df.copy()
+            save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
+            conn.update(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", data=save_df)
+    except:
+        pass
+        
     return merged_df
 
 def plot_market_dashboard(saitei_df, sinyou_df):
@@ -194,7 +216,18 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['Buy(M-yen)'], mode='lines+markers', name='信用買い残', line=dict(color='rgba(255, 0, 0, 0.8)', width=2)), row=4, col=1)
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['Sell(M-yen)'], mode='lines+markers', name='信用売り残', line=dict(color='rgba(0, 0, 255, 0.8)', width=2)), row=4, col=1)
     fig.update_layout(height=1000, margin=dict(l=20, r=60, t=50, b=20), showlegend=False, hovermode='x unified', dragmode='pan')
-    fig.update_xaxes(showspikes=True, spikemode='across', spikesnap='cursor', spikethickness=1, spikedash='solid', spikecolor='#888')
+    
+    # 全てのx軸で縦線（Spike Lines）を同期表示する設定
+    fig.update_xaxes(
+        showspikes=True,
+        spikemode='across',
+        spikesnap='cursor',
+        spikethickness=1,
+        spikedash='solid',
+        spikecolor='#555', # より視認性の高い色に変更
+        showline=True,
+        showgrid=True
+    )
     fig.update_yaxes(showspikes=False, title_text="株価", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True)
     fig.update_yaxes(title_text="億円", row=2, col=1)
@@ -238,14 +271,36 @@ def update_and_load_saitei_data():
         else: existing_df = pd.DataFrame(columns=['Date', 'Nikkei225', 'Sell(Oku-yen)', 'Buy(Oku-yen)'])
     except: existing_df = pd.DataFrame(columns=['Date', 'Nikkei225', 'Sell(Oku-yen)', 'Buy(Oku-yen)'])
     web_df = fetch_saitei_data()
-    if web_df.empty: return existing_df
-    merged_df = pd.concat([existing_df, web_df]).drop_duplicates(subset=['Date'], keep='last') if not existing_df.empty else web_df.copy()
-    merged_df = merged_df.sort_values('Date').reset_index(drop=True)
+    
+    # 統合処理
+    if web_df.empty:
+        merged_df = existing_df
+    elif existing_df.empty:
+        merged_df = web_df
+    else:
+        merged_df = pd.concat([existing_df, web_df])
+        
+    if not merged_df.empty:
+        # 日付の正規化と重複排除を徹底
+        merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.normalize()
+        merged_df = merged_df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
+        
+    # 保存の必要性チェック（最新日付が既存データより新しい場合のみ保存）
     try:
-        save_df = merged_df.copy()
-        save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
-        conn.update(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", data=save_df)
-    except: pass
+        should_update = True
+        if not existing_df.empty and not merged_df.empty:
+            last_existing = pd.to_datetime(existing_df['Date']).max()
+            last_merged = merged_df['Date'].max()
+            if last_merged <= last_existing:
+                should_update = False
+                
+        if should_update and not merged_df.empty:
+            save_df = merged_df.copy()
+            save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
+            conn.update(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", data=save_df)
+    except:
+        pass
+        
     return merged_df
 
 def generate_mini_chart_base64(df):
