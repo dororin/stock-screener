@@ -146,44 +146,50 @@ def delete_history(screening_id):
 # --- マーケット情報用定数 ---
 MARKET_DATA_URL = "https://docs.google.com/spreadsheets/d/1vaX2dKcHO_fo_KMffNiC98pY1fzfMkHCRkHE1IFE0PI/edit"
 
-def parse_jp_amount(text):
-    text = str(text).replace('億円', '').replace(',', '').strip()
-    if '兆' in text:
-        parts = text.split('兆')
-        trillion = int(parts[0]) if parts[0] else 0
-        hundred_mil = int(parts[1]) if len(parts) > 1 and parts[1] else 0
-        return trillion * 10000 + hundred_mil
-    else:
-        try:
-            return int(text)
-        except:
-            return 0
+def parse_saitei_amount(text):
+    """nikkei225jp.comの数値を億円単位に変換 (3,512,558 -> 35125)"""
+    try:
+        val = int(str(text).replace(',', '').strip())
+        return val // 100 # 百万円単位を100で割って億円にする
+    except:
+        return 0
+
+def parse_nikkei_val(text):
+    """日経225の数値をフロート変換 (53,373.07 -> 53373.07)"""
+    try:
+        return float(str(text).replace(',', '').strip())
+    except:
+        return 0.0
 
 def fetch_saitei_data():
-    url = "https://karauri.net/saitei/"
+    url = "https://nikkei225jp.com/data/saitei.php"
     headers = {"User-Agent": "Mozilla/5.0"}
     res = requests.get(url, headers=headers)
     res.encoding = 'utf-8'
     soup = BeautifulSoup(res.text, "html.parser")
-    tables = soup.find_all("table")
+    table = soup.find("table", id="datatbl")
     data = []
-    if tables:
-        rows = tables[0].find_all("tr")
-        for row in rows[1:]:
+    if table:
+        rows = table.find_all("tr")
+        for row in rows[1:]: # ヘッダー飛ばし
             cols = [td.text.strip() for td in row.find_all(["td", "th"])]
-            if len(cols) >= 3:
-                # 日付形式の統一
-                date_str = cols[0].replace('年', '-').replace('月', '-').replace('日', '')
-                sell_amt = cols[1]
-                buy_amt = cols[2]
+            if len(cols) >= 6:
+                # 0:日付, 1:日経225, 4:買い残, 5:売り残
+                date_str = cols[0].replace('/', '-')
+                nikkei_val = parse_nikkei_val(cols[1])
+                buy_val = parse_saitei_amount(cols[4])
+                sell_val = parse_saitei_amount(cols[5])
+                
                 data.append({
-                    'Date': date_str, 
-                    'Sell(Oku-yen)': parse_jp_amount(sell_amt), 
-                    'Buy(Oku-yen)': parse_jp_amount(buy_amt)
+                    'Date': date_str,
+                    'Nikkei225': nikkei_val,
+                    'Sell(Oku-yen)': sell_val,
+                    'Buy(Oku-yen)': buy_val
                 })
     df = pd.DataFrame(data)
     if not df.empty:
         df['Date'] = pd.to_datetime(df['Date'])
+        # 最新100件が降順で並んでいるので昇順に直す
         df = df.sort_values('Date').reset_index(drop=True)
     return df
 
@@ -196,7 +202,7 @@ def update_and_load_saitei_data():
         # マーケットデータ専用の別ファイルを読み込み
         existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", ttl=0)
     except Exception:
-        existing_df = pd.DataFrame(columns=['Date', 'Sell(Oku-yen)', 'Buy(Oku-yen)'])
+        existing_df = pd.DataFrame(columns=['Date', 'Nikkei225', 'Sell(Oku-yen)', 'Buy(Oku-yen)'])
     
     web_df = fetch_saitei_data()
     if web_df.empty:
@@ -212,11 +218,14 @@ def update_and_load_saitei_data():
     try:
         save_df = merged_df.copy()
         save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
+        # カラム順を整理
+        cols = ['Date', 'Nikkei225', 'Sell(Oku-yen)', 'Buy(Oku-yen)']
+        save_df = save_df[cols]
         # マーケットデータ専用の別ファイルへ保存
         conn.update(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", data=save_df)
     except Exception as e:
         if "saitei_data" in str(e):
-             st.error(f"新しいスプレッドシート（marketdata）の中に 'saitei_data' という名前のタブが見つかりません。タブ名を正確に設定しているか確認してください。")
+             st.error(f"スプレッドシートの中に 'saitei_data' というタブが見つかりません。")
         else:
              st.error(f"裁定残データの保存に失敗しました: {e}")
         
@@ -259,30 +268,35 @@ def plot_saitei_and_nikkei(saitei_df):
 
     # 比率（裁定買残 / 日経平均）の計算
     ratio_df = pd.DataFrame()
-    if not n225.empty and not saitei_df.empty:
+    if not saitei_df.empty:
         try:
             # 計算用にコピーとカラム名正規化
             temp_saitei = saitei_df.copy()
             temp_saitei.columns = [str(c).lower() for c in temp_saitei.columns]
-            
-            # 日付の精度と型を完全に「ナノ秒単位」で一致させる (dtypeエラーの最終対策)
             temp_saitei['date'] = pd.to_datetime(temp_saitei['date']).astype('datetime64[ns]')
             
-            temp_n225 = n225[['date', 'close']].copy()
-            temp_n225.columns = ['date', 'n225_close']
-            temp_n225['date'] = pd.to_datetime(temp_n225['date']).astype('datetime64[ns]')
+            # 新しいソース(nikkei225jp.com)から取得した日経平均データがある場合
+            if 'nikkei225' in temp_saitei.columns and not temp_saitei['nikkei225'].isna().all():
+                ratio_df = temp_saitei.copy()
+                ratio_df['ratio'] = ratio_df['buy(oku-yen)'] / ratio_df['nikkei225']
+            else:
+                # 既存データやyfinanceからのマージが必要な場合
+                if not n225.empty:
+                    temp_n225 = n225[['date', 'close']].copy()
+                    temp_n225.columns = ['date', 'n225_close']
+                    temp_n225['date'] = pd.to_datetime(temp_n225['date']).astype('datetime64[ns]')
+                    
+                    ratio_df = pd.merge_asof(
+                        temp_saitei.sort_values('date').drop_duplicates(subset=['date']),
+                        temp_n225.sort_values('date').drop_duplicates(subset=['date']),
+                        on='date',
+                        direction='nearest'
+                    )
+                    ratio_df['ratio'] = ratio_df['buy(oku-yen)'] / ratio_df['n225_close']
             
-            # 直近の日足終値でマージして比率を算出 (重複日付排除とソートを徹底)
-            ratio_df = pd.merge_asof(
-                temp_saitei.sort_values('date').drop_duplicates(subset=['date']),
-                temp_n225.sort_values('date').drop_duplicates(subset=['date']),
-                on='date',
-                direction='nearest'
-            )
-            # 比率算出
-            ratio_df['ratio'] = ratio_df['buy(oku-yen)'] / ratio_df['n225_close']
-            # NaNを除去
-            ratio_df = ratio_df.dropna(subset=['ratio'])
+            if not ratio_df.empty:
+                # NaNを除去
+                ratio_df = ratio_df.dropna(subset=['ratio'])
         except Exception as e:
             st.error(f"比率の計算中にエラーが発生しました: {e}")
             ratio_df = pd.DataFrame()
