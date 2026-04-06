@@ -173,9 +173,17 @@ def plot_individual_margin(df, code):
         title=f"銘柄コード {code} : 信用残高推移 (株)",
         height=400, margin=dict(l=20, r=20, t=50, b=20),
         hovermode='x unified', template='plotly_white',
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        spikedistance=-1, hoverdistance=-1
     )
-    fig.update_xaxes(showspikes=True, spikemode='across', spikesnap='cursor', spikedash='solid')
+    fig.update_xaxes(
+        showspikes=True, 
+        spikemode='across+toaxis', 
+        spikesnap='cursor', 
+        spikedash='solid', 
+        spikethickness=1, 
+        spikecolor='#ff4b4b'
+    )
     return fig
 
 def fetch_sinyou_data():
@@ -278,22 +286,20 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         hovermode='x unified', # 全段に同時にガイド線を出す
         dragmode='pan',
         hoverdistance=-1,
-        spikedistance=-1,
-        xaxis_showspikes=True, # 全軸でスパイクを有効化
-        xaxis2_showspikes=True,
-        xaxis3_showspikes=True
+        spikedistance=-1
     )
     
-    # 各軸の個別設定 (独立させつつ、レンジを同期)
+    # 各軸の個別設定 (垂直線を全チャートに貫通させる設定)
     fig.update_xaxes(
         showticklabels=True,
         nticks=16,
         matches='x',      # レンジ同期
         showspikes=True,  # 垂直線の有効化
-        spikemode='across',
+        spikemode='across+toaxis',
         spikesnap='cursor',
         spikethickness=1,
         spikecolor='#ff4b4b',
+        spikedash='solid', # 実線にして視認性を向上
         showline=True,
         tickformatstops=[
             dict(dtickrange=[None, 1000*60*60*24*7], value="%m/%d"),
