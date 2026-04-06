@@ -292,8 +292,8 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         showticklabels=True, # 全段で表示
         nticks=8,            # 密度を抑えて重なりを防止
         tickformatstops=[
-            dict(dtickrange=[None, 1000*60*60*24*7], value="%m/%d"), # ズーム時
-            dict(dtickrange=[1000*60*60*24*7, None], value="%Y/%m")  # 広域時
+            dict(dtickrange=[None, 1000*60*60*24*7], value="%m/%d"),   # 1週間以内は月日
+            dict(dtickrange=[1000*60*60*24*7, None], value="%y/%m/%d") # それ以上は年月日
         ]
     )
     
