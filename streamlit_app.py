@@ -281,7 +281,7 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         spikedistance=-1
     )
     
-    # 共通のX軸設定 (同期させつつ、全段でラベルを表示)
+    # 共通のX軸設定 (同期させつつ、全段を一本の線で貫くようリンク)
     common_x_config = dict(
         showspikes=True,
         spikemode='across',
@@ -289,18 +289,20 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         spikethickness=1,
         spikecolor='#ff4b4b',
         showline=True,
-        showticklabels=True, # 全段で表示
-        nticks=16,           # 密度を従来の2倍以上に強化
+        showticklabels=True,
+        nticks=16,
         tickformatstops=[
-            dict(dtickrange=[None, 1000*60*60*24*7], value="%m/%d"),   # 1週間以内は月日
-            dict(dtickrange=[1000*60*60*24*7, None], value="%y/%m/%d") # それ以上は年月日
+            dict(dtickrange=[None, 1000*60*60*24*7], value="%m/%d"),
+            dict(dtickrange=[1000*60*60*24*7, None], value="%y/%m/%d")
         ]
     )
     
+    # 全段のX軸を同期させつつ、一本の線で貫く設定を強化
     fig.update_xaxes(common_x_config)
+    fig.update_xaxes(matches='x') # これで全段の動きと線を物理的に結合
 
-    # Y軸タイトルの設定 (目盛り密度を高める)
-    fig.update_yaxes(showspikes=False, nticks=15) # Y軸の密度も各段で強化
+    # Y軸タイトルの設定
+    fig.update_yaxes(showspikes=False, nticks=15)
     fig.update_yaxes(title_text="株価", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True)
     fig.update_yaxes(title_text="億円", row=2, col=1)
