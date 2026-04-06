@@ -286,24 +286,27 @@ def plot_market_dashboard(saitei_df, sinyou_df):
     df['ratio_sai'] = df[buy_sai_col] / df[nik_col]
     df['ratio_sin'] = df[buy_sin_col] / df[nik_col]
 
-    # 3段構成のフィギュア作成
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-                        row_heights=[0.5, 0.25, 0.25], specs=[[{"secondary_y": True}], [{}], [{}]],
+    # 3段構成のフィギュア作成 (2段目と3段目をコンパクトに変更)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        row_heights=[0.68, 0.16, 0.16], specs=[[{"secondary_y": True}], [{}], [{}]],
                         subplot_titles=('日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)', '信用比率 (買残 / 日経平均)'))
     
+    # 裁定倍率 0.6 の水平ライン (水色)
+    fig.add_hline(y=0.6, row=1, col=1, secondary_y=True, line_color='lightblue', line_dash='dash', line_width=1)
+
     # 全ての段で統合テーブルの共通 'date' 列を使用
     fig.add_trace(go.Scatter(x=df['date'], y=df[nik_col], mode='lines+markers', name='日経平均', line=dict(color='orange', width=2), marker=dict(size=4)), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=df['date'], y=df['ratio_sai'], mode='lines+markers', name='裁定倍率', line=dict(color='red', width=2), marker=dict(size=4)), row=1, col=1, secondary_y=True)
     fig.add_trace(go.Bar(x=df['date'], y=df[buy_sai_col], name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['date'], y=df['ratio_sin'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
 
-    # 全ての段で物理的に全く同一のX軸(x)を共有させる（同期の究極設定）
+    # 全ての段で物理的に全く同一のX軸(x)を共有させる
     fig.update_traces(xaxis='x')
 
     # レイアウト設定
     fig.update_layout(
-        height=1000, margin=dict(l=20, r=60, t=50, b=20), showlegend=False,
-        hovermode='x', # 同一軸共有時は 'x' モードで完璧に同期します
+        height=850, margin=dict(l=20, r=60, t=50, b=20), showlegend=False,
+        hovermode='x', 
         dragmode='pan', hoverdistance=-1, spikedistance=-1
     )
     
@@ -321,7 +324,8 @@ def plot_market_dashboard(saitei_df, sinyou_df):
     fig.update_yaxes(title_text="株価", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True, range=[0.2, 1.6])
     fig.update_yaxes(title_text="億円", row=2, col=1)
-    fig.update_yaxes(title_text="比率", row=3, col=1)
+    # 信用比率は60以上を表示
+    fig.update_yaxes(title_text="比率", row=3, col=1, range=[60, df['ratio_sin'].max() * 1.05])
         
     return fig
     
