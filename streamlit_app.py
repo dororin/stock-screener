@@ -368,6 +368,9 @@ def plot_saitei_and_nikkei(saitei_df):
                  n225.columns = [str(c).lower() for c in n225.columns]
             n225['date'] = pd.to_datetime(n225['date']).dt.tz_localize(None)
 
+        # 期間のデフォルト (直近1年間)
+        start_view = df['date'].max() - pd.DateOffset(years=1)
+
         # サブプロットの作成 (2段構成, 1段目は左右2軸)
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                             vertical_spacing=0.1, row_heights=[0.6, 0.4],
@@ -397,10 +400,12 @@ def plot_saitei_and_nikkei(saitei_df):
         fig.update_layout(height=800, margin=dict(l=20, r=60, t=50, b=20),
                           xaxis_rangeslider_visible=False,
                           showlegend=False,
-                          dragmode='zoom',
+                          dragmode='pan',
                           hovermode='x unified')
                           
-        fig.update_xaxes(spikemode='across', spikethickness=1, spikedash='solid', spikecolor='grey')
+        fig.update_xaxes(range=[start_view, end_date], spikemode='across', spikethickness=1, spikedash='solid', spikecolor='grey')
+        # 全体でY軸はオートスケールにする
+        fig.update_yaxes(autorange=True, fixedrange=False)
         fig.update_yaxes(title_text="株価 (円)", row=1, col=1, secondary_y=False)
         fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True, showgrid=False)
         fig.update_yaxes(title_text="億円", row=2, col=1)
@@ -650,7 +655,7 @@ if selected_page == "マーケット情報":
         st.subheader("1. 裁定取引の状況")
         fig_saitei = plot_saitei_and_nikkei(st.session_state.saitei_df)
         if fig_saitei:
-            st.plotly_chart(fig_saitei, use_container_width=True)
+            st.plotly_chart(fig_saitei, use_container_width=True, config={'scrollZoom': True})
             
     # 信用残高セクション
     if not st.session_state.sinyou_df.empty:
@@ -659,8 +664,8 @@ if selected_page == "マーケット情報":
         sinyou_charts = plot_sinyou_charts(st.session_state.sinyou_df)
         if sinyou_charts:
             fig_ratio, fig_overlap = sinyou_charts
-            st.plotly_chart(fig_ratio, use_container_width=True)
-            st.plotly_chart(fig_overlap, use_container_width=True)
+            st.plotly_chart(fig_ratio, use_container_width=True, config={'scrollZoom': True})
+            st.plotly_chart(fig_overlap, use_container_width=True, config={'scrollZoom': True})
             
     if st.session_state.saitei_df.empty and st.session_state.sinyou_df.empty:
         st.info("上の「データ取得・更新」ボタンを押して最新データを取得してください。")
