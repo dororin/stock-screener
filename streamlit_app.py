@@ -258,13 +258,17 @@ def plot_market_dashboard(saitei_df, sinyou_df):
     if not m_df.empty:
         m_df['Date'] = pd.to_datetime(m_df['Date'])
         m_df['ratio'] = m_df['Buy(M-yen)'] / m_df['Nikkei225']
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
-                        row_heights=[0.7, 0.3], specs=[[{"secondary_y": True}], [{}]],
-                        subplot_titles=('日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)'))
+    # 3段構成に変更 (信用比率を復活)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                        row_heights=[0.5, 0.25, 0.25], specs=[[{"secondary_y": True}], [{}], [{}]],
+                        subplot_titles=('日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)', '信用比率 (買残 / 日経平均)'))
     if not s_df.empty:
         fig.add_trace(go.Scatter(x=s_df['date'], y=s_df[nik_col], mode='lines+markers', name='日経平均', line=dict(color='orange', width=2), marker=dict(size=4)), row=1, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=s_df['date'], y=s_df['ratio'], mode='lines+markers', name='裁定倍率', line=dict(color='red', width=2), marker=dict(size=4)), row=1, col=1, secondary_y=True)
         fig.add_trace(go.Bar(x=s_df['date'], y=s_df[buy_col], name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
+    
+    if not m_df.empty:
+        fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['ratio'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
 
     # 全体レイアウト設定 (全段を確実に一本の線で貫く設定)
     fig.update_layout(
@@ -284,7 +288,7 @@ def plot_market_dashboard(saitei_df, sinyou_df):
     fig.update_xaxes(
         patch=dict(
             showspikes=True,
-            spikemode='across', # これで全段を貫通させる
+            spikemode='across',
             spikesnap='cursor',
             spikethickness=1,
             spikedash='solid',
@@ -292,27 +296,29 @@ def plot_market_dashboard(saitei_df, sinyou_df):
             showline=True,
             visible=True
         ),
-        selector=dict(id='xaxis') # 1番目のx軸のみを調整（他は使われない）
+        selector=dict(id='xaxis')
     )
 
     # 2段目以降の不要になったx軸の定義を削除/非表示にする
-    fig.update_layout(xaxis2_visible=False)
+    fig.update_layout(xaxis2_visible=False, xaxis3_visible=False)
 
     # 見た目の調整
     fig.update_xaxes(showticklabels=False, row=1, col=1)
-    fig.update_xaxes(showticklabels=True, row=2, col=1) # 一番下だけラベルを出す
+    fig.update_xaxes(showticklabels=False, row=2, col=1)
+    fig.update_xaxes(showticklabels=True, row=3, col=1) # 一番下(3段目)だけラベルを出す
     
     # Y軸タイトルの再設定
     fig.update_yaxes(showspikes=False)
     fig.update_yaxes(title_text="株価", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True)
     fig.update_yaxes(title_text="億円", row=2, col=1)
+    fig.update_yaxes(title_text="比率", row=3, col=1)
 
-    # 裁定倍率 (右軸) のスケールを3倍に強調
+    # 裁定倍率 (右軸) のスケールを3倍の「広域」に変更
     if not s_df.empty:
         r_min, r_max = s_df['ratio'].min(), s_df['ratio'].max()
         r_center = (r_min + r_max) / 2
-        r_span = (r_max - r_min) / 3 # スパンを3分の1にして動きを拡大
+        r_span = (r_max - r_min) * 1.5 # 全体で3倍の幅を表示 (中心から±1.5倍)
         fig.update_yaxes(range=[r_center - r_span, r_center + r_span], row=1, col=1, secondary_y=True)
         
     return fig
