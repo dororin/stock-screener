@@ -258,8 +258,8 @@ def plot_market_dashboard(saitei_df, sinyou_df):
     if not m_df.empty:
         m_df['Date'] = pd.to_datetime(m_df['Date'])
         m_df['ratio'] = m_df['Buy(M-yen)'] / m_df['Nikkei225']
-    # 3段構成に変更 (信用比率を復活)
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+    # 3段構成 (信用比率)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
                         row_heights=[0.5, 0.25, 0.25], specs=[[{"secondary_y": True}], [{}], [{}]],
                         subplot_titles=('日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)', '信用比率 (買残 / 日経平均)'))
     if not s_df.empty:
@@ -284,29 +284,27 @@ def plot_market_dashboard(saitei_df, sinyou_df):
     # 物理的なx軸の一本化 (全トレースが 'xaxis1' を使うように強制)
     fig.update_traces(xaxis='x')
 
-    # 唯一のx軸に対して縦線（クロスヘア）の設定を徹底
+    # X軸の設定 (全段に適用)
     fig.update_xaxes(
-        patch=dict(
-            showspikes=True,
-            spikemode='across',
-            spikesnap='cursor',
-            spikethickness=1,
-            spikedash='solid',
-            spikecolor='#ff4b4b',
-            showline=True,
-            visible=True
-        ),
+        showspikes=True,
+        spikemode='across',
+        spikesnap='cursor',
+        spikethickness=1,
+        spikecolor='#ff4b4b',
+        showline=True,
+        showticklabels=True, # 全段で目盛りを表示
+        nticks=10,           # 表示密度の抑制
+        dtick=None,          # Plotlyにおまかせ(ズームによる動的切り替え)
+        tickformatstops=[    # ズームレベルに応じたフォーマット
+            dict(dtickrange=[None, 1000*60*60*24*7], value="%m/%d"), # 週以下
+            dict(dtickrange=[1000*60*60*24*7, None], value="%Y/%m")  # 週以上
+        ],
         selector=dict(id='xaxis')
     )
 
-    # 2段目以降の不要になったx軸の定義を削除/非表示にする
+    # 不要な重なりを避けるための設定
     fig.update_layout(xaxis2_visible=False, xaxis3_visible=False)
 
-    # 見た目の調整
-    fig.update_xaxes(showticklabels=False, row=1, col=1)
-    fig.update_xaxes(showticklabels=False, row=2, col=1)
-    fig.update_xaxes(showticklabels=True, row=3, col=1) # 一番下(3段目)だけラベルを出す
-    
     # Y軸タイトルの再設定
     fig.update_yaxes(showspikes=False)
     fig.update_yaxes(title_text="株価", row=1, col=1, secondary_y=False)
@@ -314,12 +312,8 @@ def plot_market_dashboard(saitei_df, sinyou_df):
     fig.update_yaxes(title_text="億円", row=2, col=1)
     fig.update_yaxes(title_text="比率", row=3, col=1)
 
-    # 裁定倍率 (右軸) のスケールを3倍の「広域」に変更
-    if not s_df.empty:
-        r_min, r_max = s_df['ratio'].min(), s_df['ratio'].max()
-        r_center = (r_min + r_max) / 2
-        r_span = (r_max - r_min) * 1.5 # 全体で3倍の幅を表示 (中心から±1.5倍)
-        fig.update_yaxes(range=[r_center - r_span, r_center + r_span], row=1, col=1, secondary_y=True)
+    # 裁定倍率 (右軸) を 0.2〜1.6 に固定
+    fig.update_yaxes(range=[0.2, 1.6], row=1, col=1, secondary_y=True)
         
     return fig
 
