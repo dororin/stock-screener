@@ -188,28 +188,40 @@ def fetch_sinyou_data():
 
 def update_and_load_sinyou_data():
     if conn is None: return pd.DataFrame()
-    web_df = fetch_sinyou_data()
-    if web_df.empty:
-        try: return conn.read(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", ttl=0)
-        except: return pd.DataFrame()
     
+    # 既存データの取得
     try:
         existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", ttl=0)
         if existing_df is not None and not existing_df.empty:
             existing_df['Date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
-            merged_df = pd.concat([existing_df, web_df]).drop_duplicates(subset=['Date'], keep='last')
-            merged_df = merged_df.sort_values('Date').reset_index(drop=True)
+            # 既存データから日足（数値がない行）を徹底排除
+            existing_df = existing_df.dropna(subset=['Sell(M-yen)', 'Buy(M-yen)'], how='any').copy()
         else:
-            merged_df = web_df
+            existing_df = pd.DataFrame()
     except:
+        existing_df = pd.DataFrame()
+
+    # WEBからの新規データ取得
+    web_df = fetch_sinyou_data()
+    if web_df.empty:
+        return existing_df
+    
+    # マージ
+    if not existing_df.empty:
+        merged_df = pd.concat([existing_df, web_df]).drop_duplicates(subset=['Date'], keep='last')
+    else:
         merged_df = web_df
-        
+    
+    merged_df = merged_df.sort_values('Date').reset_index(drop=True)
+    
+    # 保存処理 (週次データのみを書き込む)
     try:
         save_df = merged_df.copy()
         save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
         conn.update(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", data=save_df)
     except Exception as e:
         st.error(f"信用データの保存に失敗しました: {e}")
+        
     return merged_df
 
 def plot_sinyou_charts(sinyou_df):
@@ -298,32 +310,34 @@ def update_and_load_saitei_data():
         st.error("Google Sheets への接続設定が見つかりません。")
         return pd.DataFrame()
         
+    # 既存データの取得
     try:
-        # マーケットデータ専用の別ファイルを読み込み
         existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", ttl=0)
         if existing_df is not None and not existing_df.empty:
             existing_df['Date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
-            if 'Nikkei225' not in existing_df.columns:
-                existing_df['Nikkei225'] = np.nan
+            # 既存データから日足（裁定残高がない行）を徹底排除
+            existing_df = existing_df.dropna(subset=['Sell(Oku-yen)', 'Buy(Oku-yen)'], how='any').copy()
+        else:
+            existing_df = pd.DataFrame(columns=['Date', 'Nikkei225', 'Sell(Oku-yen)', 'Buy(Oku-yen)'])
     except Exception:
         existing_df = pd.DataFrame(columns=['Date', 'Nikkei225', 'Sell(Oku-yen)', 'Buy(Oku-yen)'])
     
-    # 新規データの取得
+    # WEBからの新規データ取得 (fetch_saitei_data内部でも週次フィルタ済み)
     web_df = fetch_saitei_data()
     
+    # WEBが取れなければ既存（クリーン済み）を返す
     if web_df.empty:
-        if existing_df is not None and not existing_df.empty:
-            return existing_df
-        return pd.DataFrame()
+        return existing_df
     
     # マージ処理
-    if existing_df is not None and not existing_df.empty:
+    if not existing_df.empty:
         merged_df = pd.concat([existing_df, web_df]).drop_duplicates(subset=['Date'], keep='last')
-        merged_df = merged_df.sort_values('Date').reset_index(drop=True)
     else:
         merged_df = web_df.copy()
+    
+    merged_df = merged_df.sort_values('Date').reset_index(drop=True)
         
-    # 保存処理
+    # 保存処理 (クリーンな週次データのみでスプレッドシートを更新)
     try:
         save_df = merged_df.copy()
         save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
@@ -355,34 +369,21 @@ def plot_saitei_and_nikkei(saitei_df):
         buy_col = 'buy(oku-yen)' if 'buy(oku-yen)' in df.columns else 'buy'
         df['ratio'] = df[buy_col] / df[nikkei_col]
         
-        # yfinanceからローソク足用データを取得
-        start_date = df['date'].min() - pd.Timedelta(days=30)
+        # 期間のデフォルト
         end_date = df['date'].max() + pd.Timedelta(days=7)
-        n225 = yf.download('^N225', start=start_date, end=end_date, interval='1d', progress=False)
-        if not n225.empty:
-            n225.reset_index(inplace=True)
-            # カラム名を小文字に
-            if hasattr(n225.columns, 'levels'): # MultiIndex対応
-                 n225.columns = [c[0].lower() for c in n225.columns]
-            else:
-                 n225.columns = [str(c).lower() for c in n225.columns]
-            n225['date'] = pd.to_datetime(n225['date']).dt.tz_localize(None)
-
-        # 期間のデフォルト (直近1年間)
         start_view = df['date'].max() - pd.DateOffset(years=1)
 
         # サブプロットの作成 (2段構成, 1段目は左右2軸)
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                             vertical_spacing=0.1, row_heights=[0.6, 0.4],
                             specs=[[{"secondary_y": True}], [{}], ],
-                            subplot_titles=('日経平均 (ローソク足) & 裁定倍率 (右軸)', '裁定買残 (億円)'))
+                            subplot_titles=('日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)'))
                             
-        # 1段目 (主軸): 日経平均ローソク足
-        if not n225.empty:
-            fig.add_trace(go.Candlestick(x=n225['date'],
-                                        open=n225['open'], high=n225['high'],
-                                        low=n225['low'], close=n225['close'],
-                                        name='日経225'), row=1, col=1, secondary_y=False)
+        # 1段目 (主軸): 日経平均 (折れ線) - スプレッドシートのデータを使用
+        fig.add_trace(go.Scatter(x=df['date'], y=df[nikkei_col],
+                                 mode='lines+markers', name='日経平均',
+                                 line=dict(color='orange', width=2),
+                                 marker=dict(size=4)), row=1, col=1, secondary_y=False)
                                             
         # 1段目 (副軸・右): 裁定倍率 (折れ線)
         sub_ratio = df.dropna(subset=['ratio'])
