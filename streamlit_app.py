@@ -146,64 +146,61 @@ def delete_history(screening_id):
 # --- マーケット情報用定数 ---
 MARKET_DATA_URL = "https://docs.google.com/spreadsheets/d/1vaX2dKcHO_fo_KMffNiC98pY1fzfMkHCRkHE1IFE0PI/edit"
 
-def parse_saitei_amount(text):
-    """nikkei225jp.comの数値を億円単位に変換 (3,512,558 -> 35125)"""
+def parse_saitei_amount(val):
+    """億円単位に変換 (3,512,558 -> 35125)"""
     try:
-        val = int(str(text).replace(',', '').strip())
-        return val // 100
+        if not val or val == "":
+            return np.nan
+        return int(str(val).replace(',', '').strip()) // 100
     except:
-        return 0
-
-def parse_nikkei_val(text):
-    """日経225の数値をフロート変換 (53,373.07 -> 53373.07)"""
-    try:
-        return float(str(text).replace(',', '').strip())
-    except:
-        return 0.0
+        return np.nan
 
 def fetch_saitei_data():
-    url = "https://nikkei225jp.com/data/saitei.php"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"}
+    """nikkei225jp.comの背後にあるJSONデータファイルから直接取得"""
+    url = "https://nikkei225jp.com/_data/_nfsWEB/HS_DATA_DAY/daily_saitei.json"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+        "Referer": "https://nikkei225jp.com/data/saitei.php"
+    }
     try:
         res = requests.get(url, headers=headers, timeout=15)
         res.encoding = 'utf-8'
         if res.status_code != 200:
-            st.error(f"データ取得元へのアクセスに失敗しました (HTTP {res.status_code})")
+            st.error(f"データファイルの取得に失敗しました (HTTP {res.status_code})")
             return pd.DataFrame()
             
-        soup = BeautifulSoup(res.text, "html.parser")
-        table = soup.find("table", id="datatbl")
+        # "var DAILY = [ ... ];" 形式なので整形してパース
+        json_text = res.text.strip()
+        if json_text.startswith("var DAILY ="):
+             json_text = json_text.replace("var DAILY =", "").strip()
+        if json_text.endswith(";"):
+             json_text = json_text[:-1].strip()
+             
+        import json
+        raw_rows = json.loads(json_text)
         
-        if not table:
-            st.error("サイトの構造に変更があったか、テーブルが見つかりません。")
-            return pd.DataFrame()
-            
         data = []
-        rows = table.find_all("tr")
-        for row in rows[1:]: # ヘッダー飛ばし
-            cols = [td.text.strip() for td in row.find_all(["td", "th"])]
-            if len(cols) >= 6:
-                # 0:日付, 1:日経225, 4:買い残, 5:売り残
-                date_str = cols[0].replace('/', '-')
-                nikkei_val = parse_nikkei_val(cols[1])
-                buy_val = parse_saitei_amount(cols[4])
-                sell_val = parse_saitei_amount(cols[5])
-                
-                data.append({
-                    'Date': date_str,
-                    'Nikkei225': nikkei_val,
-                    'Sell(Oku-yen)': sell_val,
-                    'Buy(Oku-yen)': buy_val
-                })
+        for r in raw_rows:
+            # r[0]:timestamp, r[1]:nikkei, r[3]:sell, r[4]:buy
+            if len(r) >= 5:
+                # 裁定データ(r[3], r[4])が空でない行のみ抽出（週次更新のため）
+                if r[3] != "" and r[4] != "":
+                    data.append({
+                        'Date': pd.to_datetime(r[0], unit='ms'),
+                        'Nikkei225': float(r[1]) if r[1] != "" else np.nan,
+                        'Sell(Oku-yen)': parse_saitei_amount(r[3]),
+                        'Buy(Oku-yen)': parse_saitei_amount(r[4])
+                    })
         
         df = pd.DataFrame(data)
         if not df.empty:
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-            df = df.dropna(subset=['Date'])
+            # タイムゾーンを消す
+            df['Date'] = df['Date'].dt.tz_localize(None)
+            df = df.dropna(subset=['Date', 'Buy(Oku-yen)'])
             df = df.sort_values('Date').reset_index(drop=True)
         return df
     except Exception as e:
-        st.error(f"スクレイピング中にエラーが発生しました: {e}")
+        st.error(f"データ解析中にエラーが発生しました: {e}")
         return pd.DataFrame()
 
 def update_and_load_saitei_data():
@@ -211,30 +208,26 @@ def update_and_load_saitei_data():
         st.error("Google Sheets への接続設定が見つかりません。")
         return pd.DataFrame()
         
-    # 既存データの読み込み
     try:
+        # マーケットデータ専用の別ファイルを読み込み
         existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", ttl=0)
-        # カラムの型と内容を整理
-        if not existing_df.empty:
+        if existing_df is not None and not existing_df.empty:
             existing_df['Date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
-            # 列が足りない場合は補完
             if 'Nikkei225' not in existing_df.columns:
                 existing_df['Nikkei225'] = np.nan
-    except Exception as e:
-        st.warning(f"既存データの読み込みに失敗しました (新規作成します): {e}")
+    except Exception:
         existing_df = pd.DataFrame(columns=['Date', 'Nikkei225', 'Sell(Oku-yen)', 'Buy(Oku-yen)'])
     
     # 新規データの取得
     web_df = fetch_saitei_data()
     
     if web_df.empty:
-        # 取得失敗時は既存データのみ返す
-        if not existing_df.empty:
+        if existing_df is not None and not existing_df.empty:
             return existing_df
         return pd.DataFrame()
     
     # マージ処理
-    if not existing_df.empty:
+    if existing_df is not None and not existing_df.empty:
         merged_df = pd.concat([existing_df, web_df]).drop_duplicates(subset=['Date'], keep='last')
         merged_df = merged_df.sort_values('Date').reset_index(drop=True)
     else:
@@ -244,7 +237,6 @@ def update_and_load_saitei_data():
     try:
         save_df = merged_df.copy()
         save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
-        # カラムを確実に揃える
         cols = ['Date', 'Nikkei225', 'Sell(Oku-yen)', 'Buy(Oku-yen)']
         for c in cols:
             if c not in save_df.columns:
