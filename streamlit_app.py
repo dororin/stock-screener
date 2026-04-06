@@ -16,6 +16,7 @@ import requests
 from bs4 import BeautifulSoup
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import re
 
 # --- ページ設定 ---
 st.set_page_config(
@@ -123,6 +124,59 @@ def delete_history(screening_id):
 
 # --- マーケット情報用定数 ---
 MARKET_DATA_URL = "https://docs.google.com/spreadsheets/d/1vaX2dKcHO_fo_KMffNiC98pY1fzfMkHCRkHE1IFE0PI/edit"
+
+def fetch_irbank_margin(code):
+    """IRBankから個別銘柄の信用残データを取得"""
+    url = f"https://irbank.net/{code}/margin"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200: return pd.DataFrame()
+        soup = BeautifulSoup(res.text, "html.parser")
+        table = soup.find("table")
+        if not table: return pd.DataFrame()
+        rows = table.find_all("tr")
+        data = []
+        current_year = str(pd.Timestamp.now().year)
+        for row in rows:
+            if "occ" in row.get('class', []):
+                year_td = row.find("td", class_="ct")
+                if year_year := (year_td.get_text(strip=True) if year_td else None):
+                    if re.match(r"^\d{4}$", year_year): current_year = year_year
+                continue
+            if any(cls in row.get('class', []) for cls in ["obb", "odd"]):
+                cells = row.find_all("td")
+                if len(cells) < 4: continue
+                date_text = cells[0].get_text(strip=True)
+                if not re.match(r"^\d{1,2}/\d{1,2}$", date_text): continue
+                try:
+                    buy_text = cells[1].get_text(separator="|", strip=True).split("|")[0].replace(",", "")
+                    sell_text = cells[3].get_text(separator="|", strip=True).split("|")[0].replace(",", "")
+                    data.append({
+                        'Date': pd.to_datetime(f"{current_year}/{date_text}"),
+                        'Buy(Shares)': int(buy_text),
+                        'Sell(Shares)': int(sell_text)
+                    })
+                except: continue
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df = df.drop_duplicates(subset=['Date']).sort_values('Date').reset_index(drop=True)
+        return df
+    except: return pd.DataFrame()
+
+def plot_individual_margin(df, code):
+    if df.empty: return None
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['Buy(Shares)'], mode='lines+markers', name='信用買い残', line=dict(color='red', width=2)))
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['Sell(Shares)'], mode='lines+markers', name='信用売り残', line=dict(color='blue', width=2)))
+    fig.update_layout(
+        title=f"銘柄コード {code} : 信用残高推移 (株)",
+        height=400, margin=dict(l=20, r=20, t=50, b=20),
+        hovermode='x unified', template='plotly_white',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig.update_xaxes(showspikes=True, spikemode='across', spikesnap='cursor', spikedash='solid')
+    return fig
 
 def fetch_sinyou_data():
     url = "https://nikkei225jp.com/_data/_nfsWEB/DAY/dailyweek2.json"
@@ -451,6 +505,30 @@ if selected_page == "マーケット情報":
             fig.update_yaxes(fixedrange=True)
             st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
     else: st.info("「データ取得・更新」ボタンを押してください。")
+    
+    st.write("---")
+    st.subheader("🔍 個別銘柄 信用残検索 (IRBank)")
+    c1, c2 = st.columns([1, 4])
+    search_code = c1.text_input("銘柄コード", value="1321", placeholder="例: 1321")
+    if search_code:
+        with st.spinner(f"{search_code} のデータを取得中..."):
+            idf = fetch_irbank_margin(search_code)
+            if not idf.empty:
+                if 'ir_period' not in st.session_state: st.session_state.ir_period = "1年"
+                p = st.radio("表示期間:", ["6ヶ月", "1年", "3年", "全"], key="ir_p", horizontal=True)
+                
+                i_end = idf['Date'].max()
+                if p == "6ヶ月": i_start = i_end - pd.DateOffset(months=6)
+                elif p == "1年": i_start = i_end - pd.DateOffset(years=1)
+                elif p == "3年": i_start = i_end - pd.DateOffset(years=3)
+                else: i_start = idf['Date'].min()
+                
+                vdf = idf[idf['Date'] >= i_start]
+                if not vdf.empty:
+                    ifig = plot_individual_margin(vdf, search_code)
+                    st.plotly_chart(ifig, use_container_width=True)
+            else:
+                st.warning("データが見つかりませんでした。コードを確認してください。")
     st.stop()
 
 with st.sidebar:
