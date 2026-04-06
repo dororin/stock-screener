@@ -297,10 +297,13 @@ def plot_market_dashboard(saitei_df, sinyou_df):
     fig.add_trace(go.Bar(x=df['date'], y=df[buy_sai_col], name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['date'], y=df['ratio_sin'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
 
+    # 全ての段で物理的に全く同一のX軸(x)を共有させる（同期の究極設定）
+    fig.update_traces(xaxis='x')
+
     # レイアウト設定
     fig.update_layout(
         height=1000, margin=dict(l=20, r=60, t=50, b=20), showlegend=False,
-        hovermode='x unified', # これで全段に統合ガイド線が出ます
+        hovermode='x', # 同一軸共有時は 'x' モードで完璧に同期します
         dragmode='pan', hoverdistance=-1, spikedistance=-1
     )
     
