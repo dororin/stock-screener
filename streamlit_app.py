@@ -235,55 +235,71 @@ def plot_saitei_and_nikkei(saitei_df):
     if saitei_df.empty:
         return None
     
-    # 日付の型変換
-    saitei_df = saitei_df.copy()
-    saitei_df['Date'] = pd.to_datetime(saitei_df['Date'])
-    
-    # カラム名を小文字に統一して処理を安定させる
-    temp_df = saitei_df.copy()
-    temp_df.columns = [str(c).lower() for c in temp_df.columns]
-    
-    # 比率（裁定買残 / 日経平均）の計算
-    if 'nikkei225' in temp_df.columns and not temp_df['nikkei225'].isna().all():
-        temp_df['ratio'] = temp_df['buy(oku-yen)'] / temp_df['nikkei225']
-    else:
-        # 万が一列がない場合の空データフレーム
-        temp_df['ratio'] = np.nan
+    try:
+        # 日付の型変換
+        df = saitei_df.copy()
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        df = df.dropna(subset=['Date'])
+        
+        # カラム名を小文字に統一
+        df.columns = [str(c).lower().strip() for c in df.columns]
+        
+        # 必要な列の存在確認 (buy_colなどは将来的な名称変更にも備える)
+        buy_col = 'buy(oku-yen)' if 'buy(oku-yen)' in df.columns else 'buy'
+        nikkei_col = 'nikkei225' if 'nikkei225' in df.columns else 'nikkei'
+        
+        # 比率（裁定買残 / 日経平均）の計算
+        if nikkei_col in df.columns and buy_col in df.columns:
+            # 0除算やNaNを考慮して安全に計算
+            df['ratio'] = df[buy_col] / df[nikkei_col]
+        else:
+            df['ratio'] = np.nan
 
-    # サブプロットの作成 (3段構成)
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.07, row_heights=[0.4, 0.3, 0.3],
-                        subplot_titles=('日経平均', '裁定買残 (億円)', '裁定買残 / 日経平均 (倍率)'))
-                        
-    # 1段目: 日経平均 (折れ線グラフ)
-    if 'nikkei225' in temp_df.columns:
-        fig.add_trace(go.Scatter(x=temp_df['date'], y=temp_df['nikkei225'],
-                                 mode='lines+markers', name='日経平均',
-                                 line=dict(color='orange', width=2)), row=1, col=1)
-                                    
-    # 2段目: 裁定買残棒グラフ
-    if 'buy(oku-yen)' in temp_df.columns:
-        fig.add_trace(go.Bar(x=temp_df['date'], y=temp_df['buy(oku-yen)'],
-                             name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
-    
-    # 3段目: 比率折れ線グラフ
-    if 'ratio' in temp_df.columns and not temp_df['ratio'].isna().all():
-        fig.add_trace(go.Scatter(x=temp_df['date'], y=temp_df['ratio'],
-                                 mode='lines+markers', name='倍率',
-                                 line=dict(color='red', width=2),
-                                 fill='tozeroy', fillcolor='rgba(255, 0, 0, 0.1)'), row=3, col=1)
-                         
-    fig.update_layout(height=900, margin=dict(l=20, r=20, t=40, b=20),
-                      xaxis_rangeslider_visible=False,
-                      showlegend=False,
-                      dragmode='zoom')
-                      
-    fig.update_xaxes(spikemode='across', spikethickness=1, spikedash='solid', spikecolor='grey')
-    fig.update_yaxes(title_text="株価", row=1, col=1)
-    fig.update_yaxes(title_text="億円", row=2, col=1)
-    fig.update_yaxes(title_text="倍率", row=3, col=1)
-    
-    return fig
+        # サブプロットの作成 (3段構成)
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
+                            vertical_spacing=0.07, row_heights=[0.4, 0.3, 0.3],
+                            subplot_titles=('日経平均', '裁定買残 (億円)', '裁定買残 / 日経平均 (倍率)'))
+                            
+        # 1段目: 日経平均 (折れ線)
+        if nikkei_col in df.columns:
+            sub1 = df.dropna(subset=[nikkei_col])
+            if not sub1.empty:
+                fig.add_trace(go.Scatter(x=sub1['date'], y=sub1[nikkei_col],
+                                         mode='lines+markers', name='日経平均',
+                                         line=dict(color='orange', width=2)), row=1, col=1)
+                                            
+        # 2段目: 裁定買残 (棒グラフ)
+        if buy_col in df.columns:
+            sub2 = df.dropna(subset=[buy_col])
+            if not sub2.empty:
+                fig.add_trace(go.Bar(x=sub2['date'], y=sub2[buy_col],
+                                     name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
+        
+        # 3段目: 比率 (折れ線)
+        if 'ratio' in df.columns:
+            sub3 = df.dropna(subset=['ratio'])
+            if not sub3.empty:
+                fig.add_trace(go.Scatter(x=sub3['date'], y=sub3['ratio'],
+                                         mode='lines+markers', name='倍率',
+                                         line=dict(color='red', width=2),
+                                         fill='tozeroy', fillcolor='rgba(255, 0, 0, 0.1)'), row=3, col=1)
+                             
+        fig.update_layout(height=900, margin=dict(l=20, r=20, t=40, b=20),
+                          xaxis_rangeslider_visible=False,
+                          showlegend=False,
+                          dragmode='zoom')
+                          
+        fig.update_xaxes(spikemode='across', spikethickness=1, spikedash='solid', spikecolor='grey')
+        fig.update_yaxes(title_text="株価", row=1, col=1)
+        fig.update_yaxes(title_text="億円", row=2, col=1)
+        fig.update_yaxes(title_text="倍率", row=3, col=1)
+        
+        return fig
+
+    except Exception as e:
+        st.error(f"チャート描画中に例外が発生しました: {e}")
+        st.text(traceback.format_exc()) # 詳細なエラー箇所を表示
+        return None
 
 # --- チャート画像生成関数 ---
 def generate_mini_chart_base64(df):
