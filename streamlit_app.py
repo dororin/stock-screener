@@ -235,41 +235,64 @@ def update_and_load_sinyou_data():
         merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.normalize()
         merged_df = merged_df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
         
-    # 保存の必要性チェック（最新日付が既存データより新しい場合のみ保存）
+    # 保存の必要性チェック
     try:
-        should_update = True
-        if not existing_df.empty and not merged_df.empty:
-            last_existing = pd.to_datetime(existing_df['Date']).max()
-            last_merged = merged_df['Date'].max()
-            if last_merged <= last_existing:
-                should_update = False
-        
-        if should_update and not merged_df.empty:
-            save_df = merged_df.copy()
-            save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
-            conn.update(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", data=save_df)
-    except:
-        pass
+        if not merged_df.empty:
+            # 保存前に最終的な重複チェックを日付ベースで実行 (強固なガード)
+            final_df = merged_df.copy()
+            final_df['Date'] = pd.to_datetime(final_df['Date']).dt.normalize()
+            final_df = final_df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
+            
+            should_update = True
+            if not existing_df.empty:
+                last_existing = pd.to_datetime(existing_df['Date']).max()
+                last_merged = final_df['Date'].max()
+                if last_merged <= last_existing and len(final_df) <= len(existing_df):
+                    should_update = False
+            
+            if should_update:
+                save_df = final_df.copy()
+                save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
+                conn.update(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", data=save_df)
+    except Exception as e:
+        st.error(f"保存エラー: {e}")
         
     return merged_df
 
 def plot_market_dashboard(saitei_df, sinyou_df):
     if saitei_df.empty and sinyou_df.empty: return None
+    
+    # 全データからユニークな日付のリスト（共通タイムライン）を作成
+    # これにより、日付が微妙にずれていても全てのチャートでガイド線が連動します
+    combined_dates = pd.to_datetime(pd.concat([saitei_df['Date'], sinyou_df['Date']])).unique()
+    common_idx = pd.DatetimeIndex(sorted(combined_dates))
+
     s_df = saitei_df.copy()
     if not s_df.empty:
         s_df['Date'] = pd.to_datetime(s_df['Date'])
+        # 同一日の重複を削除してから再インデックス
+        s_df = s_df.set_index('Date').sort_index()
+        s_df = s_df[~s_df.index.duplicated(keep='last')]
+        s_df = s_df.reindex(common_idx).ffill().reset_index().rename(columns={'index': 'date'})
         s_df.columns = [str(c).lower().strip() for c in s_df.columns]
         nik_col = 'nikkei225' if 'nikkei225' in s_df.columns else 'nikkei'
         buy_col = 'buy(oku-yen)' if 'buy(oku-yen)' in s_df.columns else 'buy'
         s_df['ratio'] = s_df[buy_col] / s_df[nik_col]
+        
     m_df = sinyou_df.copy()
     if not m_df.empty:
         m_df['Date'] = pd.to_datetime(m_df['Date'])
+        # 同一日の重複を削除してから再インデックス
+        m_df = m_df.set_index('Date').sort_index()
+        m_df = m_df[~m_df.index.duplicated(keep='last')]
+        m_df = m_df.reindex(common_idx).ffill().reset_index().rename(columns={'index': 'Date'})
         m_df['ratio'] = m_df['Buy(M-yen)'] / m_df['Nikkei225']
-    # 3段構成 (信用比率)
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08, # 余白を確保
+
+    # 3段構成
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
                         row_heights=[0.5, 0.25, 0.25], specs=[[{"secondary_y": True}], [{}], [{}]],
                         subplot_titles=('日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)', '信用比率 (買残 / 日経平均)'))
+    
     if not s_df.empty:
         fig.add_trace(go.Scatter(x=s_df['date'], y=s_df[nik_col], mode='lines+markers', name='日経平均', line=dict(color='orange', width=2), marker=dict(size=4)), row=1, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=s_df['date'], y=s_df['ratio'], mode='lines+markers', name='裁定倍率', line=dict(color='red', width=2), marker=dict(size=4)), row=1, col=1, secondary_y=True)
@@ -283,18 +306,18 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         height=1000,
         margin=dict(l=20, r=60, t=50, b=20),
         showlegend=False,
-        hovermode='x', # 'x unified'よりサブプロット間の垂直線連動が安定
+        hovermode='x unified', # 強力な同期ホバーモード
         dragmode='pan',
         hoverdistance=-1,
         spikedistance=-1
     )
     
-    # 各軸の個別設定 (垂直線を全チャートに貫通させる設定)
+    # 各軸の個別設定
     fig.update_xaxes(
         showticklabels=True,
         nticks=16,
-        matches='x',      # レンジ同期
-        showspikes=True,  # 垂直線の有効化
+        matches='x', 
+        showspikes=True,
         spikemode='across',
         spikesnap='cursor',
         spikethickness=1,
@@ -369,21 +392,27 @@ def update_and_load_saitei_data():
         merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.normalize()
         merged_df = merged_df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
         
-    # 保存の必要性チェック（最新日付が既存データより新しい場合のみ保存）
+    # 保存の必要性チェック
     try:
-        should_update = True
-        if not existing_df.empty and not merged_df.empty:
-            last_existing = pd.to_datetime(existing_df['Date']).max()
-            last_merged = merged_df['Date'].max()
-            if last_merged <= last_existing:
-                should_update = False
-                
-        if should_update and not merged_df.empty:
-            save_df = merged_df.copy()
-            save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
-            conn.update(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", data=save_df)
-    except:
-        pass
+        if not merged_df.empty:
+            # 保存前に最終的な重複チェックを日付ベースで実行
+            final_df = merged_df.copy()
+            final_df['Date'] = pd.to_datetime(final_df['Date']).dt.normalize()
+            final_df = final_df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
+            
+            should_update = True
+            if not existing_df.empty:
+                last_existing = pd.to_datetime(existing_df['Date']).max()
+                last_merged = final_df['Date'].max()
+                if last_merged <= last_existing and len(final_df) <= len(existing_df):
+                    should_update = False
+                    
+            if should_update:
+                save_df = final_df.copy()
+                save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
+                conn.update(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", data=save_df)
+    except Exception as e:
+        st.error(f"保存エラー: {e}")
         
     return merged_df
 
