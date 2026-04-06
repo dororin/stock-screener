@@ -215,24 +215,37 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['ratio'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['Buy(M-yen)'], mode='lines+markers', name='信用買い残', line=dict(color='rgba(255, 0, 0, 0.8)', width=2)), row=4, col=1)
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['Sell(M-yen)'], mode='lines+markers', name='信用売り残', line=dict(color='rgba(0, 0, 255, 0.8)', width=2)), row=4, col=1)
-    fig.update_layout(height=1000, margin=dict(l=20, r=60, t=50, b=20), showlegend=False, hovermode='x unified', dragmode='pan')
+    # 全体レイアウト設定 (hovermode='x' にして全軸のスパイクを連動)
+    fig.update_layout(
+        height=1000,
+        margin=dict(l=20, r=60, t=50, b=20),
+        showlegend=False,
+        hovermode='x', # 'x unified'より各段のスパイクが独立・連動しやすい'x'を選択
+        dragmode='pan',
+        spikedash='solid', # レイアウトレベルでも指定
+        spikethickness=1,
+        spikecolor='#999'
+    )
     
-    # 全てのx軸で縦線（Spike Lines）を同期表示する設定
+    # 全てのx軸（xaxis, xaxis2, xaxis3, xaxis4）に対して設定を徹底
     fig.update_xaxes(
         showspikes=True,
-        spikemode='across',
-        spikesnap='cursor',
+        spikemode='across', # これが全チャートを貫通させるためのキー
+        spikesnap='cursor', # マウスに吸い付くように
         spikethickness=1,
         spikedash='solid',
-        spikecolor='#555', # より視認性の高い色に変更
-        showline=True,
-        showgrid=True
+        spikecolor='#999',
+        showline=True
     )
-    fig.update_yaxes(showspikes=False, title_text="株価", row=1, col=1, secondary_y=False)
+    
+    # 2段目以降のx軸のスパイクも確実に出すための微調整
+    fig.update_yaxes(showspikes=False)
+    fig.update_yaxes(title_text="株価", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True)
     fig.update_yaxes(title_text="億円", row=2, col=1)
     fig.update_yaxes(title_text="比率", row=3, col=1)
     fig.update_yaxes(title_text="百万円", row=4, col=1)
+    
     return fig
 
 def parse_saitei_amount(val):
