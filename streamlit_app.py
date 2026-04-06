@@ -172,17 +172,18 @@ def plot_individual_margin(df, code):
     fig.update_layout(
         title=f"銘柄コード {code} : 信用残高推移 (株)",
         height=400, margin=dict(l=20, r=20, t=50, b=20),
-        hovermode='x unified', template='plotly_white',
+        hovermode='x', template='plotly_white',
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         spikedistance=-1, hoverdistance=-1
     )
     fig.update_xaxes(
         showspikes=True, 
-        spikemode='across+toaxis', 
+        spikemode='across', 
         spikesnap='cursor', 
         spikedash='solid', 
         spikethickness=1, 
-        spikecolor='#ff4b4b'
+        spikecolor='#ff4b4b',
+        spikedistance=-1
     )
     return fig
 
@@ -278,12 +279,12 @@ def plot_market_dashboard(saitei_df, sinyou_df):
     if not m_df.empty:
         fig.add_trace(go.Scatter(x=m_df['Date'], y=m_df['ratio'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
 
-    # 全体レイアウト (統合ホバーラインの設定)
+    # 全体レイアウト
     fig.update_layout(
         height=1000,
         margin=dict(l=20, r=60, t=50, b=20),
         showlegend=False,
-        hovermode='x unified', # 全段に同時にガイド線を出す
+        hovermode='x', # 'x unified'よりサブプロット間の垂直線連動が安定
         dragmode='pan',
         hoverdistance=-1,
         spikedistance=-1
@@ -295,11 +296,12 @@ def plot_market_dashboard(saitei_df, sinyou_df):
         nticks=16,
         matches='x',      # レンジ同期
         showspikes=True,  # 垂直線の有効化
-        spikemode='across+toaxis',
+        spikemode='across',
         spikesnap='cursor',
         spikethickness=1,
         spikecolor='#ff4b4b',
-        spikedash='solid', # 実線にして視認性を向上
+        spikedash='solid',
+        spikedistance=-1,
         showline=True,
         tickformatstops=[
             dict(dtickrange=[None, 1000*60*60*24*7], value="%m/%d"),
