@@ -650,21 +650,60 @@ if selected_page == "マーケット情報":
                 
             st.success("最新データを取得・保存しました。")
     
-    # 裁定取引セクション
+    # 期間選択用のボタン（TradingViewの1M, 3M, 1Yなどの感覚）
+    st.write("---")
+    col_t1, col_t2 = st.columns([2, 3])
+    with col_t1:
+        st.subheader("📊 分析チャート")
+    with col_t2:
+        period_label = st.radio("表示期間:", ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "3年", "全期間"], 
+                                 index=3, horizontal=True, label_visibility="collapsed")
+    
+    # 期間に応じた日付範囲の計算
+    end_dt = st.session_state.saitei_df['Date'].max() if not st.session_state.saitei_df.empty else pd.Timestamp.now()
+    if period_label == "1ヶ月": start_dt = end_dt - pd.DateOffset(months=1)
+    elif period_label == "3ヶ月": start_dt = end_dt - pd.DateOffset(months=3)
+    elif period_label == "6ヶ月": start_dt = end_dt - pd.DateOffset(months=6)
+    elif period_label == "1年": start_dt = end_dt - pd.DateOffset(years=1)
+    elif period_label == "3年": start_dt = end_dt - pd.DateOffset(years=3)
+    else: start_dt = st.session_state.saitei_df['Date'].min() if not st.session_state.saitei_df.empty else end_dt - pd.DateOffset(years=10)
+
+    # 1. 裁定取引セクション
     if not st.session_state.saitei_df.empty:
-        st.subheader("1. 裁定取引の状況")
+        st.markdown("#### 1. 裁定取引の状況")
         fig_saitei = plot_saitei_and_nikkei(st.session_state.saitei_df)
         if fig_saitei:
+            # 表示期間に合わせてY軸を手動でオートスケール（TradingView風）
+            mask = (st.session_state.saitei_df['Date'] >= start_dt) & (st.session_state.saitei_df['Date'] <= end_dt)
+            visible_data = st.session_state.saitei_df[mask]
+            if not visible_data.empty:
+                y_min = visible_data['Nikkei225'].min() * 0.98
+                y_max = visible_data['Nikkei225'].max() * 1.02
+                fig_saitei.update_yaxes(range=[y_min, y_max], row=1, col=1, secondary_y=False)
+            
+            fig_saitei.update_xaxes(range=[start_dt, end_dt + pd.Timedelta(days=7)])
+            fig_saitei.update_yaxes(fixedrange=True) # Y軸ズームをロック（ホイールでXのみ伸縮）
             st.plotly_chart(fig_saitei, use_container_width=True, config={'scrollZoom': True})
             
-    # 信用残高セクション
+    # 2. 信用残高セクション
     if not st.session_state.sinyou_df.empty:
         st.divider()
-        st.subheader("2. 信用残高の状況 (2市場合計)")
-        sinyou_charts = plot_sinyou_charts(st.session_state.sinyou_df)
-        if sinyou_charts:
-            fig_ratio, fig_overlap = sinyou_charts
+        st.markdown("#### 2. 信用残高の状況 (2市場合計)")
+        fig_ratio, fig_overlap = plot_sinyou_charts(st.session_state.sinyou_df)
+        if fig_ratio and fig_overlap:
+            # 信用チャートのY軸最適化
+            m_s = (st.session_state.sinyou_df['Date'] >= start_dt) & (st.session_state.sinyou_df['Date'] <= end_dt)
+            v_s = st.session_state.sinyou_df[m_s]
+            if not v_s.empty:
+                r_min, r_max = v_s['Buy(M-yen)'].replace(0, np.nan).dropna() / v_s['Nikkei225'], v_s['Buy(M-yen)'] / v_s['Nikkei225']
+                fig_ratio.update_yaxes(range=[v_s['Buy(M-yen)'].min()/v_s['Nikkei225'].max()*0.9, v_s['Buy(M-yen)'].max()/v_s['Nikkei225'].min()*1.1])
+            
+            fig_ratio.update_xaxes(range=[start_dt, end_dt + pd.Timedelta(days=7)])
+            fig_ratio.update_yaxes(fixedrange=True)
             st.plotly_chart(fig_ratio, use_container_width=True, config={'scrollZoom': True})
+            
+            fig_overlap.update_xaxes(range=[start_dt, end_dt + pd.Timedelta(days=7)])
+            fig_overlap.update_yaxes(fixedrange=True)
             st.plotly_chart(fig_overlap, use_container_width=True, config={'scrollZoom': True})
             
     if st.session_state.saitei_df.empty and st.session_state.sinyou_df.empty:
