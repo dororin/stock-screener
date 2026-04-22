@@ -459,6 +459,9 @@ def get_jpx_list():
         target = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
         df = df.loc[df["規模区分"].isin(target)].iloc[:, [0, 1]]
         df.columns = ['symbol', 'name']
+        df['symbol'] = pd.to_numeric(df['symbol'], errors='coerce')
+        df = df.dropna(subset=['symbol'])
+        df['symbol'] = df['symbol'].astype(int)
         return df
     except: return pd.DataFrame()
 
@@ -520,6 +523,7 @@ def analyze_market_streamlit(df_targets):
 if 'result_df' not in st.session_state: st.session_state.result_df = pd.DataFrame()
 if 'saitei_df' not in st.session_state: st.session_state.saitei_df = pd.DataFrame()
 if 'sinyou_df' not in st.session_state: st.session_state.sinyou_df = pd.DataFrame()
+if 'performed_scan' not in st.session_state: st.session_state.performed_scan = False
 
 with st.sidebar:
     selected_page = st.radio("画面選択", ["スクリーニング", "マーケット情報"])
@@ -604,7 +608,10 @@ with st.sidebar:
                 df_t['symbol'] = pd.to_numeric(df_c[next(c for c in ["コード", "銘柄コード", "symbol"] if c in df_c.columns)], errors='coerce').dropna().astype(int)
                 df_t['name'] = df_c[next(c for c in ["銘柄", "name"] if c in df_c.columns)] if any(c in df_c.columns for c in ["銘柄", "name"]) else "-"
             except: st.error("CSVエラー")
-        if not df_t.empty: st.session_state.result_df = analyze_market_streamlit(df_t); st.session_state.last_id = None
+        if not df_t.empty:
+            st.session_state.result_df = analyze_market_streamlit(df_t)
+            st.session_state.performed_scan = True
+            st.session_state.last_id = None
     if not st.session_state.result_df.empty:
         if st.button("結果を保存", use_container_width=True):
             if save_history(st.session_state.result_df): st.rerun()
@@ -629,4 +636,8 @@ if not st.session_state.result_df.empty:
                         m1[0].metric("現在値", f"¥{r['現在値']:,.1f}"); m1[1].metric("消灯目安", f"¥{r['消灯目安(安値)']:,.1f}"); m1[2].metric("200日乖離", f"{r['乖離率(%)']}%")
                         m2 = i2.columns(4)
                         m2[0].metric("WVF", r['WVF']); m2[1].metric("Upper", r['WVF Upper']); m2[2].metric("傾き", f"{r['200MA傾き率']:.5f}"); m2[3].metric("日", r['シグナル日'])
-else: st.info("開始ボタンを押してください。")
+else:
+    if st.session_state.performed_scan:
+        st.warning("条件に一致する銘柄は見つかりませんでした。")
+    else:
+        st.info("左メニューの「開始」ボタンを押してスクリーニングを開始してください。")
