@@ -170,18 +170,19 @@ def fetch_naaim_data():
 
 def update_and_load_naaim_data():
     """NAAIMデータをGSheetsと同期・読込"""
-    if conn is None: return pd.DataFrame()
-    try:
-        existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="naaim_data", ttl=0)
-        if existing_df is not None and not existing_df.empty:
-            existing_df['Date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
-            existing_df = existing_df.dropna(subset=['NAAIM']).copy()
-        else: existing_df = pd.DataFrame(columns=['Date', 'NAAIM'])
-    except: existing_df = pd.DataFrame(columns=['Date', 'NAAIM'])
+    existing_df = pd.DataFrame(columns=['Date', 'NAAIM'])
+    if conn is not None:
+        try:
+            existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="naaim_data", ttl=0)
+            if existing_df is not None and not existing_df.empty:
+                existing_df['Date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
+                existing_df = existing_df.dropna(subset=['NAAIM']).copy()
+            else: existing_df = pd.DataFrame(columns=['Date', 'NAAIM'])
+        except: pass
     
     web_df = fetch_naaim_data()
     
-    # 統合
+    # 統合 (Web優先)
     if web_df.empty:
         merged_df = existing_df
     elif existing_df.empty:
@@ -193,19 +194,15 @@ def update_and_load_naaim_data():
         merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.normalize()
         merged_df = merged_df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
         
-    # 保存
-    try:
-        if not merged_df.empty:
-            should_update = True
-            if not existing_df.empty:
-                if len(merged_df) <= len(existing_df) and merged_df['Date'].max() <= existing_df['Date'].max():
-                    should_update = False
-            
-            if should_update:
-                save_df = merged_df.copy()
-                save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
-                conn.update(spreadsheet=MARKET_DATA_URL, worksheet="naaim_data", data=save_df)
-    except: pass
+    # 保存 (ワークシートがない場合などは失敗するが、merged_dfは返す)
+    if conn is not None and not merged_df.empty:
+        try:
+            save_df = merged_df.copy()
+            save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
+            conn.update(spreadsheet=MARKET_DATA_URL, worksheet="naaim_data", data=save_df)
+        except: 
+            # 失敗してもセッション用データとして merged_df を活かす
+            pass
     
     return merged_df
 
@@ -347,9 +344,22 @@ def update_and_load_sinyou_data():
 def plot_market_dashboard(saitei_df, sinyou_df, naaim_df):
     if saitei_df.empty and sinyou_df.empty and naaim_df.empty: return None
     
+    # 段数の動的決定 (NAAIMがある場合のみ4段、ない場合は3段)
+    has_naaim = not naaim_df.empty
+    rows = 4 if has_naaim else 3
+    row_heights = [0.55, 0.15, 0.15, 0.15] if has_naaim else [0.6, 0.2, 0.2]
+    specs = [[{"secondary_y": True}], [{}], [{}]]
+    titles = ['日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)', '信用比率 (買残 / 日経平均)']
+    if has_naaim:
+        specs.append([{"secondary_y": True}])
+        titles.append('NAAIM Exposure Index (米個人投資家意識)')
+    
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+                        row_heights=row_heights, specs=specs, subplot_titles=titles)
+    
     # 日経データ(裁定・信用)の統合
-    d1 = saitei_df.copy()
-    d2 = sinyou_df.copy()
+    d1 = saitei_df.copy() if not saitei_df.empty else pd.DataFrame()
+    d2 = sinyou_df.copy() if not sinyou_df.empty else pd.DataFrame()
     if not d1.empty and not d2.empty:
         d1['Date'] = pd.to_datetime(d1['Date']).dt.normalize()
         d2['Date'] = pd.to_datetime(d2['Date']).dt.normalize()
@@ -362,48 +372,34 @@ def plot_market_dashboard(saitei_df, sinyou_df, naaim_df):
         buy_sin_col = 'buy(m-yen)'
         df_jp['ratio_sai'] = df_jp[buy_sai_col] / df_jp[nik_col]
         df_jp['ratio_sin'] = df_jp[buy_sin_col] / df_jp[nik_col]
-    else:
-        df_jp = pd.DataFrame()
-
-    # 4段構成のフィギュア作成 (NAAIM追加)
-    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-                        row_heights=[0.55, 0.15, 0.15, 0.15], 
-                        specs=[[{"secondary_y": True}], [{}], [{}], [{"secondary_y": True}]],
-                        subplot_titles=('日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)', '信用比率 (買残 / 日経平均)', 'NAAIM Exposure Index (米個人投資家意識)'))
-    
-    # 1段目: 日経平均 & 裁定倍率
-    if not df_jp.empty:
+        
         fig.add_hline(y=0.6, row=1, col=1, secondary_y=True, line_color='lightblue', line_dash='dash', line_width=1)
         fig.add_trace(go.Scatter(x=df_jp['date'], y=df_jp[nik_col], mode='lines', name='日経平均', line=dict(color='orange', width=2)), row=1, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=df_jp['date'], y=df_jp['ratio_sai'], mode='lines', name='裁定倍率', line=dict(color='red', width=2)), row=1, col=1, secondary_y=True)
-        # 2段目: 裁定買残
         fig.add_trace(go.Bar(x=df_jp['date'], y=df_jp[buy_sai_col], name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
-        # 3段目: 信用比率
         fig.add_trace(go.Scatter(x=df_jp['date'], y=df_jp['ratio_sin'], mode='lines', name='信用比率', line=dict(color='green', width=1.5), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
 
     # 4段目: NAAIM
-    if not naaim_df.empty:
+    if has_naaim:
         n_df = naaim_df.copy()
         n_df['Date'] = pd.to_datetime(n_df['Date']).dt.normalize()
         
-        # 比較用にS&P500を取得 (キャッシュ推奨だがここでは動的に)
+        # S&P500
         try:
             sp500 = yf.download("^GSPC", start=n_df['Date'].min(), progress=False)
             if not sp500.empty:
                 sp500 = sp500.reset_index()
-                # yfinanceの構造変更に対応
                 close_col = 'Close' if 'Close' in sp500.columns else sp500.columns[sp500.columns.get_level_values(0) == 'Close'][0]
                 fig.add_trace(go.Scatter(x=sp500['Date'], y=sp500[close_col], mode='lines', name='S&P 500', line=dict(color='gray', width=1, dash='dot')), row=4, col=1, secondary_y=True)
         except: pass
 
         fig.add_trace(go.Scatter(x=n_df['Date'], y=n_df['NAAIM'], mode='lines', name='NAAIM', line=dict(color='purple', width=2), fill='tozeroy', fillcolor='rgba(128, 0, 128, 0.1)'), row=4, col=1, secondary_y=False)
-        # 閾値ライン (100: 超楽観, 20: 悲観)
         fig.add_hline(y=100, row=4, col=1, line_color='red', line_dash='dash', line_width=1)
         fig.add_hline(y=20, row=4, col=1, line_color='blue', line_dash='dash', line_width=1)
 
     # レイアウト設定
     fig.update_layout(
-        height=1000, margin=dict(l=20, r=60, t=50, b=20), showlegend=False,
+        height=1000 if has_naaim else 800, margin=dict(l=20, r=60, t=50, b=20), showlegend=False,
         hovermode='x', dragmode='pan', hoverdistance=-1, spikedistance=-1
     )
     
@@ -420,10 +416,11 @@ def plot_market_dashboard(saitei_df, sinyou_df, naaim_df):
     fig.update_yaxes(title_text="株価", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True, range=[0.2, 1.6])
     fig.update_yaxes(title_text="億円", row=2, col=1)
-    if not df_jp.empty:
+    if not d1.empty and not d2.empty:
         fig.update_yaxes(title_text="比率", row=3, col=1, range=[60, df_jp['ratio_sin'].max() * 1.05])
-    fig.update_yaxes(title_text="指数", row=4, col=1, secondary_y=False, range=[0, 120])
-    fig.update_yaxes(title_text="S&P500", row=4, col=1, secondary_y=True)
+    if has_naaim:
+        fig.update_yaxes(title_text="指数", row=4, col=1, secondary_y=False, range=[0, 120])
+        fig.update_yaxes(title_text="S&P500", row=4, col=1, secondary_y=True)
         
     return fig
     
@@ -657,6 +654,11 @@ if selected_page == "マーケット情報":
             fig.update_yaxes(fixedrange=True)
             st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
     else: st.info("「データ取得・更新」ボタンを押してください。")
+    
+    st.write("---")
+    st.subheader("🖼️ NAAIM公式サイトのチャート")
+    st.info("※公式サイトのページをそのまま表示します。読み込みに時間がかかる場合があります。")
+    st.components.v1.iframe("https://naaim.org/programs/naaim-exposure-index/", height=700, scrolling=True)
     
     st.write("---")
     st.subheader("🔍 個別銘柄 信用残検索 (IRBank)")
