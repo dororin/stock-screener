@@ -126,15 +126,13 @@ def delete_history(screening_id):
 MARKET_DATA_URL = "https://docs.google.com/spreadsheets/d/1vaX2dKcHO_fo_KMffNiC98pY1fzfMkHCRkHE1IFE0PI/edit"
 
 def fetch_naaim_data():
-    """NAAIM Exposure IndexのExcelデータを取得"""
+    """NAAIM Exposure IndexのExcelデータを取得 (BytesIO方式で堅牢化)"""
     base_url = "https://naaim.org/programs/naaim-exposure-index/"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        # 1. Excelファイルの最新リンクをスクレイピングで見つける
         res = requests.get(base_url, headers=headers, timeout=15)
         if res.status_code != 200: return pd.DataFrame()
         soup = BeautifulSoup(res.text, "html.parser")
-        # 「HERE」という文字を含むリンクや、.xlsxで終わるリンクを探す
         links = soup.find_all("a", href=re.compile(r"\.xlsx$"))
         excel_url = None
         for link in links:
@@ -142,30 +140,26 @@ def fetch_naaim_data():
                 excel_url = link.get('href')
                 break
         if not excel_url:
-            # 見つからない場合は最初の.xlsxリンクを試す
             if links: excel_url = links[0].get('href')
             else: return pd.DataFrame()
         
-        # 2. Excelファイルを読み込む
-        # pandas.read_excelはURLを直接受け取れるが、時標的な問題があればrequestsで落としてから読み込む
-        df = pd.read_excel(excel_url)
-        # カラム名のクリーンアップ（Date, Mean/Average, ...）
+        # Excelファイルのダウンロード
+        content = requests.get(excel_url, headers=headers).content
+        import io
+        df = pd.read_excel(io.BytesIO(content))
         df.columns = [str(c).strip() for c in df.columns]
         
-        # Dateカラムの処理 (MM/DD/YYYY)
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
             df = df.dropna(subset=['Date'])
-            # NAAIM指数は 'Mean / Average' 列が一般的
-            # 最新のExcelでは 'Mean/Average'
-            val_col = next((c for c in df.columns if 'Mean' in c or 'Average' in c), None)
+            # 'Mean/Average' または 'NAAIM Number' を探す
+            val_col = next((c for c in df.columns if 'NAAIM Number' in c or 'Mean' in c or 'Average' in c), None)
             if val_col:
                 df = df[['Date', val_col]].rename(columns={val_col: 'NAAIM'})
                 df = df.sort_values('Date').reset_index(drop=True)
                 return df
         return pd.DataFrame()
-    except Exception as e:
-        print(f"NAAIM取得エラー: {e}")
+    except:
         return pd.DataFrame()
 
 def update_and_load_naaim_data():
@@ -379,23 +373,25 @@ def plot_market_dashboard(saitei_df, sinyou_df, naaim_df):
         fig.add_trace(go.Bar(x=df_jp['date'], y=df_jp[buy_sai_col], name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
         fig.add_trace(go.Scatter(x=df_jp['date'], y=df_jp['ratio_sin'], mode='lines', name='信用比率', line=dict(color='green', width=1.5), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
 
-    # 4段目: NAAIM
+    # 4段目: NAAIM (ユーザー様の画像イメージ: 青いラインチャート)
     if has_naaim:
         n_df = naaim_df.copy()
         n_df['Date'] = pd.to_datetime(n_df['Date']).dt.normalize()
         
-        # S&P500
+        # S&P500 (背景の参考程度に)
         try:
             sp500 = yf.download("^GSPC", start=n_df['Date'].min(), progress=False)
             if not sp500.empty:
                 sp500 = sp500.reset_index()
                 close_col = 'Close' if 'Close' in sp500.columns else sp500.columns[sp500.columns.get_level_values(0) == 'Close'][0]
-                fig.add_trace(go.Scatter(x=sp500['Date'], y=sp500[close_col], mode='lines', name='S&P 500', line=dict(color='gray', width=1, dash='dot')), row=4, col=1, secondary_y=True)
+                fig.add_trace(go.Scatter(x=sp500['Date'], y=sp500[close_col], mode='lines', name='S&P 500', line=dict(color='rgba(128, 128, 128, 0.4)', width=1, dash='dot')), row=4, col=1, secondary_y=True)
         except: pass
 
-        fig.add_trace(go.Scatter(x=n_df['Date'], y=n_df['NAAIM'], mode='lines', name='NAAIM', line=dict(color='purple', width=2), fill='tozeroy', fillcolor='rgba(128, 0, 128, 0.1)'), row=4, col=1, secondary_y=False)
-        fig.add_hline(y=100, row=4, col=1, line_color='red', line_dash='dash', line_width=1)
-        fig.add_hline(y=20, row=4, col=1, line_color='blue', line_dash='dash', line_width=1)
+        # NAAIM Number (鮮やかな青色、画像に近い太めの線)
+        fig.add_trace(go.Scatter(x=n_df['Date'], y=n_df['NAAIM'], mode='lines', name='NAAIM', line=dict(color='#2E5BFF', width=2.5)), row=4, col=1, secondary_y=False)
+        # 閾値ライン
+        fig.add_hline(y=100, row=4, col=1, line_color='rgba(255, 0, 0, 0.3)', line_dash='dash', line_width=1)
+        fig.add_hline(y=0, row=4, col=1, line_color='black', line_width=1)
 
     # レイアウト設定
     fig.update_layout(
@@ -644,6 +640,18 @@ if selected_page == "マーケット情報":
     elif period == "1年": start_dt = end_dt - pd.DateOffset(years=1)
     elif period == "3年": start_dt = end_dt - pd.DateOffset(years=3)
     else: start_dt = st.session_state.saitei_df['Date'].min() if not st.session_state.saitei_df.empty else end_dt - pd.DateOffset(years=10)
+    st.write("---")
+    
+    # メトリクス表示
+    m_col1, m_col2 = st.columns(2)
+    with m_col1:
+        if not st.session_state.naaim_df.empty:
+            latest_naaim = st.session_state.naaim_df.iloc[-1]
+            prev_naaim = st.session_state.naaim_df.iloc[-2] if len(st.session_state.naaim_df) > 1 else latest_naaim
+            delta = round(latest_naaim['NAAIM'] - prev_naaim['NAAIM'], 2)
+            st.metric("最新 NAAIM Exposure Index", f"{latest_naaim['NAAIM']}", delta=f"{delta}")
+            st.caption(f"更新日: {latest_naaim['Date'].strftime('%Y-%m-%d')}")
+    
     if not st.session_state.saitei_df.empty or not st.session_state.sinyou_df.empty or not st.session_state.naaim_df.empty:
         fig = plot_market_dashboard(st.session_state.saitei_df, st.session_state.sinyou_df, st.session_state.naaim_df)
         if fig:
@@ -654,11 +662,6 @@ if selected_page == "マーケット情報":
             fig.update_yaxes(fixedrange=True)
             st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
     else: st.info("「データ取得・更新」ボタンを押してください。")
-    
-    st.write("---")
-    st.subheader("🖼️ NAAIM公式サイトのチャート")
-    st.info("※公式サイトのページをそのまま表示します。読み込みに時間がかかる場合があります。")
-    st.components.v1.iframe("https://naaim.org/programs/naaim-exposure-index/", height=700, scrolling=True)
     
     st.write("---")
     st.subheader("🔍 個別銘柄 信用残検索 (IRBank)")
