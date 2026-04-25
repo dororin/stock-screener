@@ -492,10 +492,7 @@ def analyze_market_streamlit(df_targets):
             if len(df) < 220: continue
             new_cols = [c[0].lower() if isinstance(c, tuple) else str(c).lower() for c in df.columns]
             df.columns = new_cols
-            if 'stock splits' in df.columns:
-                splits = df['stock splits'].replace(0, 1)
-                df['split_factor'] = (1 / splits).iloc[::-1].cumprod().iloc[::-1].shift(-1).fillna(1.0)
-                for col in ['open', 'high', 'low', 'close']: df[col] = df[col] * df['split_factor']
+            # yfinanceのCloseはデフォルトで分割調整済みのため、手動調整は不要（二重調整を避ける）
             df['sma50'] = df['close'].rolling(window=50).mean()
             df['sma200'] = df['close'].rolling(window=200).mean()
             df['highest_close'] = df['close'].rolling(window=11).max()
