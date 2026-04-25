@@ -125,6 +125,90 @@ def delete_history(screening_id):
 # --- マーケット情報用定数 ---
 MARKET_DATA_URL = "https://docs.google.com/spreadsheets/d/1vaX2dKcHO_fo_KMffNiC98pY1fzfMkHCRkHE1IFE0PI/edit"
 
+def fetch_naaim_data():
+    """NAAIM Exposure IndexのExcelデータを取得"""
+    base_url = "https://naaim.org/programs/naaim-exposure-index/"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        # 1. Excelファイルの最新リンクをスクレイピングで見つける
+        res = requests.get(base_url, headers=headers, timeout=15)
+        if res.status_code != 200: return pd.DataFrame()
+        soup = BeautifulSoup(res.text, "html.parser")
+        # 「HERE」という文字を含むリンクや、.xlsxで終わるリンクを探す
+        links = soup.find_all("a", href=re.compile(r"\.xlsx$"))
+        excel_url = None
+        for link in links:
+            if "HERE" in link.get_text().upper():
+                excel_url = link.get('href')
+                break
+        if not excel_url:
+            # 見つからない場合は最初の.xlsxリンクを試す
+            if links: excel_url = links[0].get('href')
+            else: return pd.DataFrame()
+        
+        # 2. Excelファイルを読み込む
+        # pandas.read_excelはURLを直接受け取れるが、時標的な問題があればrequestsで落としてから読み込む
+        df = pd.read_excel(excel_url)
+        # カラム名のクリーンアップ（Date, Mean/Average, ...）
+        df.columns = [str(c).strip() for c in df.columns]
+        
+        # Dateカラムの処理 (MM/DD/YYYY)
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df = df.dropna(subset=['Date'])
+            # NAAIM指数は 'Mean / Average' 列が一般的
+            # 最新のExcelでは 'Mean/Average'
+            val_col = next((c for c in df.columns if 'Mean' in c or 'Average' in c), None)
+            if val_col:
+                df = df[['Date', val_col]].rename(columns={val_col: 'NAAIM'})
+                df = df.sort_values('Date').reset_index(drop=True)
+                return df
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"NAAIM取得エラー: {e}")
+        return pd.DataFrame()
+
+def update_and_load_naaim_data():
+    """NAAIMデータをGSheetsと同期・読込"""
+    if conn is None: return pd.DataFrame()
+    try:
+        existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="naaim_data", ttl=0)
+        if existing_df is not None and not existing_df.empty:
+            existing_df['Date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
+            existing_df = existing_df.dropna(subset=['NAAIM']).copy()
+        else: existing_df = pd.DataFrame(columns=['Date', 'NAAIM'])
+    except: existing_df = pd.DataFrame(columns=['Date', 'NAAIM'])
+    
+    web_df = fetch_naaim_data()
+    
+    # 統合
+    if web_df.empty:
+        merged_df = existing_df
+    elif existing_df.empty:
+        merged_df = web_df
+    else:
+        merged_df = pd.concat([existing_df, web_df])
+        
+    if not merged_df.empty:
+        merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.normalize()
+        merged_df = merged_df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
+        
+    # 保存
+    try:
+        if not merged_df.empty:
+            should_update = True
+            if not existing_df.empty:
+                if len(merged_df) <= len(existing_df) and merged_df['Date'].max() <= existing_df['Date'].max():
+                    should_update = False
+            
+            if should_update:
+                save_df = merged_df.copy()
+                save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
+                conn.update(spreadsheet=MARKET_DATA_URL, worksheet="naaim_data", data=save_df)
+    except: pass
+    
+    return merged_df
+
 def fetch_irbank_margin(code):
     """IRBankから個別銘柄の信用残データを取得"""
     url = f"https://irbank.net/{code}/margin"
@@ -260,54 +344,67 @@ def update_and_load_sinyou_data():
         
     return merged_df
 
-def plot_market_dashboard(saitei_df, sinyou_df):
-    if saitei_df.empty and sinyou_df.empty: return None
+def plot_market_dashboard(saitei_df, sinyou_df, naaim_df):
+    if saitei_df.empty and sinyou_df.empty and naaim_df.empty: return None
     
-    # 2つのデータソースを「共通の日付」で結合する (最も強力な同期方法)
-    # これにより信用残チャートも、裁定データが存在する2024年以降からの描画になります
+    # 日経データ(裁定・信用)の統合
     d1 = saitei_df.copy()
     d2 = sinyou_df.copy()
-    d1['Date'] = pd.to_datetime(d1['Date']).dt.normalize()
-    d2['Date'] = pd.to_datetime(d2['Date']).dt.normalize()
-    
-    # how='inner' にすることで、裁定データの開始日に合わせて信用残の古いデータをカット
-    df = pd.merge(d1, d2, on='Date', how='inner', suffixes=('_sai', '_sin')).sort_values('Date')
-    # 重複削除
-    df = df[~df['Date'].duplicated(keep='last')]
-    # カラム名を整理
-    df.columns = [str(c).lower().strip() for c in df.columns]
-    
-    # 統合テーブルから列名を特定
-    nik_col = 'nikkei225_sai' if 'nikkei225_sai' in df.columns else 'nikkei225'
-    buy_sai_col = 'buy(oku-yen)'
-    buy_sin_col = 'buy(m-yen)'
-    
-    # 比率の再計算 (マージ後のデータで行うことでズレを解消)
-    df['ratio_sai'] = df[buy_sai_col] / df[nik_col]
-    df['ratio_sin'] = df[buy_sin_col] / df[nik_col]
+    if not d1.empty and not d2.empty:
+        d1['Date'] = pd.to_datetime(d1['Date']).dt.normalize()
+        d2['Date'] = pd.to_datetime(d2['Date']).dt.normalize()
+        df_jp = pd.merge(d1, d2, on='Date', how='inner', suffixes=('_sai', '_sin')).sort_values('Date')
+        df_jp = df_jp[~df_jp['Date'].duplicated(keep='last')]
+        df_jp.columns = [str(c).lower().strip() for c in df_jp.columns]
+        
+        nik_col = 'nikkei225_sai' if 'nikkei225_sai' in df_jp.columns else 'nikkei225'
+        buy_sai_col = 'buy(oku-yen)'
+        buy_sin_col = 'buy(m-yen)'
+        df_jp['ratio_sai'] = df_jp[buy_sai_col] / df_jp[nik_col]
+        df_jp['ratio_sin'] = df_jp[buy_sin_col] / df_jp[nik_col]
+    else:
+        df_jp = pd.DataFrame()
 
-    # 3段構成のフィギュア作成 (2段目と3段目をコンパクトに変更)
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-                        row_heights=[0.68, 0.16, 0.16], specs=[[{"secondary_y": True}], [{}], [{}]],
-                        subplot_titles=('日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)', '信用比率 (買残 / 日経平均)'))
+    # 4段構成のフィギュア作成 (NAAIM追加)
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+                        row_heights=[0.55, 0.15, 0.15, 0.15], 
+                        specs=[[{"secondary_y": True}], [{}], [{}], [{"secondary_y": True}]],
+                        subplot_titles=('日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)', '信用比率 (買残 / 日経平均)', 'NAAIM Exposure Index (米個人投資家意識)'))
     
-    # 裁定倍率 0.6 の水平ライン (水色)
-    fig.add_hline(y=0.6, row=1, col=1, secondary_y=True, line_color='lightblue', line_dash='dash', line_width=1)
+    # 1段目: 日経平均 & 裁定倍率
+    if not df_jp.empty:
+        fig.add_hline(y=0.6, row=1, col=1, secondary_y=True, line_color='lightblue', line_dash='dash', line_width=1)
+        fig.add_trace(go.Scatter(x=df_jp['date'], y=df_jp[nik_col], mode='lines', name='日経平均', line=dict(color='orange', width=2)), row=1, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=df_jp['date'], y=df_jp['ratio_sai'], mode='lines', name='裁定倍率', line=dict(color='red', width=2)), row=1, col=1, secondary_y=True)
+        # 2段目: 裁定買残
+        fig.add_trace(go.Bar(x=df_jp['date'], y=df_jp[buy_sai_col], name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
+        # 3段目: 信用比率
+        fig.add_trace(go.Scatter(x=df_jp['date'], y=df_jp['ratio_sin'], mode='lines', name='信用比率', line=dict(color='green', width=1.5), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
 
-    # 全ての段で統合テーブルの共通 'date' 列を使用
-    fig.add_trace(go.Scatter(x=df['date'], y=df[nik_col], mode='lines+markers', name='日経平均', line=dict(color='orange', width=2), marker=dict(size=4)), row=1, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=df['date'], y=df['ratio_sai'], mode='lines+markers', name='裁定倍率', line=dict(color='red', width=2), marker=dict(size=4)), row=1, col=1, secondary_y=True)
-    fig.add_trace(go.Bar(x=df['date'], y=df[buy_sai_col], name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df['date'], y=df['ratio_sin'], mode='lines+markers', name='信用比率', line=dict(color='green', width=2), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
+    # 4段目: NAAIM
+    if not naaim_df.empty:
+        n_df = naaim_df.copy()
+        n_df['Date'] = pd.to_datetime(n_df['Date']).dt.normalize()
+        
+        # 比較用にS&P500を取得 (キャッシュ推奨だがここでは動的に)
+        try:
+            sp500 = yf.download("^GSPC", start=n_df['Date'].min(), progress=False)
+            if not sp500.empty:
+                sp500 = sp500.reset_index()
+                # yfinanceの構造変更に対応
+                close_col = 'Close' if 'Close' in sp500.columns else sp500.columns[sp500.columns.get_level_values(0) == 'Close'][0]
+                fig.add_trace(go.Scatter(x=sp500['Date'], y=sp500[close_col], mode='lines', name='S&P 500', line=dict(color='gray', width=1, dash='dot')), row=4, col=1, secondary_y=True)
+        except: pass
 
-    # 全ての段で物理的に全く同一のX軸(x)を共有させる
-    fig.update_traces(xaxis='x')
+        fig.add_trace(go.Scatter(x=n_df['Date'], y=n_df['NAAIM'], mode='lines', name='NAAIM', line=dict(color='purple', width=2), fill='tozeroy', fillcolor='rgba(128, 0, 128, 0.1)'), row=4, col=1, secondary_y=False)
+        # 閾値ライン (100: 超楽観, 20: 悲観)
+        fig.add_hline(y=100, row=4, col=1, line_color='red', line_dash='dash', line_width=1)
+        fig.add_hline(y=20, row=4, col=1, line_color='blue', line_dash='dash', line_width=1)
 
     # レイアウト設定
     fig.update_layout(
-        height=850, margin=dict(l=20, r=60, t=50, b=20), showlegend=False,
-        hovermode='x', 
-        dragmode='pan', hoverdistance=-1, spikedistance=-1
+        height=1000, margin=dict(l=20, r=60, t=50, b=20), showlegend=False,
+        hovermode='x', dragmode='pan', hoverdistance=-1, spikedistance=-1
     )
     
     fig.update_xaxes(
@@ -319,13 +416,14 @@ def plot_market_dashboard(saitei_df, sinyou_df):
             dict(dtickrange=[1000*60*60*24*7, None], value="%y/%m/%d")
         ]
     )
-    # 各 y 軸のラベル等
     fig.update_yaxes(showspikes=False)
     fig.update_yaxes(title_text="株価", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True, range=[0.2, 1.6])
     fig.update_yaxes(title_text="億円", row=2, col=1)
-    # 信用比率は60以上を表示
-    fig.update_yaxes(title_text="比率", row=3, col=1, range=[60, df['ratio_sin'].max() * 1.05])
+    if not df_jp.empty:
+        fig.update_yaxes(title_text="比率", row=3, col=1, range=[60, df_jp['ratio_sin'].max() * 1.05])
+    fig.update_yaxes(title_text="指数", row=4, col=1, secondary_y=False, range=[0, 120])
+    fig.update_yaxes(title_text="S&P500", row=4, col=1, secondary_y=True)
         
     return fig
     
@@ -520,6 +618,7 @@ def analyze_market_streamlit(df_targets):
 if 'result_df' not in st.session_state: st.session_state.result_df = pd.DataFrame()
 if 'saitei_df' not in st.session_state: st.session_state.saitei_df = pd.DataFrame()
 if 'sinyou_df' not in st.session_state: st.session_state.sinyou_df = pd.DataFrame()
+if 'naaim_df' not in st.session_state: st.session_state.naaim_df = pd.DataFrame()
 if 'performed_scan' not in st.session_state: st.session_state.performed_scan = False
 
 with st.sidebar:
@@ -534,6 +633,8 @@ if selected_page == "マーケット情報":
             if not df_s.empty: st.session_state.saitei_df = df_s
             df_m = update_and_load_sinyou_data()
             if not df_m.empty: st.session_state.sinyou_df = df_m
+            df_n = update_and_load_naaim_data()
+            if not df_n.empty: st.session_state.naaim_df = df_n
             st.success("更新完了")
     st.write("---")
     col1, col2 = st.columns([2, 3])
@@ -546,8 +647,8 @@ if selected_page == "マーケット情報":
     elif period == "1年": start_dt = end_dt - pd.DateOffset(years=1)
     elif period == "3年": start_dt = end_dt - pd.DateOffset(years=3)
     else: start_dt = st.session_state.saitei_df['Date'].min() if not st.session_state.saitei_df.empty else end_dt - pd.DateOffset(years=10)
-    if not st.session_state.saitei_df.empty or not st.session_state.sinyou_df.empty:
-        fig = plot_market_dashboard(st.session_state.saitei_df, st.session_state.sinyou_df)
+    if not st.session_state.saitei_df.empty or not st.session_state.sinyou_df.empty or not st.session_state.naaim_df.empty:
+        fig = plot_market_dashboard(st.session_state.saitei_df, st.session_state.sinyou_df, st.session_state.naaim_df)
         if fig:
             fig.update_xaxes(range=[start_dt, end_dt + pd.Timedelta(days=7)])
             if not st.session_state.saitei_df.empty:
