@@ -151,7 +151,9 @@ def get_sector_spreadsheet():
     gc = get_gspread_client()
     if gc is None: return None
     try:
-        url = st.secrets["connections"]["gsheets"]["spreadsheet"] # シートBのURL
+        cfg = st.secrets["connections"]["gsheets"]
+        # sector_spreadsheetがあればそれを使い、無ければ従来のspreadsheetを使います
+        url = cfg.get("sector_spreadsheet", cfg.get("spreadsheet"))
         return gc.open_by_url(url)
     except Exception:
         return None
