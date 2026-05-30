@@ -116,14 +116,17 @@ def get_gspread_client():
 
 def get_management_spreadsheet():
     """
-    secrets.toml の [connections.gsheets].spreadsheet を管理スプレッドシートとして開く。
+    secrets.toml の [connections.gsheets].management_spreadsheet を優先して管理スプレッドシートとして開く。
+    設定されていない場合は、従来の [connections.gsheets].spreadsheet を開く。
     戻り値: gspread.Spreadsheet | None
     """
     gc = get_gspread_client()
     if gc is None:
         return None
     try:
-        url = st.secrets["connections"]["gsheets"]["spreadsheet"]
+        cfg = st.secrets["connections"]["gsheets"]
+        # management_spreadsheet の設定があれば優先し、なければ従来の spreadsheet を使う
+        url = cfg.get("management_spreadsheet", cfg.get("spreadsheet"))
         return gc.open_by_url(url)
     except Exception:
         return None
