@@ -773,8 +773,9 @@ def render_sector_rotation_page():
     for sname, tickers in sectors.items():
         idx_series = compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly)
         if not idx_series.empty:
-            sector_index_cache[sname] = idx_series
-            momentum_scores[sname] = get_sector_momentum(idx_series, days=min(5, period_days))
+            plot_series = relativize_series(idx_series, bm_series)
+            sector_index_cache[sname] = plot_series
+            momentum_scores[sname] = get_sector_momentum(plot_series, days=min(5, period_days))
 
     if momentum_scores:
         sorted_sectors = sorted(momentum_scores.items(), key=lambda x: x[1], reverse=True)
@@ -837,6 +838,7 @@ def render_sector_rotation_page():
 
                 # 個別銘柄のインデックス系列を計算
                 single_series = compute_sector_index_from_df(db_df, [code], period_days, resample_weekly)
+                single_series = relativize_series(single_series, bm_series)
                 mom_single = get_sector_momentum(single_series, days=min(5, period_days)) if not single_series.empty else 0.0
                 badge = "🟢" if mom_single >= 3.0 else "🔴" if mom_single <= -3.0 else "⚪"
                 color_theme = "#26a69a" if mom_single >= 3.0 else "#ef5350" if mom_single <= -3.0 else "#9e9e9e"
@@ -915,6 +917,18 @@ def get_benchmark_data(ticker, period_days, interval):
         if len(idx) > 0: idx.iloc[0] = 100.0
         return idx
     except Exception: return pd.Series(dtype=float)
+
+def relativize_series(idx_series: pd.Series, bm_series: pd.Series) -> pd.Series:
+    """セクター指数をベンチマークで割って相対強度系列に変換する"""
+    if bm_series is None or bm_series.empty:
+        return idx_series
+    common = idx_series.index.intersection(bm_series.index)
+    if len(common) < 2:
+        return idx_series
+    rel = (idx_series[common] / bm_series[common]) * 100
+    # 始点を100に正規化
+    rel = rel / rel.iloc[0] * 100
+    return rel
 
 def plot_sector_mini_chart(index_series, sector_name, momentum_pct):
     if index_series.empty: return go.Figure()
