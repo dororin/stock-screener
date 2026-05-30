@@ -184,6 +184,17 @@ def get_topix500_tickers() -> list:
         print(f"JPX銘柄リスト取得失敗: {e}")
         return []
 
+# お手持ちのCSVからA列の銘柄コードを読み込む例
+def get_custom_tickers_from_csv(csv_path) -> list:
+    try:
+        df = pd.read_csv(csv_path)
+        # A列（0番目の列）のデータを文字列のリストとして取得
+        codes = df.iloc[:, 0].dropna().astype(str).tolist()
+        return codes
+    except Exception as e:
+        print(f"CSV読み込み失敗: {e}")
+        return []
+
 # --- データベース統合更新エンジン ---
 
 def update_price_database(is_jp: bool = True, target_tickers: list = None):
@@ -323,6 +334,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--market", type=str, default="jp", choices=["jp", "us"])
+    parser.add_argument("--csv", type=str, default=None, help="カスタム銘柄コードを含むCSVファイルのパス")
     args = parser.parse_args()
 
     start_time = datetime.now()
@@ -331,7 +343,16 @@ def main():
     # 米国株のデフォルトセクター用シンボルの設定
     us_tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
     
-    update_price_database(is_jp=is_jp, target_tickers=None if is_jp else us_tickers)
+    target_tickers = None
+    if args.csv:
+        target_tickers = get_custom_tickers_from_csv(args.csv)
+        if not target_tickers:
+            print("CSVから銘柄を読み込めなかったため、処理を中断します。")
+            return
+    elif not is_jp:
+        target_tickers = us_tickers
+
+    update_price_database(is_jp=is_jp, target_tickers=target_tickers)
     print(f"\nPipeline finished. Duration: {datetime.now() - start_time}")
 
 if __name__ == "__main__":
