@@ -641,12 +641,11 @@ def render_sector_rotation_page():
         q = search_query.strip() if search_query else ""
 
         # 2文字以上でリアルタイム候補表示
-        # 2文字以上でリアルタイム候補表示
+        # 2文字以上でリアルタイム候補をボタン一覧で表示
         if len(q) >= 2:
             jpx_df = get_jpx_full_list()
             if jpx_df.empty:
-                # JPXリスト取得失敗時 → コード直接入力にフォールバック
-                st.caption("⚠️ JPXリスト取得失敗。コードを直接入力して追加できます。")
+                st.caption("⚠️ JPXリスト取得失敗。コードを直接入力してください。")
                 if q.isdigit():
                     if st.button(f"➕ {q} を追加", key="btn_add_direct", use_container_width=True):
                         st.session_state[CUSTOM_SECTOR_KEY][q] = q
@@ -656,25 +655,18 @@ def render_sector_rotation_page():
                     jpx_df['name'].str.contains(q, na=False, case=False) |
                     jpx_df['symbol'].str.contains(q, na=False)
                 )
-                found = jpx_df[mask].head(10)
+                found = jpx_df[mask].head(8)
                 if not found.empty:
-                    options = {
-                        f"{row['symbol']}  {row['name']}": (row['symbol'], row['name'])
-                        for _, row in found.iterrows()
-                    }
-                    selected_label = st.selectbox(
-                        "候補",
-                        list(options.keys()),
-                        key="watch_search_select",
-                        label_visibility="collapsed"
-                    )
-                    if st.button("➕ 追加", key="btn_add_watch", use_container_width=True):
-                        sel_code, sel_name = options[selected_label]
-                        st.session_state[CUSTOM_SECTOR_KEY][sel_code] = sel_name
-                        st.rerun()
+                    for _, row in found.iterrows():
+                        code_str = str(row['symbol'])
+                        name_str = str(row['name'])
+                        already = code_str in st.session_state[CUSTOM_SECTOR_KEY]
+                        label = f"✅ {code_str}　{name_str}" if already else f"➕ {code_str}　{name_str}"
+                        if st.button(label, key=f"srch_btn_{code_str}", use_container_width=True, disabled=already):
+                            st.session_state[CUSTOM_SECTOR_KEY][code_str] = name_str
+                            st.rerun()
                 else:
                     st.caption(f"「{q}」の候補なし（TOPIX500内で検索中）")
-                    # 数字ならコード直接追加も提示
                     if q.isdigit():
                         if st.button(f"➕ {q} をコードとして追加", key="btn_add_direct", use_container_width=True):
                             st.session_state[CUSTOM_SECTOR_KEY][q] = q
