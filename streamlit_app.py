@@ -192,6 +192,46 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
         return default_sectors
 
 # =====================================================================
+# 📌 ウォッチリスト スプレッドシート永続化
+# =====================================================================
+WATCHLIST_SHEET_NAME = "watchlist"
+
+def load_watchlist_from_sheets() -> dict:
+    """watchlistシートから {code: name} を読み込む。シートがなければ空dictを返す"""
+    sh = get_sector_spreadsheet()
+    if sh is None:
+        return {}
+    try:
+        ws = sh.worksheet(WATCHLIST_SHEET_NAME)
+        records = ws.get_all_records()
+        result = {}
+        for row in records:
+            code = str(row.get("code", "")).strip()
+            name = str(row.get("name", "")).strip()
+            if code:
+                result[code] = name
+        return result
+    except Exception:
+        return {}
+
+def save_watchlist_to_sheets(watchlist: dict):
+    """watchlistシートに {code: name} を全上書き保存。シートがなければ作成する"""
+    sh = get_sector_spreadsheet()
+    if sh is None:
+        return
+    try:
+        try:
+            ws = sh.worksheet(WATCHLIST_SHEET_NAME)
+        except Exception:
+            ws = sh.add_worksheet(title=WATCHLIST_SHEET_NAME, rows=200, cols=2)
+        rows = [["code", "name"]] + [[code, name] for code, name in watchlist.items()]
+        ws.clear()
+        ws.update(rows, "A1")
+    except Exception:
+        pass
+
+
+# =====================================================================
 # 📂 データベースアクセス関数
 # =====================================================================
 def load_unified_db(interval: str, is_jp: bool = True) -> pd.DataFrame:
@@ -618,6 +658,7 @@ def _watchlist_ui():
             if q.isdigit():
                 if st.button(f"➕ {q} を追加", key="btn_add_direct", use_container_width=True):
                     st.session_state[CUSTOM_SECTOR_KEY][q] = q
+                    save_watchlist_to_sheets(st.session_state[CUSTOM_SECTOR_KEY])
                     st.rerun(scope="app")
         else:
             mask = (
@@ -646,6 +687,7 @@ def _watchlist_ui():
                     sel_code, sel_name = code_map[selected]
                     if sel_code not in st.session_state[CUSTOM_SECTOR_KEY]:
                         st.session_state[CUSTOM_SECTOR_KEY][sel_code] = sel_name
+                        save_watchlist_to_sheets(st.session_state[CUSTOM_SECTOR_KEY])
                         st.rerun(scope="app")
                     else:
                         st.caption(f"✅ {sel_code} はすでに登録済みです")
@@ -654,6 +696,7 @@ def _watchlist_ui():
                 if q.isdigit():
                     if st.button(f"➕ {q} をコードとして追加", key="btn_add_direct", use_container_width=True):
                         st.session_state[CUSTOM_SECTOR_KEY][q] = q
+                        save_watchlist_to_sheets(st.session_state[CUSTOM_SECTOR_KEY])
                         st.rerun(scope="app")
     elif len(q) == 1:
         st.caption("もう1文字以上入力すると候補が表示されます")
@@ -671,6 +714,7 @@ def _watchlist_ui():
         for code in to_delete:
             del st.session_state[CUSTOM_SECTOR_KEY][code]
         if to_delete:
+            save_watchlist_to_sheets(st.session_state[CUSTOM_SECTOR_KEY])
             st.rerun(scope="app")
     else:
         st.caption("まだ銘柄が登録されていません")
@@ -682,8 +726,9 @@ def render_sector_rotation_page():
 
     # カスタム銘柄セクターのセッションステート初期化
     if CUSTOM_SECTOR_KEY not in st.session_state:
-        st.session_state[CUSTOM_SECTOR_KEY] = {}  # {ticker: name}
-
+        # 初回起動時にスプレッドシートから復元
+        loaded = load_watchlist_from_sheets()
+        st.session_state[CUSTOM_SECTOR_KEY] = loaded  # {code: name}
     with st.sidebar:
         st.subheader("⚙️ 表示設定")
         market_mode = st.radio("マーケット", ["日本株 🇯🇵", "米国株 🇺🇸"], horizontal=True)
