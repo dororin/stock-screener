@@ -185,14 +185,80 @@ def get_topix500_tickers() -> list:
         return []
 
 # お手持ちのCSVからA列の銘柄コードを読み込む例
-def get_custom_tickers_from_csv(csv_path) -> list:
+def load_tickers_from_file(file_path: str) -> list:
+    """CSVまたはExcel(XLS/XLSX)ファイルから、1行目を検索して『コード』列を特定し、ティッカーリストを読み込む"""
+    possible_paths = [
+        file_path,
+        os.path.join("/content/drive/MyDrive", file_path),
+        os.path.join("/content/drive/MyDrive/stock_data_hub", file_path),
+        os.path.join(os.getcwd(), file_path)
+    ]
+    
+    actual_path = None
+    for p in possible_paths:
+        if os.path.exists(p):
+            actual_path = p
+            break
+            
+    if not actual_path:
+        print(f"⚠️ 【警告】指定されたファイル '{file_path}' が見つかりませんでした。")
+        return []
+        
+    ext = os.path.splitext(actual_path)[1].lower()
     try:
-        df = pd.read_csv(csv_path)
-        # A列（0番目の列）のデータを文字列のリストとして取得
-        codes = df.iloc[:, 0].dropna().astype(str).tolist()
-        return codes
+        if ext == '.csv':
+            df = pd.read_csv(actual_path)
+        elif ext in ['.xls', '.xlsx']:
+            df = pd.read_excel(actual_path)
+        else:
+            print(f"❌ 【エラー】サポートされていないファイル形式です: {ext}")
+            return []
+            
+        if df.empty:
+            print("⚠️ 【警告】ファイルが空です。")
+            return []
+            
+        raw_tickers = []
+        ticker_col = None
+        
+        # 1行目のヘッダー名（df.columns）から『コード』に関連する文字が含まれる列を検索
+        # 日本語の「コード」「銘柄コード」や、英語の「ticker」「symbol」「code」に対応します
+        target_keywords = ['コード', 'ticker', 'symbol', 'code', '銘柄コード']
+        for col in df.columns:
+            col_str = str(col).strip().lower()
+            if any(k in col_str for k in target_keywords):
+                ticker_col = col
+                break
+                
+        if ticker_col is not None:
+            raw_tickers = df[ticker_col].dropna().astype(str).tolist()
+            print(f"🔍 1行目から『{ticker_col}』列を自動検出しました。この列からコードを抽出します。")
+        else:
+            # 万が一キーワードが見つからなかった場合は、1列目（インデックス0）を代替として読み込みます
+            raw_tickers = df.iloc[:, 0].dropna().astype(str).tolist()
+            print("⚠️ 1行目に『コード』に該当する見出しが見つかりませんでした。代わりに1列目のデータを読み込みます。")
+            
+            # 見出し行がないファイルで、1行目のコードが列名として読み込まれた場合の救済
+            first_col_name = str(df.columns[0]).strip().split('.')[0]
+            if first_col_name and not any(h in first_col_name.lower() for h in ['name', 'date', '日付', '市場', '価格', 'close']):
+                raw_tickers.insert(0, str(df.columns[0]))
+        
+        # データの整形（小数の削除など）
+        cleaned = []
+        for t in raw_tickers:
+            t_clean = t.strip().split('.')[0]
+            if t_clean and t_clean.isalnum():
+                cleaned.append(t_clean)
+                
+        # 重複を排除しつつ、順序を維持
+        seen = set()
+        unique_cleaned = [x for x in cleaned if not (x in seen or seen.add(x))]
+        
+        print(f"✅ ファイル '{actual_path}' から {len(unique_cleaned)} 個の固有銘柄を読み込みました。")
+        return unique_cleaned
+        
     except Exception as e:
-        print(f"CSV読み込み失敗: {e}")
+        print(f"❌ 【エラー】ファイルの読み込み中に問題が発生しました: {e}")
         return []
 
 # --- データベース統合更新エンジン ---
@@ -334,24 +400,24 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--market", type=str, default="jp", choices=["jp", "us"])
-    parser.add_argument("--csv", type=str, default=None, help="カスタム銘柄コードを含むCSVファイルのパス")
+    # --file を基本としつつ、従来の --csv でも同じ変数 file_path に入るようにします
+    parser.add_argument("--file", "--csv", dest="file_path", type=str, default=None, 
+                        help="Path to custom CSV/XLS/XLSX ticker list")
     args = parser.parse_args()
 
     start_time = datetime.now()
     is_jp = (args.market == "jp")
     
-    # 米国株のデフォルトセクター用シンボルの設定
-    us_tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
-    
     target_tickers = None
-    if args.csv:
-        target_tickers = get_custom_tickers_from_csv(args.csv)
+    
+    if args.file_path:
+        target_tickers = load_tickers_from_file(args.file_path)
         if not target_tickers:
-            print("CSVから銘柄を読み込めなかったため、処理を中断します。")
+            print("❌ 有効な銘柄コードが見つからなかったため、処理を中断します。")
             return
     elif not is_jp:
-        target_tickers = us_tickers
-
+        target_tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
+    
     update_price_database(is_jp=is_jp, target_tickers=target_tickers)
     print(f"\nPipeline finished. Duration: {datetime.now() - start_time}")
 
