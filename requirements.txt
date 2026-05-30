@@ -10,3 +10,4 @@ st-gsheets-connection
 plotly
 requests
 beautifulsoup4
+gspread
