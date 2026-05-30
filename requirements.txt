@@ -12,7 +12,6 @@ requests
 beautifulsoup4
 gspread
 google-api-python-client
-streamlit-gsheets
 pandas-datareader
 pyarrow
 fastparquet
