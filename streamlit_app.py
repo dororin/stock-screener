@@ -9,7 +9,7 @@ import base64
 import matplotlib.pyplot as plt
 import os
 import json
-import shutil
+import sys
 from datetime import datetime, timedelta
 from typing import Optional
 from streamlit_gsheets import GSheetsConnection
@@ -24,9 +24,18 @@ import re
 # =====================================================================
 # 📂 データベースを安全に一元管理する自作ライブラリをインポート
 # =====================================================================
+# パスずれによるインポートエラーを強制防止
+current_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
+
 import stock_study
 
-# --- 固定セクター定義 (Google Sheets からいつでも上書き同期可能) ---
+# =====================================================================
+# セクターローテーション用 定数・設定
+# =====================================================================
+
+# --- デフォルトセクター定義 ---
 JP_SECTORS = {
     "半導体・装置": ["8035", "6857", "6146", "6920", "6963", "4063", "6981"],
     "電気機器": ["6758", "6861", "6954", "6902", "7751", "6971"],
@@ -62,7 +71,70 @@ US_BENCHMARKS = {"なし（絶対値）": None, "S&P500": "^GSPC", "NASDAQ100": 
 
 MARKET_DATA_URL = "https://docs.google.com/spreadsheets/d/1vaX2dKcHO_fo_KMffNiC98pY1fzfMkHCRkHE1IFE0PI/edit"
 
-# --- 認証関係 ---
+# --- ページ設定 ---
+st.set_page_config(
+    page_title="WVF Stock Screener Pro",
+    page_icon="📈",
+    layout="wide"
+)
+
+# --- カスタムCSS ---
+st.markdown("""
+    <style>
+    html, body, [class*="st-"] { font-size: 0.95rem !important; }
+    [data-testid="stMetricValue"] { font-size: 1.1rem !important; font-weight: 600; }
+    [data-testid="stMetricLabel"] { font-size: 0.8rem !important; }
+    .stMainContainer { padding-top: 2rem !important; }
+    .stVerticalBlock { gap: 0.5rem !important; }
+    hr { margin: 0.8rem 0 !important; }
+    h3 { font-size: 1.1rem !important; margin-bottom: 0.3rem !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# =====================================================================
+# Google Sheets 共通接続 & 履歴管理 (履歴保存シート)
+# =====================================================================
+try:
+    conn = st.connection("gsheets", type=GSheetsConnection)
+except Exception:
+    conn = None
+
+def save_history(df):
+    if conn is None: return None
+    screening_id = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_df = df.copy()
+    save_df['screening_id'] = screening_id
+    try:
+        existing_data = conn.read()
+        updated_data = pd.concat([existing_data, save_df], ignore_index=True)
+    except Exception:
+        updated_data = save_df
+    conn.update(data=updated_data)
+    return screening_id
+
+def get_history_list():
+    if conn is None: return []
+    try:
+        df = conn.read(ttl=0)
+        if df is None or df.empty or 'screening_id' not in df.columns: return []
+        return sorted(df['screening_id'].unique().tolist(), reverse=True)
+    except Exception: return []
+
+def load_history(screening_id):
+    if conn is None: return pd.DataFrame()
+    try:
+        df = conn.read()
+        target_df = df[df['screening_id'] == screening_id].copy()
+        if not target_df.empty and 'コード' in target_df.columns:
+            target_df['コード'] = target_df['コード'].astype(str).str.replace(r'\.0$', '', regex=True)
+        if not target_df.empty and 'お気に入り' not in target_df.columns:
+            target_df['お気に入り'] = False
+        return target_df
+    except Exception: return pd.DataFrame()
+
+# =====================================================================
+# Google Sheets セクター定義シート (シートB)
+# =====================================================================
 @st.cache_resource
 def get_gspread_client():
     try:
@@ -79,14 +151,11 @@ def get_sector_spreadsheet():
     gc = get_gspread_client()
     if gc is None: return None
     try:
-        url = st.secrets["connections"]["gsheets"]["spreadsheet"] # スプレッドシートB
+        url = st.secrets["connections"]["gsheets"]["spreadsheet"] # シートBのURL
         return gc.open_by_url(url)
     except Exception:
         return None
 
-# =====================================================================
-# セクター定義のシート同期・読み込み
-# =====================================================================
 def load_sector_master_from_sheets(is_jp: bool) -> dict:
     sh = get_sector_spreadsheet()
     default_sectors = JP_SECTORS if is_jp else US_SECTORS
@@ -101,7 +170,6 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
         df = pd.DataFrame(records)
         df.columns = [str(c).strip() for c in df.columns]
         
-        # 簡易列マッピング
         col_map = {}
         for c in df.columns:
             if c in ["セクター名", "sector", "sector_name"]: col_map[c] = "sector"
@@ -121,27 +189,8 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
     except Exception:
         return default_sectors
 
-def save_sector_master_to_sheets(sectors: dict, is_jp: bool) -> bool:
-    sh = get_sector_spreadsheet()
-    if sh is None: return False
-    sheet_name = "sector_JP" if is_jp else "sector_US"
-    try:
-        try:
-            ws = sh.worksheet(sheet_name)
-        except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=sheet_name, rows=500, cols=3)
-        rows = [["セクター名", "銘柄コード", "備考"]]
-        for sec, codes in sectors.items():
-            for code in codes:
-                rows.append([sec, code, ""])
-        ws.clear()
-        ws.update(rows)
-        return True
-    except Exception:
-        return False
-
 # =====================================================================
-# 📁 データベースアクセス関数
+# 📂 データベースアクセス関数
 # =====================================================================
 def load_unified_db(interval: str, is_jp: bool = True) -> pd.DataFrame:
     try:
@@ -162,7 +211,6 @@ def run_fast_screening(db_df: pd.DataFrame) -> pd.DataFrame:
     results = []
     tickers = db_df['ticker'].unique()
     
-    # 完全に整列されていることを確認
     db_df = db_df.sort_values(["ticker", "date"])
     
     progress_bar = st.progress(0)
@@ -254,9 +302,288 @@ def get_jpx_list():
     except Exception: return pd.DataFrame()
 
 # =====================================================================
-# 各ページ描画処理
+# マーケット情報ダッシュボード関係の関数
 # =====================================================================
+def fetch_naaim_data():
+    base_url = "https://naaim.org/programs/naaim-exposure-index/"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        res = requests.get(base_url, headers=headers, timeout=15)
+        if res.status_code != 200: return pd.DataFrame()
+        soup = BeautifulSoup(res.text, "html.parser")
+        links = soup.find_all("a", href=re.compile(r"\.xlsx$"))
+        excel_url = None
+        for link in links:
+            if "HERE" in link.get_text().upper():
+                excel_url = link.get('href')
+                break
+        if not excel_url and links: excel_url = links[0].get('href')
+        if not excel_url: return pd.DataFrame()
+        
+        content = requests.get(excel_url, headers=headers).content
+        df = pd.read_excel(io.BytesIO(content))
+        df.columns = [str(c).strip() for c in df.columns]
+        
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df = df.dropna(subset=['Date'])
+            val_col = next((c for c in df.columns if 'NAAIM Number' in c or 'Mean' in c or 'Average' in c), None)
+            if val_col:
+                df = df[['Date', val_col]].rename(columns={val_col: 'NAAIM'})
+                return df.sort_values('Date').reset_index(drop=True)
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
+def update_and_load_naaim_data():
+    existing_df = pd.DataFrame(columns=['Date', 'NAAIM'])
+    if conn is not None:
+        try:
+            existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="naaim_data", ttl=0)
+            if existing_df is not None and not existing_df.empty:
+                existing_df['Date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
+                existing_df = existing_df.dropna(subset=['NAAIM']).copy()
+        except Exception: pass
+    
+    web_df = fetch_naaim_data()
+    merged_df = web_df if existing_df.empty else pd.concat([existing_df, web_df]) if not web_df.empty else existing_df
+        
+    if not merged_df.empty:
+        merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.normalize()
+        merged_df = merged_df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
+        
+    if conn is not None and not merged_df.empty:
+        try:
+            save_df = merged_df.copy()
+            save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
+            conn.update(spreadsheet=MARKET_DATA_URL, worksheet="naaim_data", data=save_df)
+        except Exception: pass
+    return merged_df
+
+def fetch_irbank_margin(code):
+    url = f"https://irbank.net/{code}/margin"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200: return pd.DataFrame()
+        soup = BeautifulSoup(res.text, "html.parser")
+        table = soup.find("table")
+        if not table: return pd.DataFrame()
+        rows = table.find_all("tr")
+        data = []
+        current_year = str(pd.Timestamp.now().year)
+        for row in rows:
+            if "occ" in row.get('class', []):
+                year_td = row.find("td", class_="ct")
+                if year_td:
+                    year_val = year_td.get_text(strip=True)
+                    if re.match(r"^\d{4}$", year_val): current_year = year_val
+                continue
+            if any(cls in row.get('class', []) for cls in ["obb", "odd"]):
+                cells = row.find_all("td")
+                if len(cells) < 4: continue
+                date_text = cells[0].get_text(strip=True)
+                if not re.match(r"^\d{1,2}/\d{1,2}$", date_text): continue
+                try:
+                    buy_text = cells[1].get_text(separator="|", strip=True).split("|")[0].replace(",", "")
+                    sell_text = cells[3].get_text(separator="|", strip=True).split("|")[0].replace(",", "")
+                    data.append({
+                        'Date': pd.to_datetime(f"{current_year}/{date_text}"),
+                        'Buy(Shares)': int(buy_text),
+                        'Sell(Shares)': int(sell_text)
+                    })
+                except Exception: continue
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df = df.drop_duplicates(subset=['Date']).sort_values('Date').reset_index(drop=True)
+        return df
+    except Exception: return pd.DataFrame()
+
+def plot_individual_margin(df, code):
+    if df.empty: return None
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['Buy(Shares)'], mode='lines+markers', name='信用買い残', line=dict(color='red', width=2)))
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['Sell(Shares)'], mode='lines+markers', name='信用売り残', line=dict(color='blue', width=2)))
+    fig.update_layout(
+        title=f"銘柄コード {code} : 信用残高推移 (株)",
+        height=400, margin=dict(l=20, r=20, t=50, b=20),
+        hovermode='x', template='plotly_white',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        spikedistance=-1, hoverdistance=-1
+    )
+    fig.update_xaxes(showspikes=True, spikemode='across', spikesnap='cursor', spikedash='solid', spikethickness=1, spikecolor='#ff4b4b')
+    return fig
+
+def fetch_sinyou_data():
+    url = "https://nikkei225jp.com/_data/_nfsWEB/DAY/dailyweek2.json"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://nikkei225jp.com/data/sinyou.php"}
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        res.encoding = 'utf-8'
+        if res.status_code != 200: return pd.DataFrame()
+        json_text = res.text.strip().replace("var DAILY =", "").strip().rstrip(";")
+        raw_rows = json.loads(json_text)
+        data = []
+        for r in raw_rows:
+            if len(r) >= 7 and r[4] != "" and r[6] != "":
+                data.append({
+                    'Date': pd.to_datetime(r[0], unit='ms'),
+                    'Nikkei225': float(r[1]) if r[1] != "" else np.nan,
+                    'Sell(M-yen)': int(str(r[4]).replace(',', '')),
+                    'Buy(M-yen)': int(str(r[6]).replace(',', ''))
+                })
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df['Date'] = df['Date'].dt.tz_localize(None)
+            df = df.sort_values('Date').reset_index(drop=True)
+        return df
+    except Exception: return pd.DataFrame()
+
+def update_and_load_sinyou_data():
+    if conn is None: return pd.DataFrame()
+    try:
+        existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", ttl=0)
+        if existing_df is not None and not existing_df.empty:
+            existing_df['Date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
+    except Exception: existing_df = pd.DataFrame()
+    
+    web_df = fetch_sinyou_data()
+    merged_df = web_df if existing_df.empty else pd.concat([existing_df, web_df]) if not web_df.empty else existing_df
+        
+    if not merged_df.empty:
+        merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.normalize()
+        merged_df = merged_df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
+        
+    try:
+        if not merged_df.empty:
+            save_df = merged_df.copy()
+            save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
+            conn.update(spreadsheet=MARKET_DATA_URL, worksheet="sinyou_data", data=save_df)
+    except Exception: pass
+    return merged_df
+
+def parse_saitei_amount(val):
+    try:
+        if not val or val == "": return np.nan
+        return int(str(val).replace(',', '').strip()) // 100
+    except Exception: return np.nan
+
+def fetch_saitei_data():
+    url = "https://nikkei225jp.com/_data/_nfsWEB/HS_DATA_DAY/daily_saitei.json"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://nikkei225jp.com/data/saitei.php"}
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        res.encoding = 'utf-8'
+        if res.status_code != 200: return pd.DataFrame()
+        text = res.text.strip().replace("var DAILY =", "").strip().rstrip(";")
+        raw = json.loads(text)
+        data = []
+        for r in raw:
+            if len(r) >= 9 and r[7] != "" and r[8] != "":
+                data.append({
+                    'Date': pd.to_datetime(r[0], unit='ms'),
+                    'Nikkei225': float(r[1]) if r[1] != "" else np.nan,
+                    'Sell(Oku-yen)': parse_saitei_amount(r[7]),
+                    'Buy(Oku-yen)': parse_saitei_amount(r[8])
+                })
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df['Date'] = df['Date'].dt.tz_localize(None).dropna()
+            df = df.sort_values('Date').reset_index(drop=True)
+        return df
+    except Exception: return pd.DataFrame()
+
+def update_and_load_saitei_data():
+    if conn is None: return pd.DataFrame()
+    try:
+        existing_df = conn.read(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", ttl=0)
+        if existing_df is not None and not existing_df.empty:
+            existing_df['Date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
+    except Exception: existing_df = pd.DataFrame()
+    
+    web_df = fetch_saitei_data()
+    merged_df = web_df if existing_df.empty else pd.concat([existing_df, web_df]) if not web_df.empty else existing_df
+        
+    if not merged_df.empty:
+        merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.normalize()
+        merged_df = merged_df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
+        
+    try:
+        if not merged_df.empty:
+            save_df = merged_df.copy()
+            save_df['Date'] = save_df['Date'].dt.strftime('%Y-%m-%d')
+            conn.update(spreadsheet=MARKET_DATA_URL, worksheet="saitei_data", data=save_df)
+    except Exception: pass
+    return merged_df
+
+def plot_market_dashboard(saitei_df, sinyou_df, naaim_df):
+    if saitei_df.empty and sinyou_df.empty and naaim_df.empty: return None
+    
+    has_naaim = not naaim_df.empty
+    rows = 4 if has_naaim else 3
+    row_heights = [0.55, 0.15, 0.15, 0.15] if has_naaim else [0.6, 0.2, 0.2]
+    specs = [[{"secondary_y": True}], [{}], [{}]]
+    titles = ['日経平均 & 裁定倍率 (右軸)', '裁定買残 (億円)', '信用比率 (買残 / 日経平均)']
+    if has_naaim:
+        specs.append([{"secondary_y": True}])
+        titles.append('NAAIM Exposure Index')
+    
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=row_heights, specs=specs, subplot_titles=titles)
+    
+    d1 = saitei_df.copy() if not saitei_df.empty else pd.DataFrame()
+    d2 = sinyou_df.copy() if not sinyou_df.empty else pd.DataFrame()
+    if not d1.empty and not d2.empty:
+        d1['Date'] = pd.to_datetime(d1['Date']).dt.normalize()
+        d2['Date'] = pd.to_datetime(d2['Date']).dt.normalize()
+        df_jp = pd.merge(d1, d2, on='Date', how='inner', suffixes=('_sai', '_sin')).sort_values('Date')
+        df_jp = df_jp[~df_jp['Date'].duplicated(keep='last')]
+        df_jp.columns = [str(c).lower().strip() for c in df_jp.columns]
+        
+        nik_col = 'nikkei225_sai' if 'nikkei225_sai' in df_jp.columns else 'nikkei225'
+        buy_sai_col = 'buy(oku-yen)'
+        buy_sin_col = 'buy(m-yen)'
+        df_jp['ratio_sai'] = df_jp[buy_sai_col] / df_jp[nik_col]
+        df_jp['ratio_sin'] = df_jp[buy_sin_col] / df_jp[nik_col]
+        
+        fig.add_hline(y=0.6, row=1, col=1, secondary_y=True, line_color='lightblue', line_dash='dash', line_width=1)
+        fig.add_trace(go.Scatter(x=df_jp['date'], y=df_jp[nik_col], mode='lines', name='日経平均', line=dict(color='orange', width=2)), row=1, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=df_jp['date'], y=df_jp['ratio_sai'], mode='lines', name='裁定倍率', line=dict(color='red', width=2)), row=1, col=1, secondary_y=True)
+        fig.add_trace(go.Bar(x=df_jp['date'], y=df_jp[buy_sai_col], name='裁定買残', marker_color='#1f77b4'), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df_jp['date'], y=df_jp['ratio_sin'], mode='lines', name='信用比率', line=dict(color='green', width=1.5), fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)'), row=3, col=1)
+
+    if has_naaim:
+        n_df = naaim_df.copy()
+        n_df['Date'] = pd.to_datetime(n_df['Date']).dt.normalize()
+        try:
+            sp500 = yf.download("^GSPC", start=n_df['Date'].min(), progress=False)
+            if not sp500.empty:
+                sp500 = sp500.reset_index()
+                close_col = 'Close' if 'Close' in sp500.columns else sp500.columns[sp500.columns.get_level_values(0) == 'Close'][0]
+                fig.add_trace(go.Scatter(x=sp500['Date'], y=sp500[close_col], mode='lines', name='S&P 500', line=dict(color='rgba(128, 128, 128, 0.4)', width=1, dash='dot')), row=4, col=1, secondary_y=True)
+        except Exception: pass
+
+        fig.add_trace(go.Scatter(x=n_df['Date'], y=n_df['NAAIM'], mode='lines', name='NAAIM', line=dict(color='#2E5BFF', width=2.5)), row=4, col=1, secondary_y=False)
+        fig.add_hline(y=100, row=4, col=1, line_color='rgba(255, 0, 0, 0.3)', line_dash='dash', line_width=1)
+        fig.add_hline(y=0, row=4, col=1, line_color='black', line_width=1)
+
+    fig.update_layout(height=1000 if has_naaim else 800, margin=dict(l=20, r=60, t=50, b=20), showlegend=False, hovermode='x', dragmode='pan', hoverdistance=-1, spikedistance=-1)
+    fig.update_xaxes(showticklabels=True, nticks=16, matches='x', showspikes=True, spikemode='across', spikesnap='cursor', spikethickness=1, spikecolor='#ff4b4b', spikedash='solid', showline=True)
+    fig.update_yaxes(showspikes=False)
+    fig.update_yaxes(title_text="株価", row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="倍率", row=1, col=1, secondary_y=True, range=[0.2, 1.6])
+    fig.update_yaxes(title_text="億円", row=2, col=1)
+    if not d1.empty and not d2.empty:
+        fig.update_yaxes(title_text="比率", row=3, col=1, range=[60, df_jp['ratio_sin'].max() * 1.05])
+    if has_naaim:
+        fig.update_yaxes(title_text="指数", row=4, col=1, secondary_y=False, range=[0, 120])
+        fig.update_yaxes(title_text="S&P500", row=4, col=1, secondary_y=True)
+        
+    return fig
+
+
+# =====================================================================
+# 🔄 セクターローテーション: ページ描画
+# =====================================================================
 def render_sector_rotation_page():
     st.title("🔄 セクターローテーション分析（統合版）")
 
@@ -351,86 +678,6 @@ def render_sector_rotation_page():
         if sel_idx is not None:
             st.plotly_chart(plot_sector_detail_chart(sel_idx, bm_series, sel_name, bm_label), use_container_width=True)
 
-# --- スコア測定ヘルパー ---
-def compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly):
-    if db_df.empty: return pd.Series(dtype=float)
-    db_df = db_df.copy()
-    db_df["date"] = pd.to_datetime(db_df["date"]).dt.tz_localize(None)
-    end_date = db_df["date"].max()
-    start_date = end_date - timedelta(days=period_days)
-    target_df = db_df[(db_df["date"] >= start_date) & (db_df["ticker"].isin(tickers))].copy()
-    if target_df.empty: return pd.Series(dtype=float)
-    
-    if resample_weekly:
-        target_df = target_df.set_index("date")
-        target_df = target_df.groupby("ticker").resample("W-FRI").agg({"close": "last"}).reset_index()
-        
-    close_pivot = target_df.pivot_table(index="date", columns="ticker", values="close")
-    close_pivot = close_pivot.sort_index()
-    daily_returns = close_pivot.pct_change()
-    sector_return = daily_returns.mean(axis=1)
-    index_series = (1 + sector_return).cumprod() * 100
-    if len(index_series) > 0: index_series.iloc[0] = 100.0
-    return index_series
-
-def get_sector_momentum(index_series, days=5):
-    if len(index_series) < 2: return 0.0
-    recent = index_series.iloc[-min(days, len(index_series)):]
-    if recent.iloc[0] == 0: return 0.0
-    return float((recent.iloc[-1] / recent.iloc[0] - 1) * 100)
-
-@st.cache_data(ttl=600)
-def get_benchmark_data(ticker, period_days, interval):
-    try:
-        end = datetime.now()
-        start = end - timedelta(days=period_days + 30)
-        df_raw = yf.download(ticker, start=start.strftime("%Y-%m-%d"), interval=interval, auto_adjust=True, progress=False)
-        if df_raw.empty: return pd.Series(dtype=float)
-        df_raw = df_raw.reset_index()
-        df_raw.columns = [str(c).lower() if not isinstance(c, tuple) else str(c[0]).lower() for c in df_raw.columns]
-        date_col = "date" if "date" in df_raw.columns else "datetime"
-        df_raw = df_raw.rename(columns={date_col: "date"})
-        df_raw["date"] = pd.to_datetime(df_raw["date"]).dt.tz_localize(None)
-        close = df_raw.set_index("date")["close"]
-        ret = close.pct_change()
-        idx = (1 + ret).cumprod() * 100
-        if len(idx) > 0: idx.iloc[0] = 100.0
-        return idx
-    except Exception: return pd.Series(dtype=float)
-
-def plot_sector_mini_chart(index_series, sector_name, momentum_pct):
-    if index_series.empty: return go.Figure()
-    color = "#26a69a" if momentum_pct >= 0 else "#ef5350"
-    fill_color = "rgba(38,166,154,0.15)" if momentum_pct >= 0 else "rgba(239,83,80,0.15)"
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=index_series.index, y=index_series.values, mode="lines",
-        line=dict(color=color, width=2), fill="tozeroy", fillcolor=fill_color,
-        hovertemplate="%{x|%m/%d}: %{y:.1f}<extra></extra>"
-    ))
-    fig.add_hline(y=100, line_dash="dot", line_color="gray", line_width=1, opacity=0.5)
-    fig.update_layout(
-        height=140, margin=dict(l=5, r=5, t=5, b=5), showlegend=False,
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
-        yaxis=dict(showticklabels=True, showgrid=True, gridcolor="rgba(128,128,128,0.2)", zeroline=False, tickfont=dict(size=9)),
-    )
-    return fig
-
-def plot_sector_detail_chart(index_series, benchmark_series, sector_name, benchmark_label):
-    fig = make_subplots(rows=2 if benchmark_series is not None and not benchmark_series.empty else 1,
-                        cols=1, shared_xaxes=True,
-                        row_heights=[0.7, 0.3] if benchmark_series is not None else [1.0])
-    fig.add_trace(go.Scatter(x=index_series.index, y=index_series.values, name=sector_name, line=dict(color="#2196F3", width=2)), row=1, col=1)
-    if benchmark_series is not None and not benchmark_series.empty:
-        common_dates = index_series.index.intersection(benchmark_series.index)
-        if len(common_dates) > 0:
-            rel = (index_series[common_dates] / benchmark_series[common_dates]) * 100
-            fig.add_trace(go.Scatter(x=rel.index, y=rel.values, name=f"相対強度 vs {benchmark_label}", line=dict(color="#FF9800", width=1.5)), row=2, col=1)
-            fig.add_hline(y=100, line_dash="dot", line_color="gray", row=2, col=1)
-    fig.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified", template="plotly_white", legend=dict(orientation="h", y=1.05))
-    return fig
-
 
 # =====================================================================
 # メイン画面ルーティング
@@ -450,6 +697,75 @@ if selected_page == "セクターローテーション":
     render_sector_rotation_page()
     st.stop()
 
+# --- マーケット情報ページ ---
+if selected_page == "マーケット情報":
+    st.title("📈 マーケット情報")
+    if st.button("データ取得・更新", type="primary"):
+        with st.spinner("更新中..."):
+            df_s = update_and_load_saitei_data()
+            if not df_s.empty: st.session_state.saitei_df = df_s
+            df_m = update_and_load_sinyou_data()
+            if not df_m.empty: st.session_state.sinyou_df = df_m
+            df_n = update_and_load_naaim_data()
+            if not df_n.empty: st.session_state.naaim_df = df_n
+            st.success("更新完了")
+    st.write("---")
+    col1, col2 = st.columns([2, 3])
+    with col1: st.subheader("📊 分析ダッシュボード")
+    with col2: period = st.radio("期間:", ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "3年", "全"], index=3, horizontal=True, label_visibility="collapsed")
+    
+    end_dt = st.session_state.saitei_df['Date'].max() if not st.session_state.saitei_df.empty else pd.Timestamp.now()
+    if period == "1ヶ月": start_dt = end_dt - pd.DateOffset(months=1)
+    elif period == "3ヶ月": start_dt = end_dt - pd.DateOffset(months=3)
+    elif period == "6ヶ月": start_dt = end_dt - pd.DateOffset(months=6)
+    elif period == "1年": start_dt = end_dt - pd.DateOffset(years=1)
+    elif period == "3年": start_dt = end_dt - pd.DateOffset(years=3)
+    else: start_dt = st.session_state.saitei_df['Date'].min() if not st.session_state.saitei_df.empty else end_dt - pd.DateOffset(years=10)
+    st.write("---")
+    
+    m_col1, _ = st.columns([1, 1])
+    with m_col1:
+        if not st.session_state.naaim_df.empty:
+            latest_naaim = st.session_state.naaim_df.iloc[-1]
+            prev_naaim = st.session_state.naaim_df.iloc[-2] if len(st.session_state.naaim_df) > 1 else latest_naaim
+            delta = round(latest_naaim['NAAIM'] - prev_naaim['NAAIM'], 2)
+            st.metric("最新 NAAIM Exposure Index", f"{latest_naaim['NAAIM']}", delta=f"{delta}")
+            st.caption(f"更新日: {latest_naaim['Date'].strftime('%Y-%m-%d')}")
+            
+    if not st.session_state.saitei_df.empty or not st.session_state.sinyou_df.empty or not st.session_state.naaim_df.empty:
+        fig = plot_market_dashboard(st.session_state.saitei_df, st.session_state.sinyou_df, st.session_state.naaim_df)
+        if fig:
+            fig.update_xaxes(range=[start_dt, end_dt + pd.Timedelta(days=7)])
+            if not st.session_state.saitei_df.empty:
+                v = st.session_state.saitei_df[(st.session_state.saitei_df['Date'] >= start_dt) & (st.session_state.saitei_df['Date'] <= end_dt)]
+                if not v.empty: fig.update_yaxes(range=[v['Nikkei225'].min()*0.98, v['Nikkei225'].max()*1.02], row=1, col=1, secondary_y=False)
+            fig.update_yaxes(fixedrange=True)
+            st.plotly_chart(fig, use_container_width=True)
+    else: st.info("「データ取得・更新」ボタンを押してください。")
+    
+    st.write("---")
+    st.subheader("🔍 個別銘柄 信用残検索 (IRBank)")
+    c1, c2 = st.columns([1, 4])
+    search_code = c1.text_input("銘柄コード", value="1321", placeholder="例: 1321")
+    if search_code:
+        with st.spinner(f"{search_code} のデータを取得中..."):
+            idf = fetch_irbank_margin(search_code)
+            if not idf.empty:
+                p = st.radio("表示期間:", ["6ヶ月", "1年", "3年", "全"], key="ir_p", horizontal=True)
+                i_end = idf['Date'].max()
+                if p == "6ヶ月": i_start = i_end - pd.DateOffset(months=6)
+                elif p == "1年": i_start = i_end - pd.DateOffset(years=1)
+                elif p == "3年": i_start = i_end - pd.DateOffset(years=3)
+                else: i_start = idf['Date'].min()
+                
+                vdf = idf[idf['Date'] >= i_start]
+                if not vdf.empty:
+                    ifig = plot_individual_margin(vdf, search_code)
+                    st.plotly_chart(ifig, use_container_width=True)
+            else:
+                st.warning("データが見つかりませんでした。コードを確認してください。")
+    st.stop()
+
 # --- スクリーニングページ ---
 if selected_page == "スクリーニング":
     st.title("WVF + Trend Screener :blue[Pro]")
@@ -457,7 +773,7 @@ if selected_page == "スクリーニング":
     with st.sidebar:
         st.subheader("スクリーニング操作")
         
-        # 保存用Google Sheet履歴ロード
+        # 履歴ロード
         with st.expander("📂 履歴表示", expanded=True):
             ids = get_history_list()
             if ids:
@@ -487,7 +803,7 @@ if selected_page == "スクリーニング":
                     st.success("結果を保存しました！")
                     st.rerun()
 
-    # スクリーニング結果表示
+    # 結果の表示
     if not st.session_state.result_df.empty:
         rdf = st.session_state.result_df
         for i in range(0, len(rdf), 2):
@@ -517,9 +833,6 @@ if selected_page == "スクリーニング":
             st.warning("条件に一致する銘柄は見つかりませんでした。")
         else:
             st.info("左サイドバーの「🚀 スクリーニング開始」ボタンを押してください。データベースから超高速判定を行います。")
-    st.stop()
-
-
 # --- マーケット情報ページ (従来ロジックそのまま維持) ---
 if selected_page == "マーケット情報":
     st.title("📈 マーケット情報")
