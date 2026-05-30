@@ -220,23 +220,35 @@ SECTOR_SHEET_NAME_US = "sector_US"
 #   セクター名 | 銘柄コード | 備考
 # 1セクター複数銘柄 → 1銘柄1行（long形式）
 
-def load_sector_master_from_sheets(is_jp: bool) -> dict:
+def load_sector_master_from_sheets(is_jp: bool, override_url: str = None) -> dict:
     """
-    管理スプレッドシートの sector_JP または sector_US シートから
+    指定された url または管理スプレッドシートの sector_JP または sector_US シートから
     セクター辞書 {セクター名: [コード, ...]} を読み込む。
-    シートがない場合はハードコードのデフォルトを返す。
     """
-    sh = get_management_spreadsheet()
-    if sh is None:
+    gc = get_gspread_client()
+    if gc is None:
         return JP_SECTORS if is_jp else US_SECTORS
+    
+    # override_url（選択された別シート）があればそれを使い、なければ従来の management_spreadsheet を使う
+    if override_url:
+        url = override_url
+    else:
+        sh_m = get_management_spreadsheet()
+        if sh_m is None:
+            return JP_SECTORS if is_jp else US_SECTORS
+        try:
+            url = st.secrets["connections"]["gsheets"]["spreadsheet"]
+        except Exception:
+            return JP_SECTORS if is_jp else US_SECTORS
+
     sheet_name = SECTOR_SHEET_NAME_JP if is_jp else SECTOR_SHEET_NAME_US
     try:
+        sh = gc.open_by_url(url)
         ws = sh.worksheet(sheet_name)
         records = ws.get_all_records()
         if not records:
             return JP_SECTORS if is_jp else US_SECTORS
         df = pd.DataFrame(records)
-        # 列名の正規化（大文字小文字・スペース対応）
         col_map = {}
         for c in df.columns:
             lc = str(c).strip().lower().replace(" ", "_")
@@ -252,15 +264,19 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
         result = {}
         for _, row in df.iterrows():
             sec = str(row["sector"]).strip()
-            code = str(row["code"]).strip().split(".")[0]  # .T サフィックス除去
+            code = str(row["code"]).strip().split(".")[0]
             if sec and code:
                 result.setdefault(sec, [])
                 if code not in result[sec]:
                     result[sec].append(code)
         return result if result else (JP_SECTORS if is_jp else US_SECTORS)
     except gspread.exceptions.WorksheetNotFound:
-        # シートが存在しない → デフォルトを自動書き込みして返す
-        _init_sector_sheet(sh, is_jp)
+        # シートがない場合は自動作成（デフォルト書き込み）
+        try:
+            sh = gc.open_by_url(url)
+            _init_sector_sheet(sh, is_jp)
+        except Exception:
+            pass
         return JP_SECTORS if is_jp else US_SECTORS
     except Exception:
         return JP_SECTORS if is_jp else US_SECTORS
@@ -279,13 +295,26 @@ def _init_sector_sheet(sh, is_jp: bool):
     except Exception:
         pass
 
-def save_sector_master_to_sheets(sectors: dict, is_jp: bool) -> bool:
-    """セクター辞書を Sheets に保存する"""
-    sh = get_management_spreadsheet()
-    if sh is None:
+def save_sector_master_to_sheets(sectors: dict, is_jp: bool, override_url: str = None) -> bool:
+    """セクター辞書を 指定されたURL または管理 Sheets に保存する"""
+    gc = get_gspread_client()
+    if gc is None:
         return False
+    
+    if override_url:
+        url = override_url
+    else:
+        sh_m = get_management_spreadsheet()
+        if sh_m is None:
+            return False
+        try:
+            url = st.secrets["connections"]["gsheets"]["spreadsheet"]
+        except Exception:
+            return False
+
     sheet_name = SECTOR_SHEET_NAME_JP if is_jp else SECTOR_SHEET_NAME_US
     try:
+        sh = gc.open_by_url(url)
         try:
             ws = sh.worksheet(sheet_name)
         except gspread.exceptions.WorksheetNotFound:
@@ -1287,6 +1316,19 @@ def render_sector_rotation_page():
         market_mode = st.radio("マーケット", ["日本株 🇯🇵", "米国株 🇺🇸"], horizontal=True)
         is_jp = (market_mode == "日本株 🇯🇵")
 
+        # --- 📂 追加：セクターマスタ切り替えプルダウンの追加 ---
+        reg = load_file_registry()
+        target_type = "sector_JP" if is_jp else "sector_US"
+        sector_files = reg[reg["file_type"] == target_type] if not reg.empty and "file_type" in reg.columns else pd.DataFrame()
+        
+        selected_sector_url = None
+        if not sector_files.empty:
+            options = ["デフォルト（管理用シート）"] + sector_files["file_name"].tolist()
+            sel_file_name = st.selectbox("セクターマスタの選択", options)
+            if sel_file_name != "デフォルト（管理用シート）":
+                selected_sector_url = sector_files[sector_files["file_name"] == sel_file_name]["url"].iloc[0]
+        # -----------------------------------------------------
+
         period_label = st.radio(
             "表示期間",
             ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "全期間"],
@@ -1312,7 +1354,8 @@ def render_sector_rotation_page():
             placeholder="カンマ区切りで複数入力可"
         )
         # どのセクターに追加するか選択
-        _current_sectors = load_sector_master_from_sheets(is_jp)
+        # --- 変更：選択中のセクターマスタからセクター一覧を読み込むように修正 ---
+        _current_sectors = load_sector_master_from_sheets(is_jp, override_url=selected_sector_url)
         sector_options = list(_current_sectors.keys()) + ["＋ 新規セクター作成"]
         extra_sector_sel = st.selectbox("追加先セクター", sector_options, key="extra_sector_sel")
         if extra_sector_sel == "＋ 新規セクター作成":
@@ -1371,9 +1414,9 @@ def render_sector_rotation_page():
         # 手動更新ボタン
         do_update = st.button("🔄 データ更新", type="primary", use_container_width=True)
 
-    # --- セクター定義: Sheetsから読み込み（フォールバック: ハードコード） ---
+    # --- 変更：選択されたセクターマスタをロード ---
     with st.spinner("セクターマスタを読み込み中..."):
-        sectors = load_sector_master_from_sheets(is_jp)
+        sectors = load_sector_master_from_sheets(is_jp, override_url=selected_sector_url)
 
     # --- 銘柄追加UI ---
     if extra_code.strip():
@@ -1387,9 +1430,10 @@ def render_sector_rotation_page():
                     sectors[extra_sector.strip()].append(c)
                     added.append(c)
             if added and st.session_state.get("_save_extra_trigger"):
-                ok = save_sector_master_to_sheets(sectors, is_jp)
+                # --- 変更：選択中のセクターマスタに保存する ---
+                ok = save_sector_master_to_sheets(sectors, is_jp, override_url=selected_sector_url)
                 if ok:
-                    st.success(f"✅ {added} を「{extra_sector}」に追加してSheetsに保存しました")
+                    st.success(f"✅ {added} を「{extra_sector}」に追加して保存しました")
                     st.cache_data.clear()
                 st.session_state["_save_extra_trigger"] = False
         elif codes:
@@ -1576,9 +1620,8 @@ def render_sector_rotation_page():
     # =====================================================================
     st.divider()
     with st.expander("⚙️ セクターマスタ編集（Google Sheets と同期）", expanded=False):
-        st.caption(f"{'sector_JP' if is_jp else 'sector_US'} シートの内容を直接編集できます。変更は即時 Sheets に反映されます。")
-
-        edit_sectors = load_sector_master_from_sheets(is_jp)
+        # --- 変更：選択中のセクターマスタを編集するように修正 ---
+        edit_sectors = load_sector_master_from_sheets(is_jp, override_url=selected_sector_url)
 
         # セクター選択
         edit_sec_name = st.selectbox(
@@ -1605,7 +1648,8 @@ def render_sector_rotation_page():
                             edit_sectors[edit_sec_name].append(c)
                             changed = True
                     if changed:
-                        if save_sector_master_to_sheets(edit_sectors, is_jp):
+                        # --- 変更：選択中のURLに保存 ---
+                        if save_sector_master_to_sheets(edit_sectors, is_jp, override_url=selected_sector_url):
                             st.success(f"追加しました: {codes_to_add}")
                             st.rerun()
                     else:
@@ -1618,7 +1662,8 @@ def render_sector_rotation_page():
                 if st.button("削除して保存", key="edit_del_btn", use_container_width=True):
                     if del_code != "-- 選択 --":
                         edit_sectors[edit_sec_name] = [c for c in current_codes if c != del_code]
-                        if save_sector_master_to_sheets(edit_sectors, is_jp):
+                        # --- 変更：選択中のURLに保存 ---
+                        if save_sector_master_to_sheets(edit_sectors, is_jp, override_url=selected_sector_url):
                             st.success(f"{del_code} を削除しました")
                             st.rerun()
 
@@ -1633,7 +1678,8 @@ def render_sector_rotation_page():
                 if new_sec_name and new_sec_name not in edit_sectors:
                     codes_list = [c.strip() for c in new_sec_codes.replace("、",",").split(",") if c.strip()]
                     edit_sectors[new_sec_name] = codes_list
-                    if save_sector_master_to_sheets(edit_sectors, is_jp):
+                    # --- 変更：選択中のURLに保存 ---
+                    if save_sector_master_to_sheets(edit_sectors, is_jp, override_url=selected_sector_url):
                         st.success(f"セクター「{new_sec_name}」を作成しました")
                         st.rerun()
                 elif new_sec_name in edit_sectors:
@@ -1645,7 +1691,8 @@ def render_sector_rotation_page():
             if st.button("セクター削除", key="del_sec_btn", use_container_width=True, type="secondary"):
                 if del_sec != "-- 選択 --":
                     del edit_sectors[del_sec]
-                    if save_sector_master_to_sheets(edit_sectors, is_jp):
+                    # --- 変更：選択中のURLに保存 ---
+                    if save_sector_master_to_sheets(edit_sectors, is_jp, override_url=selected_sector_url):
                         st.success(f"「{del_sec}」を削除しました")
                         st.rerun()
 
