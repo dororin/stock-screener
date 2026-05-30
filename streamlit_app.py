@@ -586,22 +586,15 @@ def plot_market_dashboard(saitei_df, sinyou_df, naaim_df):
 # =====================================================================
 # 🔄 セクターローテーション: ページ描画
 # =====================================================================
-@st.cache_data(ttl=86400)
 def get_jpx_full_list():
-    """JPX全銘柄リスト（名前検索用）- TOPIX Core30/Large70/Mid400を対象"""
-    url = 'https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls'
-    try:
-        df = pd.read_excel(url)
-        df = df.iloc[:, [1, 2, 3, 9]]
-        target = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
-        df = df.loc[df.iloc[:, 2].isin(target)].iloc[:, [0, 1]]
-        df.columns = ['symbol', 'name']
-        df['symbol'] = pd.to_numeric(df['symbol'], errors='coerce')
-        df = df.dropna(subset=['symbol'])
-        df['symbol'] = df['symbol'].astype(int).astype(str)
-        return df
-    except Exception:
+    """get_jpx_list() を再利用してsymbolを文字列化して返す（検索用ラッパー）"""
+    df = get_jpx_list()
+    if df.empty:
         return pd.DataFrame(columns=['symbol', 'name'])
+    df = df.copy()
+    df['symbol'] = df['symbol'].astype(str)
+    return df
+
 
 CUSTOM_SECTOR_KEY = "custom_sector_tickers"
 
@@ -648,9 +641,17 @@ def render_sector_rotation_page():
         q = search_query.strip() if search_query else ""
 
         # 2文字以上でリアルタイム候補表示
+        # 2文字以上でリアルタイム候補表示
         if len(q) >= 2:
             jpx_df = get_jpx_full_list()
-            if not jpx_df.empty:
+            if jpx_df.empty:
+                # JPXリスト取得失敗時 → コード直接入力にフォールバック
+                st.caption("⚠️ JPXリスト取得失敗。コードを直接入力して追加できます。")
+                if q.isdigit():
+                    if st.button(f"➕ {q} を追加", key="btn_add_direct", use_container_width=True):
+                        st.session_state[CUSTOM_SECTOR_KEY][q] = q
+                        st.rerun()
+            else:
                 mask = (
                     jpx_df['name'].str.contains(q, na=False, case=False) |
                     jpx_df['symbol'].str.contains(q, na=False)
@@ -672,7 +673,12 @@ def render_sector_rotation_page():
                         st.session_state[CUSTOM_SECTOR_KEY][sel_code] = sel_name
                         st.rerun()
                 else:
-                    st.caption("候補なし")
+                    st.caption(f"「{q}」の候補なし（TOPIX500内で検索中）")
+                    # 数字ならコード直接追加も提示
+                    if q.isdigit():
+                        if st.button(f"➕ {q} をコードとして追加", key="btn_add_direct", use_container_width=True):
+                            st.session_state[CUSTOM_SECTOR_KEY][q] = q
+                            st.rerun()
         elif len(q) == 1:
             st.caption("もう1文字以上入力すると候補が表示されます")
 
