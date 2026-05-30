@@ -181,7 +181,7 @@ def get_topix500_tickers() -> list:
         df.columns = ['symbol', 'name', 'market', 'scale_type']
         target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
         df = df[df["scale_type"].isin(target_scales)]
-        codes = df['symbol'].dropna().astype(int).astype(str).tolist()
+        codes = [str(s).strip().split('.')[0] for s in df['symbol'].dropna() if str(s).strip()]
         return codes
     except Exception as e:
         print(f"JPX銘柄リスト取得失敗: {e}")
@@ -376,7 +376,9 @@ def parse_yfinance_batch(df_raw, chunk_tickers):
     if df_raw.empty: return pd.DataFrame()
     all_rows = []
     for ticker in chunk_tickers:
-        symbol = f"{ticker}.T" if ticker.isdigit() else ticker
+        # 数字のみ、または「数字から始まる4桁」であれば日本株コード（.T付き）とみなす
+        is_jp_ticker = ticker.isdigit() or (len(ticker) == 4 and ticker[0].isdigit())
+        symbol = f"{ticker}.T" if is_jp_ticker else ticker
         try:
             if symbol in df_raw.columns.get_level_values(1):
                 t_df = df_raw.xs(symbol, axis=1, level=1).copy()
