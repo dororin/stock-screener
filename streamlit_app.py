@@ -598,6 +598,85 @@ def get_jpx_full_list():
 
 CUSTOM_SECTOR_KEY = "custom_sector_tickers"
 
+@st.fragment
+def _watchlist_ui():
+    """ウォッチリスト操作UI（フラグメント: 操作してもチャートを再実行しない）"""
+    st.divider()
+    st.subheader("📌 ウォッチリスト")
+
+    search_query = st.text_input(
+        "銘柄コード・名前で検索",
+        placeholder="例: 7203 / トヨタ / 三菱",
+        key="watch_search_input"
+    )
+    q = search_query.strip() if search_query else ""
+
+    if len(q) >= 2:
+        jpx_df = get_jpx_full_list()
+        if jpx_df.empty:
+            st.caption("⚠️ JPXリスト取得失敗。コードを直接入力してください。")
+            if q.isdigit():
+                if st.button(f"➕ {q} を追加", key="btn_add_direct", use_container_width=True):
+                    st.session_state[CUSTOM_SECTOR_KEY][q] = q
+                    st.rerun(scope="app")
+        else:
+            mask = (
+                jpx_df["name"].str.contains(q, na=False, case=False) |
+                jpx_df["symbol"].str.contains(q, na=False)
+            )
+            found = jpx_df[mask].head(8)
+            if not found.empty:
+                # ダミー先頭付きプルダウン → 選択した瞬間に追加
+                PLACEHOLDER = "── 選択してください ──"
+                options = [PLACEHOLDER] + [
+                    f"{row['symbol']}　{row['name']}" for _, row in found.iterrows()
+                ]
+                # code/name マップ
+                code_map = {
+                    f"{row['symbol']}　{row['name']}": (str(row['symbol']), str(row['name']))
+                    for _, row in found.iterrows()
+                }
+                selected = st.selectbox(
+                    "候補",
+                    options,
+                    key="watch_search_select",
+                    label_visibility="collapsed"
+                )
+                if selected != PLACEHOLDER:
+                    sel_code, sel_name = code_map[selected]
+                    if sel_code not in st.session_state[CUSTOM_SECTOR_KEY]:
+                        st.session_state[CUSTOM_SECTOR_KEY][sel_code] = sel_name
+                        st.rerun(scope="app")
+                    else:
+                        st.caption(f"✅ {sel_code} はすでに登録済みです")
+            else:
+                st.caption(f"「{q}」の候補なし（TOPIX500内で検索中）")
+                if q.isdigit():
+                    if st.button(f"➕ {q} をコードとして追加", key="btn_add_direct", use_container_width=True):
+                        st.session_state[CUSTOM_SECTOR_KEY][q] = q
+                        st.rerun(scope="app")
+    elif len(q) == 1:
+        st.caption("もう1文字以上入力すると候補が表示されます")
+
+    # 登録済み一覧
+    custom_tickers = st.session_state[CUSTOM_SECTOR_KEY]
+    if custom_tickers:
+        st.caption(f"登録済み: {len(custom_tickers)}銘柄")
+        to_delete = []
+        for code, name in list(custom_tickers.items()):
+            col_a, col_b = st.columns([4, 1])
+            col_a.markdown(f"**{code}** {name}")
+            if col_b.button("🗑️", key=f"del_{code}", help=f"{code}を削除"):
+                to_delete.append(code)
+        for code in to_delete:
+            del st.session_state[CUSTOM_SECTOR_KEY][code]
+        if to_delete:
+            st.rerun(scope="app")
+    else:
+        st.caption("まだ銘柄が登録されていません")
+
+
+
 def render_sector_rotation_page():
     st.title("🔄 セクターローテーション分析（統合版）")
 
@@ -627,77 +706,9 @@ def render_sector_rotation_page():
         n_cols = st.slider("グリッド列数", 2, 4, 3)
 
         # ─────────────────────────────────────────
-        # 📌 ウォッチリスト（カスタム銘柄）管理
+        # 📌 ウォッチリスト（フラグメントで独立）
         # ─────────────────────────────────────────
-        st.divider()
-        st.subheader("📌 ウォッチリスト")
-
-        search_query = st.text_input(
-            "銘柄コード・名前で検索",
-            placeholder="例: 7203 / トヨタ / 三菱",
-            key="watch_search_input"
-        )
-
-        q = search_query.strip() if search_query else ""
-
-        # 2文字以上でリアルタイム候補表示
-        # 2文字以上でリアルタイム候補表示
-        if len(q) >= 2:
-            jpx_df = get_jpx_full_list()
-            if jpx_df.empty:
-                # JPXリスト取得失敗時 → コード直接入力にフォールバック
-                st.caption("⚠️ JPXリスト取得失敗。コードを直接入力して追加できます。")
-                if q.isdigit():
-                    if st.button(f"➕ {q} を追加", key="btn_add_direct", use_container_width=True):
-                        st.session_state[CUSTOM_SECTOR_KEY][q] = q
-                        st.rerun()
-            else:
-                mask = (
-                    jpx_df['name'].str.contains(q, na=False, case=False) |
-                    jpx_df['symbol'].str.contains(q, na=False)
-                )
-                found = jpx_df[mask].head(10)
-                if not found.empty:
-                    options = {
-                        f"{row['symbol']}  {row['name']}": (row['symbol'], row['name'])
-                        for _, row in found.iterrows()
-                    }
-                    selected_label = st.selectbox(
-                        "候補",
-                        list(options.keys()),
-                        key="watch_search_select",
-                        label_visibility="collapsed"
-                    )
-                    if st.button("➕ 追加", key="btn_add_watch", use_container_width=True):
-                        sel_code, sel_name = options[selected_label]
-                        st.session_state[CUSTOM_SECTOR_KEY][sel_code] = sel_name
-                        st.rerun()
-                else:
-                    st.caption(f"「{q}」の候補なし（TOPIX500内で検索中）")
-                    # 数字ならコード直接追加も提示
-                    if q.isdigit():
-                        if st.button(f"➕ {q} をコードとして追加", key="btn_add_direct", use_container_width=True):
-                            st.session_state[CUSTOM_SECTOR_KEY][q] = q
-                            st.rerun()
-        elif len(q) == 1:
-            st.caption("もう1文字以上入力すると候補が表示されます")
-
-        # 現在のウォッチリスト表示（削除ボタン付き）
-        custom_tickers = st.session_state[CUSTOM_SECTOR_KEY]
-        if custom_tickers:
-            st.caption(f"登録済み: {len(custom_tickers)}銘柄")
-            to_delete = []
-            for code, name in list(custom_tickers.items()):
-                col_a, col_b = st.columns([4, 1])
-                col_a.markdown(f"**{code}** {name}")
-                if col_b.button("🗑️", key=f"del_{code}", help=f"{code}を削除"):
-                    to_delete.append(code)
-            for code in to_delete:
-                del st.session_state[CUSTOM_SECTOR_KEY][code]
-            if to_delete:
-                st.rerun()
-        else:
-            st.caption("まだ銘柄が登録されていません")
+        _watchlist_ui()
 
     with st.spinner("セクター構成をスプレッドシートから読み込み中..."):
         sectors = load_sector_master_from_sheets(is_jp)
