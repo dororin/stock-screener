@@ -679,6 +679,87 @@ def render_sector_rotation_page():
             st.plotly_chart(plot_sector_detail_chart(sel_idx, bm_series, sel_name, bm_label), use_container_width=True)
 
 
+# --- スコア測定ヘルパー ---
+def compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly):
+    if db_df.empty: return pd.Series(dtype=float)
+    db_df = db_df.copy()
+    db_df["date"] = pd.to_datetime(db_df["date"]).dt.tz_localize(None)
+    end_date = db_df["date"].max()
+    start_date = end_date - timedelta(days=period_days)
+    target_df = db_df[(db_df["date"] >= start_date) & (db_df["ticker"].isin(tickers))].copy()
+    if target_df.empty: return pd.Series(dtype=float)
+    
+    if resample_weekly:
+        target_df = target_df.set_index("date")
+        target_df = target_df.groupby("ticker").resample("W-FRI").agg({"close": "last"}).reset_index()
+        
+    close_pivot = target_df.pivot_table(index="date", columns="ticker", values="close")
+    close_pivot = close_pivot.sort_index()
+    daily_returns = close_pivot.pct_change()
+    sector_return = daily_returns.mean(axis=1)
+    index_series = (1 + sector_return).cumprod() * 100
+    if len(index_series) > 0: index_series.iloc[0] = 100.0
+    return index_series
+
+def get_sector_momentum(index_series, days=5):
+    if len(index_series) < 2: return 0.0
+    recent = index_series.iloc[-min(days, len(index_series)):]
+    if recent.iloc[0] == 0: return 0.0
+    return float((recent.iloc[-1] / recent.iloc[0] - 1) * 100)
+
+@st.cache_data(ttl=600)
+def get_benchmark_data(ticker, period_days, interval):
+    try:
+        end = datetime.now()
+        start = end - timedelta(days=period_days + 30)
+        df_raw = yf.download(ticker, start=start.strftime("%Y-%m-%d"), interval=interval, auto_adjust=True, progress=False)
+        if df_raw.empty: return pd.Series(dtype=float)
+        df_raw = df_raw.reset_index()
+        df_raw.columns = [str(c).lower() if not isinstance(c, tuple) else str(c[0]).lower() for c in df_raw.columns]
+        date_col = "date" if "date" in df_raw.columns else "datetime"
+        df_raw = df_raw.rename(columns={date_col: "date"})
+        df_raw["date"] = pd.to_datetime(df_raw["date"]).dt.tz_localize(None)
+        close = df_raw.set_index("date")["close"]
+        ret = close.pct_change()
+        idx = (1 + ret).cumprod() * 100
+        if len(idx) > 0: idx.iloc[0] = 100.0
+        return idx
+    except Exception: return pd.Series(dtype=float)
+
+def plot_sector_mini_chart(index_series, sector_name, momentum_pct):
+    if index_series.empty: return go.Figure()
+    color = "#26a69a" if momentum_pct >= 0 else "#ef5350"
+    fill_color = "rgba(38,166,154,0.15)" if momentum_pct >= 0 else "rgba(239,83,80,0.15)"
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=index_series.index, y=index_series.values, mode="lines",
+        line=dict(color=color, width=2), fill="tozeroy", fillcolor=fill_color,
+        hovertemplate="%{x|%m/%d}: %{y:.1f}<extra></extra>"
+    ))
+    fig.add_hline(y=100, line_dash="dot", line_color="gray", line_width=1, opacity=0.5)
+    fig.update_layout(
+        height=140, margin=dict(l=5, r=5, t=5, b=5), showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        yaxis=dict(showticklabels=True, showgrid=True, gridcolor="rgba(128,128,128,0.2)", zeroline=False, tickfont=dict(size=9)),
+    )
+    return fig
+
+def plot_sector_detail_chart(index_series, benchmark_series, sector_name, benchmark_label):
+    fig = make_subplots(rows=2 if benchmark_series is not None and not benchmark_series.empty else 1,
+                        cols=1, shared_xaxes=True,
+                        row_heights=[0.7, 0.3] if benchmark_series is not None else [1.0])
+    fig.add_trace(go.Scatter(x=index_series.index, y=index_series.values, name=sector_name, line=dict(color="#2196F3", width=2)), row=1, col=1)
+    if benchmark_series is not None and not benchmark_series.empty:
+        common_dates = index_series.index.intersection(benchmark_series.index)
+        if len(common_dates) > 0:
+            rel = (index_series[common_dates] / benchmark_series[common_dates]) * 100
+            fig.add_trace(go.Scatter(x=rel.index, y=rel.values, name=f"相対強度 vs {benchmark_label}", line=dict(color="#FF9800", width=1.5)), row=2, col=1)
+            fig.add_hline(y=100, line_dash="dot", line_color="gray", row=2, col=1)
+    fig.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified", template="plotly_white", legend=dict(orientation="h", y=1.05))
+    return fig
+
+
 # =====================================================================
 # メイン画面ルーティング
 # =====================================================================
