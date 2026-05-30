@@ -90,7 +90,7 @@ def get_drive_service():
 
 def download_from_drive_api(filename, local_path):
     service = get_drive_service()
-    if not service or not FOLDER_ID or FOLDER_ID.startswith("1Lx-Xdsm8h20Q"): # デフォルト値チェック回避
+    if not service or not FOLDER_ID:
         return False
     try:
         query = f"name='{filename}' and '{FOLDER_ID}' in parents and trashed=false"
