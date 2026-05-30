@@ -586,8 +586,31 @@ def plot_market_dashboard(saitei_df, sinyou_df, naaim_df):
 # =====================================================================
 # 🔄 セクターローテーション: ページ描画
 # =====================================================================
+@st.cache_data(ttl=86400)
+def get_jpx_full_list():
+    """JPX全銘柄リスト（名前検索用）- TOPIX Core30/Large70/Mid400を対象"""
+    url = 'https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls'
+    try:
+        df = pd.read_excel(url)
+        df = df.iloc[:, [1, 2, 3, 9]]
+        target = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
+        df = df.loc[df.iloc[:, 2].isin(target)].iloc[:, [0, 1]]
+        df.columns = ['symbol', 'name']
+        df['symbol'] = pd.to_numeric(df['symbol'], errors='coerce')
+        df = df.dropna(subset=['symbol'])
+        df['symbol'] = df['symbol'].astype(int).astype(str)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=['symbol', 'name'])
+
+CUSTOM_SECTOR_KEY = "custom_sector_tickers"
+
 def render_sector_rotation_page():
     st.title("🔄 セクターローテーション分析（統合版）")
+
+    # カスタム銘柄セクターのセッションステート初期化
+    if CUSTOM_SECTOR_KEY not in st.session_state:
+        st.session_state[CUSTOM_SECTOR_KEY] = {}  # {ticker: name}
 
     with st.sidebar:
         st.subheader("⚙️ 表示設定")
@@ -609,6 +632,66 @@ def render_sector_rotation_page():
 
         st.divider()
         n_cols = st.slider("グリッド列数", 2, 4, 3)
+
+        # ─────────────────────────────────────────
+        # 📌 ウォッチリスト（カスタム銘柄）管理
+        # ─────────────────────────────────────────
+        st.divider()
+        st.subheader("📌 ウォッチリスト")
+
+        search_query = st.text_input(
+            "銘柄コード・名前で検索",
+            placeholder="例: 7203 / トヨタ / 三菱",
+            key="watch_search_input"
+        )
+
+        q = search_query.strip() if search_query else ""
+
+        # 2文字以上でリアルタイム候補表示
+        if len(q) >= 2:
+            jpx_df = get_jpx_full_list()
+            if not jpx_df.empty:
+                mask = (
+                    jpx_df['name'].str.contains(q, na=False, case=False) |
+                    jpx_df['symbol'].str.contains(q, na=False)
+                )
+                found = jpx_df[mask].head(10)
+                if not found.empty:
+                    options = {
+                        f"{row['symbol']}  {row['name']}": (row['symbol'], row['name'])
+                        for _, row in found.iterrows()
+                    }
+                    selected_label = st.selectbox(
+                        "候補",
+                        list(options.keys()),
+                        key="watch_search_select",
+                        label_visibility="collapsed"
+                    )
+                    if st.button("➕ 追加", key="btn_add_watch", use_container_width=True):
+                        sel_code, sel_name = options[selected_label]
+                        st.session_state[CUSTOM_SECTOR_KEY][sel_code] = sel_name
+                        st.rerun()
+                else:
+                    st.caption("候補なし")
+        elif len(q) == 1:
+            st.caption("もう1文字以上入力すると候補が表示されます")
+
+        # 現在のウォッチリスト表示（削除ボタン付き）
+        custom_tickers = st.session_state[CUSTOM_SECTOR_KEY]
+        if custom_tickers:
+            st.caption(f"登録済み: {len(custom_tickers)}銘柄")
+            to_delete = []
+            for code, name in list(custom_tickers.items()):
+                col_a, col_b = st.columns([4, 1])
+                col_a.markdown(f"**{code}** {name}")
+                if col_b.button("🗑️", key=f"del_{code}", help=f"{code}を削除"):
+                    to_delete.append(code)
+            for code in to_delete:
+                del st.session_state[CUSTOM_SECTOR_KEY][code]
+            if to_delete:
+                st.rerun()
+        else:
+            st.caption("まだ銘柄が登録されていません")
 
     with st.spinner("セクター構成をスプレッドシートから読み込み中..."):
         sectors = load_sector_master_from_sheets(is_jp)
@@ -670,6 +753,49 @@ def render_sector_rotation_page():
                         st.caption(f"構成: {', '.join(tickers[:3])}...")
                     if st.button("詳細表示", key=f"detail_{sname}", use_container_width=True):
                         st.session_state.selected_sector = sname
+
+    # ─────────────────────────────────────────
+    # 📌 ウォッチリスト（カスタム銘柄）ミニチャート
+    # ─────────────────────────────────────────
+    custom_tickers = st.session_state.get(CUSTOM_SECTOR_KEY, {})
+    if custom_tickers:
+        st.divider()
+        st.markdown("### 📌 ウォッチリスト（個別銘柄）")
+
+        custom_codes = list(custom_tickers.keys())
+        custom_rows = (len(custom_codes) + n_cols - 1) // n_cols
+
+        for row_i in range(custom_rows):
+            cols = st.columns(n_cols)
+            for col_i in range(n_cols):
+                idx = row_i * n_cols + col_i
+                if idx >= len(custom_codes): break
+                code = custom_codes[idx]
+                name = custom_tickers[code]
+
+                # 個別銘柄のインデックス系列を計算
+                single_series = compute_sector_index_from_df(db_df, [code], period_days, resample_weekly)
+                mom_single = get_sector_momentum(single_series, days=min(5, period_days)) if not single_series.empty else 0.0
+                badge = "🟢" if mom_single >= 3.0 else "🔴" if mom_single <= -3.0 else "⚪"
+                color_theme = "#26a69a" if mom_single >= 3.0 else "#ef5350" if mom_single <= -3.0 else "#9e9e9e"
+
+                with cols[col_i]:
+                    with st.container(border=True):
+                        hc1, hc2, hc3 = st.columns([3, 1, 1])
+                        hc1.markdown(f"<span style='font-weight:600;color:{color_theme}'>{badge} {code} {name}</span>", unsafe_allow_html=True)
+                        hc2.metric("", f"{mom_single:+.2f}%", label_visibility="collapsed")
+                        if hc3.button("🗑️", key=f"watchlist_del_{code}", help=f"{code}を削除"):
+                            del st.session_state[CUSTOM_SECTOR_KEY][code]
+                            st.rerun()
+
+                        if not single_series.empty:
+                            st.plotly_chart(
+                                plot_sector_mini_chart(single_series, f"{code} {name}", mom_single),
+                                use_container_width=True,
+                                key=f"watch_mini_{code}"
+                            )
+                        else:
+                            st.caption("データなし（DBにティッカーが存在しない可能性があります）")
 
     # 詳細画面表示
     if st.session_state.selected_sector and st.session_state.selected_sector in sectors:
