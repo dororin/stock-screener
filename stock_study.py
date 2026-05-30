@@ -18,10 +18,13 @@ except ImportError:
     HAS_STREAMLIT = False
 
 # --- 設定：Google Driveの共有フォルダID ---
+FOLDER_ID = "1Lx-Xdsm8h20Q-ZRI91Ty7smdYVhkuoFD"
 if HAS_STREAMLIT:
-    FOLDER_ID = st.secrets["connections"]["gsheets"].get("folder_id", "1Lx-Xdsm8h20Q-ZRI91Ty7smdYVhkuoFD")
-else:
-    FOLDER_ID = "1Lx-Xdsm8h20Q-ZRI91Ty7smdYVhkuoFD"
+    try:
+        if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+            FOLDER_ID = st.secrets["connections"]["gsheets"].get("folder_id", FOLDER_ID)
+    except Exception:
+        pass
 
 JPX_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
 TIMEFRAMES = ["1m", "5m", "60m", "1d"]
