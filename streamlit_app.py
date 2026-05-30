@@ -888,192 +888,6 @@ def analyze_market_streamlit(df_targets):
     progress_bar.empty(); status_text.empty()
     return pd.DataFrame(results)
 
-if 'result_df' not in st.session_state: st.session_state.result_df = pd.DataFrame()
-if 'saitei_df' not in st.session_state: st.session_state.saitei_df = pd.DataFrame()
-if 'sinyou_df' not in st.session_state: st.session_state.sinyou_df = pd.DataFrame()
-if 'naaim_df' not in st.session_state: st.session_state.naaim_df = pd.DataFrame()
-if 'performed_scan' not in st.session_state: st.session_state.performed_scan = False
-
-with st.sidebar:
-    selected_page = st.radio("画面選択", ["スクリーニング", "マーケット情報", "セクターローテーション"])
-    st.divider()
-
-if selected_page == "マーケット情報":
-    st.title("📈 マーケット情報")
-    if st.button("データ取得・更新", type="primary"):
-        with st.spinner("更新中..."):
-            df_s = update_and_load_saitei_data()
-            if not df_s.empty: st.session_state.saitei_df = df_s
-            df_m = update_and_load_sinyou_data()
-            if not df_m.empty: st.session_state.sinyou_df = df_m
-            df_n = update_and_load_naaim_data()
-            if not df_n.empty: st.session_state.naaim_df = df_n
-            st.success("更新完了")
-    st.write("---")
-    col1, col2 = st.columns([2, 3])
-    with col1: st.subheader("📊 分析ダッシュボード")
-    with col2: period = st.radio("期間:", ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "3年", "全"], index=3, horizontal=True, label_visibility="collapsed")
-    end_dt = st.session_state.saitei_df['Date'].max() if not st.session_state.saitei_df.empty else pd.Timestamp.now()
-    if period == "1ヶ月": start_dt = end_dt - pd.DateOffset(months=1)
-    elif period == "3ヶ月": start_dt = end_dt - pd.DateOffset(months=3)
-    elif period == "6ヶ月": start_dt = end_dt - pd.DateOffset(months=6)
-    elif period == "1年": start_dt = end_dt - pd.DateOffset(years=1)
-    elif period == "3年": start_dt = end_dt - pd.DateOffset(years=3)
-    else: start_dt = st.session_state.saitei_df['Date'].min() if not st.session_state.saitei_df.empty else end_dt - pd.DateOffset(years=10)
-    st.write("---")
-    
-    # メトリクス表示
-    m_col1, m_col2 = st.columns(2)
-    with m_col1:
-        if not st.session_state.naaim_df.empty:
-            latest_naaim = st.session_state.naaim_df.iloc[-1]
-            prev_naaim = st.session_state.naaim_df.iloc[-2] if len(st.session_state.naaim_df) > 1 else latest_naaim
-            delta = round(latest_naaim['NAAIM'] - prev_naaim['NAAIM'], 2)
-            st.metric("最新 NAAIM Exposure Index", f"{latest_naaim['NAAIM']}", delta=f"{delta}")
-            st.caption(f"更新日: {latest_naaim['Date'].strftime('%Y-%m-%d')}")
-    
-    if not st.session_state.saitei_df.empty or not st.session_state.sinyou_df.empty or not st.session_state.naaim_df.empty:
-        fig = plot_market_dashboard(st.session_state.saitei_df, st.session_state.sinyou_df, st.session_state.naaim_df)
-        if fig:
-            fig.update_xaxes(range=[start_dt, end_dt + pd.Timedelta(days=7)])
-            if not st.session_state.saitei_df.empty:
-                v = st.session_state.saitei_df[(st.session_state.saitei_df['Date'] >= start_dt) & (st.session_state.saitei_df['Date'] <= end_dt)]
-                if not v.empty: fig.update_yaxes(range=[v['Nikkei225'].min()*0.98, v['Nikkei225'].max()*1.02], row=1, col=1, secondary_y=False)
-            fig.update_yaxes(fixedrange=True)
-            st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
-    else: st.info("「データ取得・更新」ボタンを押してください。")
-    
-    st.write("---")
-    st.subheader("🔍 個別銘柄 信用残検索 (IRBank)")
-    c1, c2 = st.columns([1, 4])
-    search_code = c1.text_input("銘柄コード", value="1321", placeholder="例: 1321")
-    if search_code:
-        with st.spinner(f"{search_code} のデータを取得中..."):
-            idf = fetch_irbank_margin(search_code)
-            if not idf.empty:
-                if 'ir_period' not in st.session_state: st.session_state.ir_period = "1年"
-                p = st.radio("表示期間:", ["6ヶ月", "1年", "3年", "全"], key="ir_p", horizontal=True)
-                
-                i_end = idf['Date'].max()
-                if p == "6ヶ月": i_start = i_end - pd.DateOffset(months=6)
-                elif p == "1年": i_start = i_end - pd.DateOffset(years=1)
-                elif p == "3年": i_start = i_end - pd.DateOffset(years=3)
-                else: i_start = idf['Date'].min()
-                
-                vdf = idf[idf['Date'] >= i_start]
-                if not vdf.empty:
-                    ifig = plot_individual_margin(vdf, search_code)
-                    st.plotly_chart(ifig, use_container_width=True)
-            else:
-                st.warning("データが見つかりませんでした。コードを確認してください。")
-    st.stop()
-
-if selected_page == "セクターローテーション":
-    render_sector_rotation_page()
-    st.stop()
-
-with st.sidebar:
-    st.subheader("スクリーニング操作")
-    with st.expander("📂 履歴", expanded=True):
-        ids = get_history_list()
-        if ids:
-            sid = st.selectbox("過去の結果", ["-- 選択 --"] + ids, key="h_sel")
-            if sid != "-- 選択 --" and st.session_state.get('last_id') != sid:
-                st.session_state.result_df = load_history(sid); st.session_state.last_id = sid
-            if sid != "-- 選択 --":
-                if st.button("削除", type="primary"):
-                    if delete_history(sid): st.session_state.result_df = pd.DataFrame(); st.session_state.last_id = None; st.rerun()
-    list_src = st.radio("取得元", ["JPX (TOPIX)", "Google Sheets", "CSV（ローカル）"], label_visibility="collapsed")
-
-    # Google Sheets 取得元の場合: ファイル登録から選択
-    sheets_df_target = pd.DataFrame()
-    if list_src == "Google Sheets":
-        reg = load_file_registry()
-        screening_files = reg[reg["file_type"] == "screening"] if not reg.empty and "file_type" in reg.columns else pd.DataFrame()
-        if screening_files.empty:
-            st.info("file_manager シートに file_type=screening のファイルを登録してください。")
-            st.markdown("👉 下の「ファイル登録」から追加できます")
-        else:
-            sel_name = st.selectbox(
-                "銘柄リスト選択",
-                screening_files["file_name"].tolist(),
-                key="screening_file_sel"
-            )
-            sel_row = screening_files[screening_files["file_name"] == sel_name].iloc[0]
-            sel_url = sel_row["url"]
-            sel_sheet = sel_row.get("sheet_name", "") or None
-            if st.button("シートをプレビュー", key="preview_screening"):
-                preview_df = read_sheet_as_df(sel_url, sel_sheet)
-                if not preview_df.empty:
-                    st.dataframe(preview_df.head(10), use_container_width=True)
-                else:
-                    st.warning("読み込めませんでした")
-
-    csv = st.file_uploader("CSVファイルをアップロード", type=["csv"]) if list_src == "CSV（ローカル）" else None
-
-    if st.button("開始", use_container_width=True):
-        df_t = pd.DataFrame()
-        if list_src == "JPX (TOPIX)":
-            df_t = get_jpx_list()
-        elif list_src == "Google Sheets":
-            reg = load_file_registry()
-            screening_files = reg[reg["file_type"] == "screening"] if not reg.empty and "file_type" in reg.columns else pd.DataFrame()
-            if not screening_files.empty:
-                sel_name = st.session_state.get("screening_file_sel", screening_files["file_name"].iloc[0])
-                sel_row = screening_files[screening_files["file_name"] == sel_name].iloc[0]
-                raw_df = read_sheet_as_df(sel_row["url"], sel_row.get("sheet_name") or None)
-                if not raw_df.empty:
-                    try:
-                        code_col = next(c for c in ["コード", "銘柄コード", "symbol", "code"] if c in raw_df.columns)
-                        df_t = pd.DataFrame()
-                        df_t["symbol"] = pd.to_numeric(raw_df[code_col].astype(str).str.split(".").str[0], errors="coerce").dropna().astype(int)
-                        name_cols = [c for c in ["銘柄", "銘柄名", "name"] if c in raw_df.columns]
-                        df_t["name"] = raw_df[name_cols[0]] if name_cols else "-"
-                        df_t = df_t.dropna(subset=["symbol"]).reset_index(drop=True)
-                    except Exception as e:
-                        st.error(f"銘柄コード列の読み込みエラー: {e}")
-        elif csv:
-            try:
-                try: df_c = pd.read_csv(csv)
-                except: csv.seek(0); df_c = pd.read_csv(csv, encoding='shift_jis')
-                df_t = pd.DataFrame()
-                df_t['symbol'] = pd.to_numeric(df_c[next(c for c in ["コード", "銘柄コード", "symbol"] if c in df_c.columns)], errors='coerce').dropna().astype(int)
-                df_t['name'] = df_c[next(c for c in ["銘柄", "name"] if c in df_c.columns)] if any(c in df_c.columns for c in ["銘柄", "name"]) else "-"
-            except: st.error("CSVエラー")
-        if not df_t.empty:
-            st.session_state.result_df = analyze_market_streamlit(df_t)
-            st.session_state.performed_scan = True
-            st.session_state.last_id = None
-    if not st.session_state.result_df.empty:
-        if st.button("結果を保存", use_container_width=True):
-            if save_history(st.session_state.result_df): st.rerun()
-
-st.title("WVF + Trend Screener :blue[Pro]")
-if not st.session_state.result_df.empty:
-    rdf = st.session_state.result_df
-    for i in range(0, len(rdf), 2):
-        cols = st.columns(2)
-        for j in range(2):
-            if i + j < len(rdf):
-                r = rdf.iloc[i + j]
-                with cols[j]:
-                    with st.container(border=True):
-                        c1, c2 = st.columns([0.85, 0.15])
-                        c1.subheader(f"[{r['コード']}](https://jp.tradingview.com/chart/?symbol=TSE%3A{r['コード']}) {r['銘柄']}")
-                        if c2.toggle("⭐", value=r['お気に入り'], key=f"f_{r['コード']}_{i+j}", label_visibility="collapsed") != r['お気に入り']:
-                            st.session_state.result_df.at[i + j, 'お気に入り'] = not r['お気に入り']
-                        i1, i2 = st.columns([1, 2])
-                        if r['チャート']: i1.image(r['チャート'], use_container_width=True)
-                        m1 = i2.columns(3)
-                        m1[0].metric("現在値", f"¥{r['現在値']:,.1f}"); m1[1].metric("消灯目安", f"¥{r['消灯目安(安値)']:,.1f}"); m1[2].metric("200日乖離", f"{r['乖離率(%)']}%")
-                        m2 = i2.columns(4)
-                        m2[0].metric("WVF", r['WVF']); m2[1].metric("Upper", r['WVF Upper']); m2[2].metric("傾き", f"{r['200MA傾き率']:.5f}"); m2[3].metric("日", r['シグナル日'])
-else:
-    if st.session_state.performed_scan:
-        st.warning("条件に一致する銘柄は見つかりませんでした。")
-    else:
-        st.info("左メニューの「開始」ボタンを押してスクリーニングを開始してください。")
-
 # =====================================================================
 # セクターローテーション: データ管理関数
 # =====================================================================
@@ -1837,3 +1651,188 @@ def render_sector_rotation_page():
             st.cache_data.clear()
             st.rerun()
 
+if 'result_df' not in st.session_state: st.session_state.result_df = pd.DataFrame()
+if 'saitei_df' not in st.session_state: st.session_state.saitei_df = pd.DataFrame()
+if 'sinyou_df' not in st.session_state: st.session_state.sinyou_df = pd.DataFrame()
+if 'naaim_df' not in st.session_state: st.session_state.naaim_df = pd.DataFrame()
+if 'performed_scan' not in st.session_state: st.session_state.performed_scan = False
+
+with st.sidebar:
+    selected_page = st.radio("画面選択", ["スクリーニング", "マーケット情報", "セクターローテーション"])
+    st.divider()
+
+if selected_page == "マーケット情報":
+    st.title("📈 マーケット情報")
+    if st.button("データ取得・更新", type="primary"):
+        with st.spinner("更新中..."):
+            df_s = update_and_load_saitei_data()
+            if not df_s.empty: st.session_state.saitei_df = df_s
+            df_m = update_and_load_sinyou_data()
+            if not df_m.empty: st.session_state.sinyou_df = df_m
+            df_n = update_and_load_naaim_data()
+            if not df_n.empty: st.session_state.naaim_df = df_n
+            st.success("更新完了")
+    st.write("---")
+    col1, col2 = st.columns([2, 3])
+    with col1: st.subheader("📊 分析ダッシュボード")
+    with col2: period = st.radio("期間:", ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "3年", "全"], index=3, horizontal=True, label_visibility="collapsed")
+    end_dt = st.session_state.saitei_df['Date'].max() if not st.session_state.saitei_df.empty else pd.Timestamp.now()
+    if period == "1ヶ月": start_dt = end_dt - pd.DateOffset(months=1)
+    elif period == "3ヶ月": start_dt = end_dt - pd.DateOffset(months=3)
+    elif period == "6ヶ月": start_dt = end_dt - pd.DateOffset(months=6)
+    elif period == "1年": start_dt = end_dt - pd.DateOffset(years=1)
+    elif period == "3年": start_dt = end_dt - pd.DateOffset(years=3)
+    else: start_dt = st.session_state.saitei_df['Date'].min() if not st.session_state.saitei_df.empty else end_dt - pd.DateOffset(years=10)
+    st.write("---")
+    
+    # メトリクス表示
+    m_col1, m_col2 = st.columns(2)
+    with m_col1:
+        if not st.session_state.naaim_df.empty:
+            latest_naaim = st.session_state.naaim_df.iloc[-1]
+            prev_naaim = st.session_state.naaim_df.iloc[-2] if len(st.session_state.naaim_df) > 1 else latest_naaim
+            delta = round(latest_naaim['NAAIM'] - prev_naaim['NAAIM'], 2)
+            st.metric("最新 NAAIM Exposure Index", f"{latest_naaim['NAAIM']}", delta=f"{delta}")
+            st.caption(f"更新日: {latest_naaim['Date'].strftime('%Y-%m-%d')}")
+    
+    if not st.session_state.saitei_df.empty or not st.session_state.sinyou_df.empty or not st.session_state.naaim_df.empty:
+        fig = plot_market_dashboard(st.session_state.saitei_df, st.session_state.sinyou_df, st.session_state.naaim_df)
+        if fig:
+            fig.update_xaxes(range=[start_dt, end_dt + pd.Timedelta(days=7)])
+            if not st.session_state.saitei_df.empty:
+                v = st.session_state.saitei_df[(st.session_state.saitei_df['Date'] >= start_dt) & (st.session_state.saitei_df['Date'] <= end_dt)]
+                if not v.empty: fig.update_yaxes(range=[v['Nikkei225'].min()*0.98, v['Nikkei225'].max()*1.02], row=1, col=1, secondary_y=False)
+            fig.update_yaxes(fixedrange=True)
+            st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
+    else: st.info("「データ取得・更新」ボタンを押してください。")
+    
+    st.write("---")
+    st.subheader("🔍 個別銘柄 信用残検索 (IRBank)")
+    c1, c2 = st.columns([1, 4])
+    search_code = c1.text_input("銘柄コード", value="1321", placeholder="例: 1321")
+    if search_code:
+        with st.spinner(f"{search_code} のデータを取得中..."):
+            idf = fetch_irbank_margin(search_code)
+            if not idf.empty:
+                if 'ir_period' not in st.session_state: st.session_state.ir_period = "1年"
+                p = st.radio("表示期間:", ["6ヶ月", "1年", "3年", "全"], key="ir_p", horizontal=True)
+                
+                i_end = idf['Date'].max()
+                if p == "6ヶ月": i_start = i_end - pd.DateOffset(months=6)
+                elif p == "1年": i_start = i_end - pd.DateOffset(years=1)
+                elif p == "3年": i_start = i_end - pd.DateOffset(years=3)
+                else: i_start = idf['Date'].min()
+                
+                vdf = idf[idf['Date'] >= i_start]
+                if not vdf.empty:
+                    ifig = plot_individual_margin(vdf, search_code)
+                    st.plotly_chart(ifig, use_container_width=True)
+            else:
+                st.warning("データが見つかりませんでした。コードを確認してください。")
+    st.stop()
+
+if selected_page == "セクターローテーション":
+    render_sector_rotation_page()
+    st.stop()
+
+with st.sidebar:
+    st.subheader("スクリーニング操作")
+    with st.expander("📂 履歴", expanded=True):
+        ids = get_history_list()
+        if ids:
+            sid = st.selectbox("過去の結果", ["-- 選択 --"] + ids, key="h_sel")
+            if sid != "-- 選択 --" and st.session_state.get('last_id') != sid:
+                st.session_state.result_df = load_history(sid); st.session_state.last_id = sid
+            if sid != "-- 選択 --":
+                if st.button("削除", type="primary"):
+                    if delete_history(sid): st.session_state.result_df = pd.DataFrame(); st.session_state.last_id = None; st.rerun()
+    list_src = st.radio("取得元", ["JPX (TOPIX)", "Google Sheets", "CSV（ローカル）"], label_visibility="collapsed")
+
+    # Google Sheets 取得元の場合: ファイル登録から選択
+    sheets_df_target = pd.DataFrame()
+    if list_src == "Google Sheets":
+        reg = load_file_registry()
+        screening_files = reg[reg["file_type"] == "screening"] if not reg.empty and "file_type" in reg.columns else pd.DataFrame()
+        if screening_files.empty:
+            st.info("file_manager シートに file_type=screening のファイルを登録してください。")
+            st.markdown("👉 下の「ファイル登録」から追加できます")
+        else:
+            sel_name = st.selectbox(
+                "銘柄リスト選択",
+                screening_files["file_name"].tolist(),
+                key="screening_file_sel"
+            )
+            sel_row = screening_files[screening_files["file_name"] == sel_name].iloc[0]
+            sel_url = sel_row["url"]
+            sel_sheet = sel_row.get("sheet_name", "") or None
+            if st.button("シートをプレビュー", key="preview_screening"):
+                preview_df = read_sheet_as_df(sel_url, sel_sheet)
+                if not preview_df.empty:
+                    st.dataframe(preview_df.head(10), use_container_width=True)
+                else:
+                    st.warning("読み込めませんでした")
+
+    csv = st.file_uploader("CSVファイルをアップロード", type=["csv"]) if list_src == "CSV（ローカル）" else None
+
+    if st.button("開始", use_container_width=True):
+        df_t = pd.DataFrame()
+        if list_src == "JPX (TOPIX)":
+            df_t = get_jpx_list()
+        elif list_src == "Google Sheets":
+            reg = load_file_registry()
+            screening_files = reg[reg["file_type"] == "screening"] if not reg.empty and "file_type" in reg.columns else pd.DataFrame()
+            if not screening_files.empty:
+                sel_name = st.session_state.get("screening_file_sel", screening_files["file_name"].iloc[0])
+                sel_row = screening_files[screening_files["file_name"] == sel_name].iloc[0]
+                raw_df = read_sheet_as_df(sel_row["url"], sel_row.get("sheet_name") or None)
+                if not raw_df.empty:
+                    try:
+                        code_col = next(c for c in ["コード", "銘柄コード", "symbol", "code"] if c in raw_df.columns)
+                        df_t = pd.DataFrame()
+                        df_t["symbol"] = pd.to_numeric(raw_df[code_col].astype(str).str.split(".").str[0], errors="coerce").dropna().astype(int)
+                        name_cols = [c for c in ["銘柄", "銘柄名", "name"] if c in raw_df.columns]
+                        df_t["name"] = raw_df[name_cols[0]] if name_cols else "-"
+                        df_t = df_t.dropna(subset=["symbol"]).reset_index(drop=True)
+                    except Exception as e:
+                        st.error(f"銘柄コード列の読み込みエラー: {e}")
+        elif csv:
+            try:
+                try: df_c = pd.read_csv(csv)
+                except: csv.seek(0); df_c = pd.read_csv(csv, encoding='shift_jis')
+                df_t = pd.DataFrame()
+                df_t['symbol'] = pd.to_numeric(df_c[next(c for c in ["コード", "銘柄コード", "symbol"] if c in df_c.columns)], errors='coerce').dropna().astype(int)
+                df_t['name'] = df_c[next(c for c in ["銘柄", "name"] if c in df_c.columns)] if any(c in df_c.columns for c in ["銘柄", "name"]) else "-"
+            except: st.error("CSVエラー")
+        if not df_t.empty:
+            st.session_state.result_df = analyze_market_streamlit(df_t)
+            st.session_state.performed_scan = True
+            st.session_state.last_id = None
+    if not st.session_state.result_df.empty:
+        if st.button("結果を保存", use_container_width=True):
+            if save_history(st.session_state.result_df): st.rerun()
+
+st.title("WVF + Trend Screener :blue[Pro]")
+if not st.session_state.result_df.empty:
+    rdf = st.session_state.result_df
+    for i in range(0, len(rdf), 2):
+        cols = st.columns(2)
+        for j in range(2):
+            if i + j < len(rdf):
+                r = rdf.iloc[i + j]
+                with cols[j]:
+                    with st.container(border=True):
+                        c1, c2 = st.columns([0.85, 0.15])
+                        c1.subheader(f"[{r['コード']}](https://jp.tradingview.com/chart/?symbol=TSE%3A{r['コード']}) {r['銘柄']}")
+                        if c2.toggle("⭐", value=r['お気に入り'], key=f"f_{r['コード']}_{i+j}", label_visibility="collapsed") != r['お気に入り']:
+                            st.session_state.result_df.at[i + j, 'お気に入り'] = not r['お気に入り']
+                        i1, i2 = st.columns([1, 2])
+                        if r['チャート']: i1.image(r['チャート'], use_container_width=True)
+                        m1 = i2.columns(3)
+                        m1[0].metric("現在値", f"¥{r['現在値']:,.1f}"); m1[1].metric("消灯目安", f"¥{r['消灯目安(安値)']:,.1f}"); m1[2].metric("200日乖離", f"{r['乖離率(%)']}%")
+                        m2 = i2.columns(4)
+                        m2[0].metric("WVF", r['WVF']); m2[1].metric("Upper", r['WVF Upper']); m2[2].metric("傾き", f"{r['200MA傾き率']:.5f}"); m2[3].metric("日", r['シグナル日'])
+else:
+    if st.session_state.performed_scan:
+        st.warning("条件に一致する銘柄は見つかりませんでした。")
+    else:
+        st.info("左メニューの「開始」ボタンを押してスクリーニングを開始してください。")
