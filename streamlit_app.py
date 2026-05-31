@@ -281,67 +281,7 @@ def analyze_db_update_needs(is_jp: bool = True):
 
         # is_finalized=False の銘柄（当日取得の未完成データ）
         if "is_finalized" in db_df.columns:
-            unfinalized = db_df[db_df["is_finalized"] == False]["ticker"].unique().tolist()
-        else:
-            unfinalized = []
-
-        # DBに存在しない銘柄
-        db_tickers = set(db_df["ticker"].unique())
-        missing = [t for t in all_tickers if t not in db_tickers]
-
-        return {
-            "global_max_date": global_max_date,
-            "needs_period_update": needs_period_update,
-            "refetch_tickers": unfinalized,
-            "missing_tickers": missing,
-        }
-    except Exception as e:
-        return {
-            "global_max_date": None,
-            "needs_period_update": True,
-            "refetch_tickers": [],
-            "missing_tickers": [],
-            "error": str(e),
-        }
-
-def run_incremental_update(is_jp: bool = True):
-    """3段階差分更新 with Streamlit status logging:
-    ① 期間差分（3日超）→ 全銘柄のGroup A/B更新
-    ② is_finalized=False → その銘柄の当日分を再取得
-    ③ DB未存在銘柄 → フルダウンロード
-    """
-    try:
-        sync_extra_tickers_to_local()
-    except Exception:
-        pass
-
-    needs = analyze_db_update_needs(is_jp=is_jp)
-    if "error" in needs:
-        return False, f"DB分析エラー: {needs['error']}"
-
-    updated = False
-    messages = []
-
-    # Use placeholder for incremental log output
-    placeholder = st.empty()
-    def log(msg):
-        # Write message to placeholder and also to main page for visibility
-        placeholder.text(msg)
-        st.write(msg)
-
-    # ① 期間差分更新
-    if needs["needs_period_update"]:
-        try:
-            all_tickers = stock_study.get_all_collection_tickers()
-            stock_study.update_price_database(is_jp=is_jp, target_tickers=all_tickers, log_func=log)
-            messages.append(f"期間更新完了({needs['global_max_date']}→今日)")
-            updated = True
-        except Exception as e:
-            messages.append(f"期間更新エラー: {e}")
-
-    # ② is_finalized=False の銘柄を再取得
-    if needs["refetch_tickers"]:
-        try:
+            unfinalized = db_df[db    try:
             stock_study.update_price_database(
                 is_jp=is_jp,
                 target_tickers=needs["refetch_tickers"],

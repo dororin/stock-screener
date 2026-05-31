@@ -170,56 +170,7 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True):
 
 # --- TOPIXユニバースのダウンロード ---
 
-def get_topix500_tickers(log_func=None) -> list:
-    """JPX公式エクセルからTOPIX500（Core30+Large70+Mid400）＋ETF・ETNの銘柄コードを取得（当日キャッシュあり）
-    Optional log_func for UI logging.
-    """
-    # 当日キャッシュ確認
-    cache_path = os.path.join(WORK_DIR, "jpx_ticker_cache.json")
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, "r") as f:
-                cache = json.load(f)
-            if cache.get("date") == today_str and cache.get("tickers"):
-                msg = f"✅ JPXリスト: 当日キャッシュ使用 ({len(cache['tickers'])}銘柄)"
-                if log_func:
-                    log_func(msg)
-                else:
-                    print(msg)
-                return cache["tickers"]
-        except Exception:
-            pass
-    try:
-        resp = requests.get(JPX_URL, timeout=10)
-        jpx_save_path = os.path.join(DRIVE_DIR, "jpx_stock_list_raw.xls")
-        with open(jpx_save_path, "wb") as f:
-            f.write(resp.content)
-        df_full = pd.read_excel(jpx_save_path)
-        df_scale = df_full.iloc[:, [1, 2, 3, 9]].copy()
-        df_scale.columns = ['symbol', 'name', 'market', 'scale_type']
-        target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
-        topix500 = df_scale[df_scale["scale_type"].isin(target_scales)]['symbol'].dropna()
-        codes = [str(s).strip().split('.')[0] for s in topix500 if str(s).strip()]
-        msg = f"✅ 収集対象: TOPIX500={len(topix500)}銘柄 = 計{len(codes)}銘柄"
-        if log_func:
-            log_func(msg)
-        else:
-            print(msg)
-        # 当日キャッシュ保存
-        try:
-            with open(cache_path, "w") as f:
-                json.dump({"date": today_str, "tickers": codes}, f)
-        except Exception:
-            pass
-        return codes
-    except Exception as e:
-        msg = f"JPX銘柄リスト取得失敗: {e}"
-        if log_func:
-            log_func(msg)
-        else:
-            print(msg)
-        return []
+def get_topix500_tickers() -> list:
     """JPX公式エクセルからTOPIX500（Core30+Large70+Mid400）＋ETF・ETNの銘柄コードを取得（当日キャッシュあり）"""
     # 当日キャッシュ確認
     cache_path = os.path.join(WORK_DIR, "jpx_ticker_cache.json")
@@ -246,9 +197,14 @@ def get_topix500_tickers(log_func=None) -> list:
         target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
         topix500 = df_scale[df_scale["scale_type"].isin(target_scales)]['symbol'].dropna()
 
-                # TOPIX500の銘柄コードのみ取得（ETF・ETNは除外）
-        codes = [str(s).strip().split('.')[0] for s in topix500 if str(s).strip()]
-        print(f"✅ 収集対象: TOPIX500={len(topix500)}銘柄 = 計{len(codes)}銘柄")
+        # ETF・ETN: 市場・商品区分列(index 3)で絞り込み
+        df_market = df_full.iloc[:, [1, 2, 3]].copy()
+        df_market.columns = ['symbol', 'name', 'market']
+        etf_etn = df_market[df_market["market"] == "ETF・ETN"]['symbol'].dropna()
+
+        all_symbols = pd.concat([topix500, etf_etn]).drop_duplicates()
+        codes = [str(s).strip().split('.')[0] for s in all_symbols if str(s).strip()]
+        print(f"✅ 収集対象: TOPIX500={len(topix500)}銘柄 + ETF/ETN={len(etf_etn)}銘柄 = 計{len(codes)}銘柄")
         # 当日キャッシュ保存
         try:
             with open(cache_path, "w") as f:
@@ -361,13 +317,7 @@ def load_tickers_from_file(file_path: str) -> list:
 
 # --- データベース統合更新エンジン ---
 
-def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, log_func=None):
-    def log(msg):
-        if log_func:
-            log_func(msg)
-        else:
-            print(msg)
-
+def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False):
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
     
@@ -375,18 +325,18 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         tickers = get_all_collection_tickers()
         
     if not tickers:
-        log(f"[{market_name}] 更新対象銘柄リストが空です。処理をスキップします。")
+        print(f"[{market_name}] 更新対象銘柄リストが空です。処理をスキップします。")
         return
 
     now = datetime.now()
     suffix = ".T" if is_jp else ""
 
     for interval in TIMEFRAMES:
-        log(f"\n--- Database Sync: {market_name} ({interval}) ---")
+        print(f"\n--- Database Sync: {market_name} ({interval}) ---")
         try:
             db_df = load_price_db(interval, is_jp=is_jp)
         except FileNotFoundError as e:
-            log(f"Skipped: {e}")
+            print(f"Skipped: {e}")
             continue
 
         last_updates_map = {}
@@ -412,7 +362,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         if group_up_to_date:
             start_date_dt = global_max_date + timedelta(days=1) if interval == "1d" else global_max_date + timedelta(hours=1)
             if start_date_dt > now:
-                log(f"  ✨ All Group-A tickers are already up to date.")
+                print(f"  ✨ All Group-A tickers are already up to date.")
             else:
                 BATCH_SIZE = 50
                 for i in range(0, len(group_up_to_date), BATCH_SIZE):
@@ -424,7 +374,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                         if not chunk_processed.empty:
                             all_downloaded.append(chunk_processed)
                     except Exception as e:
-                        log(f"     Batch Error: {e}")
+                        print(f"     Batch Error: {e}")
                     time.sleep(1)
 
         # --- 新規/遅れ組 (Group B) 同期 ---
@@ -454,7 +404,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                     if not chunk_processed.empty:
                         all_downloaded.append(chunk_processed)
                 except Exception as e:
-                    log(f"     Batch Error: {e}")
+                    print(f"     Batch Error: {e}")
                 time.sleep(1.5)
 
         if all_downloaded:
@@ -467,9 +417,9 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             
             db_df = merge_price_data(db_df, new_combined)
             save_price_db(db_df, interval, is_jp=is_jp)
-            log(f"  ✅ Saved updated price_{market_name.lower()}_{interval}.parquet. Rows: {len(db_df)}")
+            print(f"  ✅ Saved updated price_{market_name.lower()}_{interval}.parquet. Rows: {len(db_df)}")
         else:
-            log(f"  🧊 No new data added.")
+            print(f"  🧊 No new data added.")
 
 def merge_price_data(old_df, new_df):
     """ticker単位でマージ: 新規データがあるtickerはそのtickerの旧データと結合、
