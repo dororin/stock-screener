@@ -66,7 +66,7 @@ US_SECTORS = {
     "素材": ["LIN", "APD", "FCX", "NEM", "DOW"],
 }
 
-JP_BENCHMARKS = {"なし（絶対値）": None, "TOPIX": "^TPX", "日経平均": "^N225"}
+JP_BENCHMARKS = {"なし（絶対値）": None, "TOPIX (1306.T)": "1306.T", "日経平均": "^N225"}
 US_BENCHMARKS = {"なし（絶対値）": None, "S&P500": "^GSPC", "NASDAQ100": "^NDX"}
 
 MARKET_DATA_URL = "https://docs.google.com/spreadsheets/d/1vaX2dKcHO_fo_KMffNiC98pY1fzfMkHCRkHE1IFE0PI/edit"
@@ -767,6 +767,7 @@ def render_sector_rotation_page():
 
     bm_series = get_benchmark_data(bm_ticker, period_days, interval) if bm_ticker else None
 
+
     # サマリー
     sector_index_cache = {}
     momentum_scores = {}
@@ -900,7 +901,9 @@ def get_sector_momentum(index_series, days=5):
     return float((recent.iloc[-1] / recent.iloc[0] - 1) * 100)
 
 @st.cache_data(ttl=600)
+@st.cache_data(ttl=600)
 def get_benchmark_data(ticker, period_days, interval):
+    """ベンチマークデータ取得（yfinance）"""
     try:
         end = datetime.now()
         start = end - timedelta(days=period_days + 30)
@@ -916,7 +919,8 @@ def get_benchmark_data(ticker, period_days, interval):
         idx = (1 + ret).cumprod() * 100
         if len(idx) > 0: idx.iloc[0] = 100.0
         return idx
-    except Exception: return pd.Series(dtype=float)
+    except Exception:
+        return pd.Series(dtype=float)
 
 def relativize_series(idx_series: pd.Series, bm_series: pd.Series) -> pd.Series:
     """セクター指数をベンチマークで割って相対強度系列に変換する"""
