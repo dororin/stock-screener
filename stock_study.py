@@ -170,7 +170,56 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True):
 
 # --- TOPIXユニバースのダウンロード ---
 
-def get_topix500_tickers() -> list:
+def get_topix500_tickers(log_func=None) -> list:
+    """JPX公式エクセルからTOPIX500（Core30+Large70+Mid400）＋ETF・ETNの銘柄コードを取得（当日キャッシュあり）
+    Optional log_func for UI logging.
+    """
+    # 当日キャッシュ確認
+    cache_path = os.path.join(WORK_DIR, "jpx_ticker_cache.json")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                cache = json.load(f)
+            if cache.get("date") == today_str and cache.get("tickers"):
+                msg = f"✅ JPXリスト: 当日キャッシュ使用 ({len(cache['tickers'])}銘柄)"
+                if log_func:
+                    log_func(msg)
+                else:
+                    print(msg)
+                return cache["tickers"]
+        except Exception:
+            pass
+    try:
+        resp = requests.get(JPX_URL, timeout=10)
+        jpx_save_path = os.path.join(DRIVE_DIR, "jpx_stock_list_raw.xls")
+        with open(jpx_save_path, "wb") as f:
+            f.write(resp.content)
+        df_full = pd.read_excel(jpx_save_path)
+        df_scale = df_full.iloc[:, [1, 2, 3, 9]].copy()
+        df_scale.columns = ['symbol', 'name', 'market', 'scale_type']
+        target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
+        topix500 = df_scale[df_scale["scale_type"].isin(target_scales)]['symbol'].dropna()
+        codes = [str(s).strip().split('.')[0] for s in topix500 if str(s).strip()]
+        msg = f"✅ 収集対象: TOPIX500={len(topix500)}銘柄 = 計{len(codes)}銘柄"
+        if log_func:
+            log_func(msg)
+        else:
+            print(msg)
+        # 当日キャッシュ保存
+        try:
+            with open(cache_path, "w") as f:
+                json.dump({"date": today_str, "tickers": codes}, f)
+        except Exception:
+            pass
+        return codes
+    except Exception as e:
+        msg = f"JPX銘柄リスト取得失敗: {e}"
+        if log_func:
+            log_func(msg)
+        else:
+            print(msg)
+        return []
     """JPX公式エクセルからTOPIX500（Core30+Large70+Mid400）＋ETF・ETNの銘柄コードを取得（当日キャッシュあり）"""
     # 当日キャッシュ確認
     cache_path = os.path.join(WORK_DIR, "jpx_ticker_cache.json")

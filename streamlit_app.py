@@ -322,33 +322,74 @@ def run_incremental_update(is_jp: bool = True):
     updated = False
     messages = []
 
-    # Use Streamlit status container for detailed logs
-    with st.status("データ更新中...", expanded=True) as status:
-        def log(msg: str):
-            # Write log messages inside the status container
-            st.write(msg)
+    # Use placeholder for incremental log output
+    placeholder = st.empty()
+    def log(msg):
+        # Write message to placeholder and also to main page for visibility
+        placeholder.text(msg)
+        st.write(msg)
 
-        # ① 期間差分更新
-        if needs["needs_period_update"]:
-            try:
-                all_tickers = stock_study.get_all_collection_tickers()
-                stock_study.update_price_database(is_jp=is_jp, target_tickers=all_tickers, log_func=log)
-                messages.append(f"期間更新完了({needs['global_max_date']}→今日)")
-                updated = True
-            except Exception as e:
-                messages.append(f"期間更新エラー: {e}")
+    # ① 期間差分更新
+    if needs["needs_period_update"]:
+        try:
+            all_tickers = stock_study.get_all_collection_tickers()
+            stock_study.update_price_database(is_jp=is_jp, target_tickers=all_tickers, log_func=log)
+            messages.append(f"期間更新完了({needs['global_max_date']}→今日)")
+            updated = True
+        except Exception as e:
+            messages.append(f"期間更新エラー: {e}")
 
-        # ② is_finalized=False の銘柄を再取得
-        elif needs["refetch_tickers"]:
-            try:
-                stock_study.update_price_database(
-                    is_jp=is_jp,
-                    target_tickers=needs["refetch_tickers"],
-                    force_refetch=True,
-                    log_func=log
-                )
-                messages.append(f"未確定データ再取得({len(needs['refetch_tickers'])}銘柄)")
-                updated = True
+    # ② is_finalized=False の銘柄を再取得
+    if needs["refetch_tickers"]:
+        try:
+            stock_study.update_price_database(
+                is_jp=is_jp,
+                target_tickers=needs["refetch_tickers"],
+                force_refetch=True,
+                log_func=log
+            )
+            messages.append(f"未確定データ再取得({len(needs['refetch_tickers'])}銘柄)")
+            updated = True
+        except Exception as e:
+            messages.append(f"再取得エラー: {e}")
+
+    # ③ 未存在銘柄のフルダウンロード
+    if needs["missing_tickers"] and not needs["needs_period_update"]:
+        try:
+            stock_study.update_price_database(
+                is_jp=is_jp,
+                target_tickers=needs["missing_tickers"],
+                log_func=log
+            )
+            messages.append(f"新規銘柄追加({len(needs['missing_tickers'])}銘柄)")
+            updated = True
+        except Exception as e:
+            messages.append(f"新規取得エラー: {e}")
+
+    if not updated:
+        return False, f"最新（{needs['global_max_date']}）"
+
+    # Clear caches after successful update
+    get_db_last_update.clear()
+    load_unified_db.clear()
+    return True, " / ".join(messages)
+    """3段階差分更新 with Streamlit status logging:
+    ① 期間差分（3日超）→ 全銘柄のGroup A/B更新
+    ② is_finalized=False → その銘柄の当日分を再取得
+    ③ DB未存在銘柄 → フルダウンロード
+    """
+    try:
+        sync_extra_tickers_to_local()
+    except Exception:
+        pass
+
+    needs = analyze_db_update_needs(is_jp=is_jp)
+    if "error" in needs:
+        return False, f"DB分析エラー: {needs['error']}"
+
+    updated = False
+    messages = []
+
             except Exception as e:
                 messages.append(f"再取得エラー: {e}")
 
@@ -373,59 +414,7 @@ def run_incremental_update(is_jp: bool = True):
         load_unified_db.clear()
         return True, " / ".join(messages)
     
-    try:
-        sync_extra_tickers_to_local()
-    except Exception:
-        pass
 
-    needs = analyze_db_update_needs(is_jp=is_jp)
-    if "error" in needs:
-        return False, f"DB分析エラー: {needs['error']}"
-
-    updated = False
-    messages = []
-
-    # ① 期間差分更新
-    if needs["needs_period_update"]:
-        try:
-            all_tickers = stock_study.get_all_collection_tickers()
-            stock_study.update_price_database(is_jp=is_jp, target_tickers=all_tickers)
-            messages.append(f"期間更新完了({needs['global_max_date']}→今日)")
-            updated = True
-        except Exception as e:
-            messages.append(f"期間更新エラー: {e}")
-
-    # ② is_finalized=False の銘柄を再取得
-    elif needs["refetch_tickers"]:
-        try:
-            stock_study.update_price_database(
-                is_jp=is_jp,
-                target_tickers=needs["refetch_tickers"],
-                force_refetch=True
-            )
-            messages.append(f"未確定データ再取得({len(needs['refetch_tickers'])}銘柄)")
-            updated = True
-        except Exception as e:
-            messages.append(f"再取得エラー: {e}")
-
-    # ③ 未存在銘柄のフルダウンロード
-    if needs["missing_tickers"] and not needs["needs_period_update"]:
-        try:
-            stock_study.update_price_database(
-                is_jp=is_jp,
-                target_tickers=needs["missing_tickers"]
-            )
-            messages.append(f"新規銘柄追加({len(needs['missing_tickers'])}銘柄)")
-            updated = True
-        except Exception as e:
-            messages.append(f"新規取得エラー: {e}")
-
-    if not updated:
-        return False, f"最新（{needs['global_max_date']}）"
-
-    get_db_last_update.clear()
-    load_unified_db.clear()
-    return True, " / ".join(messages)
 
 
 # =====================================================================
