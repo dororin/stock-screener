@@ -953,9 +953,12 @@ def render_sector_rotation_page():
 
     # --- デバッグ（確認後削除）---
     if not db_df.empty:
-        sample_tickers = db_df["ticker"].unique()[:5].tolist()
+        all_tickers = db_df["ticker"].unique()
+        sample = sorted(all_tickers)
+        st.caption(f"🔍 DB総銘柄数: {len(all_tickers)} / 先頭5: {sample[:5]} / 末尾5: {sample[-5:]}")
         first_sector_tickers = list(sectors.values())[0][:3] if sectors else []
-        st.caption(f"🔍 DB ticker例: {sample_tickers} / セクターticker例: {first_sector_tickers}")
+        matched = [t for t in first_sector_tickers if t in all_tickers]
+        st.caption(f"🔍 セクターticker例: {first_sector_tickers} / うちDB一致: {matched}")
     # --- デバッグここまで ---
 
     if db_df.empty:
