@@ -421,23 +421,50 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         else:
             print(f"  🧊 No new data added.")
 
-def merge_price_data(old_df, new_df):
-    """ticker単位でマージ: 新規データがあるtickerはそのtickerの旧データと結合、
-    新規データがないtickerは旧データをそのまま保持"""
+def merge_price_data(old_df, new_df, is_jp=True):
     if new_df is None or new_df.empty: return old_df
     if old_df.empty: return new_df
-    # 新規データに含まれるtickerの旧データは、ticker別に最小日付以前のみ残す
+
     new_tickers = new_df["ticker"].unique()
-    # 新規データに含まれないtickerは旧データをそのまま保持
     old_untouched = old_df[~old_df["ticker"].isin(new_tickers)].copy()
-    # 新規データに含まれるtickerは、ticker別に新規の最小日付以前の旧データと結合
+    
     old_touched_parts = []
+    re_download_tickers = []  # 分割を検知して再ダウンロードが必要な銘柄リスト
+
     for t in new_tickers:
-        t_new = new_df[new_df["ticker"] == t]
-        t_old = old_df[old_df["ticker"] == t]
-        if not t_old.empty:
+        t_new = new_df[new_df["ticker"] == t].sort_values("date")
+        t_old = old_df[old_df["ticker"] == t].sort_values("date")
+        
+        if not t_old.empty and not t_new.empty:
+            # 境界値のチェック：DBの最終日価格 と 新データの初日価格
+            old_last_price = t_old["close"].iloc[-1]
+            new_first_price = t_new["close"].iloc[0]
+            
+            # 1日の間に価格が30%以上減少、または40%以上増加しているかチェック（分割/併合の検知）
+            ratio = new_first_price / old_last_price
+            if ratio < 0.7 or ratio > 1.4:
+                print(f"⚠️ [分割/併合検知] Ticker {t}: 価格が {old_last_price:.1f} から {new_first_price:.1f} へ急変しています。フルダウンロードリストに追加します。")
+                re_download_tickers.append(t)
+                continue  # 古いデータは結合せず、破棄する
+                
             t_min = t_new["date"].min()
             old_touched_parts.append(t_old[t_old["date"] < t_min])
+            
+    # 検知された銘柄をその場でフルダウンロード（再取得）する
+    if re_download_tickers:
+        suffix = ".T" if is_jp else ""
+        print(f"🔄 {len(re_download_tickers)}件の銘柄について過去全期間（調整後）データを再取得します...")
+        for t in re_download_tickers:
+            try:
+                # auto_adjust=True で全期間ダウンロード
+                df_heal = yf.download(f"{t}{suffix}", start="2023-01-01", auto_adjust=True, progress=False)
+                if not df_heal.empty:
+                    # 整形処理（parse_yfinance_batchと同様の処理）を行い、new_df側へ追加する
+                    df_heal_clean = parse_single_ticker(df_heal, t) # 自作の整形関数
+                    new_df = pd.concat([new_df, df_heal_clean], ignore_index=True)
+            except Exception as e:
+                print(f"❌ {t} の自己修復ダウンロードに失敗しました: {e}")
+
     old_touched = pd.concat(old_touched_parts, ignore_index=True) if old_touched_parts else pd.DataFrame()
     combined = pd.concat([old_untouched, old_touched, new_df], ignore_index=True)
     combined = combined.drop_duplicates(subset=["date", "ticker"], keep="last")
