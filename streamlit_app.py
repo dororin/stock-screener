@@ -234,6 +234,7 @@ def save_watchlist_to_sheets(watchlist: dict):
 # =====================================================================
 # 📂 データベースアクセス関数
 # =====================================================================
+@st.cache_data(ttl=300)
 def load_unified_db(interval: str, is_jp: bool = True) -> pd.DataFrame:
     try:
         return stock_study.load_price_db(interval, is_jp=is_jp)
@@ -950,6 +951,13 @@ def render_sector_rotation_page():
     # データベースロード
     db_df = load_unified_db(interval, is_jp=is_jp)
 
+    # --- デバッグ（確認後削除）---
+    if not db_df.empty:
+        sample_tickers = db_df["ticker"].unique()[:5].tolist()
+        first_sector_tickers = list(sectors.values())[0][:3] if sectors else []
+        st.caption(f"🔍 DB ticker例: {sample_tickers} / セクターticker例: {first_sector_tickers}")
+    # --- デバッグここまで ---
+
     if db_df.empty:
         st.info("💡 データベースがまだ作成されていません。Google Colabなどで `stock_study.py` を実行してデータベースを作成してください。")
         return
@@ -1089,7 +1097,6 @@ def get_sector_momentum(index_series, days=5):
     if recent.iloc[0] == 0: return 0.0
     return float((recent.iloc[-1] / recent.iloc[0] - 1) * 100)
 
-@st.cache_data(ttl=600)
 @st.cache_data(ttl=600)
 def get_benchmark_data(ticker, period_days, interval):
     """ベンチマークデータ取得（yfinance）"""
