@@ -253,17 +253,21 @@ def get_db_last_update(interval: str, is_jp: bool = True) -> str:
         return "不明"
 
 def run_incremental_update(is_jp: bool = True):
-    """差分更新: 当日未更新かつ平日のみ実行。JPXリストは当日キャッシュ使用"""
+    """差分更新: DBの最終日が今日から3日以上前の場合のみ実行（祝日・週末を考慮）"""
     today = datetime.now().date()
     last_str = get_db_last_update("1d", is_jp=is_jp)
     if last_str == "不明":
         return False, "DBが見つかりません"
     last_date = pd.to_datetime(last_str).date()
-    if last_date >= today:
+    # 3日以内なら最新とみなす（週末＋祝日を考慮）
+    if (today - last_date).days <= 3:
         return False, f"最新（{last_str}）"
     # 差分あり → 更新実行
     try:
-        tickers = stock_study.get_topix500_tickers()
+        # スプレッドシートのextra_tickersをローカルJSONに同期
+        sync_extra_tickers_to_local()
+        # TOPIX500 + extra_tickers の全銘柄で更新
+        tickers = stock_study.get_all_collection_tickers()
         if not tickers:
             return False, "JPXリスト取得失敗"
         stock_study.update_price_database(is_jp=is_jp, target_tickers=tickers)
@@ -655,20 +659,152 @@ def plot_market_dashboard(saitei_df, sinyou_df, naaim_df):
     return fig
 
 
+
+# =====================================================================
+# 📋 追加収集ティッカー（extra_tickers）管理
+# =====================================================================
+EXTRA_TICKERS_SHEET = "extra_tickers"
+EXTRA_TICKERS_CACHE_KEY = "extra_tickers_loaded"
+
+@st.cache_data(ttl=3600)
+def load_extra_tickers_from_sheets() -> pd.DataFrame:
+    """extra_tickersシートから追加収集ティッカーを読み込む。シートがなければ空DataFrameを返す"""
+    sh = get_sector_spreadsheet()
+    if sh is None:
+        return pd.DataFrame(columns=["code", "name", "memo"])
+    try:
+        ws = sh.worksheet(EXTRA_TICKERS_SHEET)
+        records = ws.get_all_records()
+        if not records:
+            return pd.DataFrame(columns=["code", "name", "memo"])
+        df = pd.DataFrame(records)
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        df["code"] = df["code"].astype(str).str.strip().str.split(".").str[0]
+        return df[df["code"].str.len() > 0].reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=["code", "name", "memo"])
+
+def save_extra_tickers_to_sheets(df: pd.DataFrame):
+    """extra_tickersシートに保存。シートがなければ作成する"""
+    sh = get_sector_spreadsheet()
+    if sh is None:
+        return
+    try:
+        try:
+            ws = sh.worksheet(EXTRA_TICKERS_SHEET)
+        except Exception:
+            ws = sh.add_worksheet(title=EXTRA_TICKERS_SHEET, rows=200, cols=3)
+        rows = [["code", "name", "memo"]] + df[["code", "name", "memo"]].values.tolist()
+        ws.clear()
+        ws.update(rows, "A1")
+        load_extra_tickers_from_sheets.clear()
+    except Exception:
+        pass
+
+def sync_extra_tickers_to_local():
+    """スプレッドシートのextra_tickersをローカルJSONに同期（stock_study.pyが参照）"""
+    try:
+        df = load_extra_tickers_from_sheets()
+        codes = df["code"].tolist() if not df.empty else []
+        cache_path = os.path.join(stock_study.WORK_DIR, "extra_tickers.json")
+        with open(cache_path, "w") as f:
+            json.dump({"codes": codes, "updated": datetime.now().strftime("%Y-%m-%d")}, f)
+        return codes
+    except Exception:
+        return []
+
 # =====================================================================
 # 🔄 セクターローテーション: ページ描画
 # =====================================================================
 def get_jpx_full_list():
-    """get_jpx_list() を再利用してsymbolを文字列化して返す（検索用ラッパー）"""
-    df = get_jpx_list()
-    if df.empty:
-        return pd.DataFrame(columns=['symbol', 'name'])
-    df = df.copy()
-    df['symbol'] = df['symbol'].astype(str)
-    return df
+    """TOPIX500 + ETF/ETN全銘柄を返す（検索用）"""
+    try:
+        url = 'https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls'
+        df_full = pd.read_excel(url)
+        # TOPIX500
+        df_scale = df_full.iloc[:, [1, 2, 9]].copy()
+        df_scale.columns = ['symbol', 'name', 'scale_type']
+        target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
+        topix = df_scale[df_scale['scale_type'].isin(target_scales)][['symbol', 'name']]
+        # ETF・ETN
+        df_market = df_full.iloc[:, [1, 2, 3]].copy()
+        df_market.columns = ['symbol', 'name', 'market']
+        etf = df_market[df_market['market'] == 'ETF・ETN'][['symbol', 'name']]
+        # 結合
+        combined = pd.concat([topix, etf]).drop_duplicates(subset=['symbol'])
+        combined['symbol'] = pd.to_numeric(combined['symbol'], errors='coerce')
+        combined = combined.dropna(subset=['symbol'])
+        combined['symbol'] = combined['symbol'].astype(int).astype(str)
+        return combined.reset_index(drop=True)
+    except Exception:
+        # フォールバック：既存のget_jpx_list()
+        df = get_jpx_list()
+        if df.empty:
+            return pd.DataFrame(columns=['symbol', 'name'])
+        df = df.copy()
+        df['symbol'] = df['symbol'].astype(str)
+        return df
 
 
 CUSTOM_SECTOR_KEY = "custom_sector_tickers"
+
+@st.fragment
+def _extra_tickers_ui():
+    """追加収集ティッカー管理UI（フラグメント）"""
+    st.divider()
+    st.subheader("⚙️ 収集対象ETF設定")
+    st.caption("ColabのDBに収集する追加ティッカーを管理します")
+
+    df = load_extra_tickers_from_sheets()
+
+    # 検索・追加UI
+    q = st.text_input(
+        "銘柄コード・名前で検索",
+        placeholder="例: 1306 / TOPIX / 半導体",
+        key="extra_search_input"
+    ).strip()
+
+    if len(q) >= 2:
+        jpx_df = get_jpx_full_list()
+        if not jpx_df.empty:
+            mask = (
+                jpx_df["name"].str.contains(q, na=False, case=False) |
+                jpx_df["symbol"].str.contains(q, na=False)
+            )
+            found = jpx_df[mask].head(8)
+            if not found.empty:
+                for _, row in found.iterrows():
+                    code_str = str(row["symbol"])
+                    name_str = str(row["name"])
+                    already = code_str in df["code"].values if not df.empty else False
+                    label = f"✅ {code_str}　{name_str}" if already else f"➕ {code_str}　{name_str}"
+                    if st.button(label, key=f"extra_btn_{code_str}", use_container_width=True, disabled=already):
+                        new_row = pd.DataFrame([{"code": code_str, "name": name_str, "memo": ""}])
+                        df = pd.concat([df, new_row], ignore_index=True)
+                        save_extra_tickers_to_sheets(df)
+                        sync_extra_tickers_to_local()
+                        st.rerun(scope="app")
+            else:
+                st.caption(f"「{q}」の候補なし")
+        elif len(q) == 1:
+            st.caption("もう1文字以上入力すると候補が表示されます")
+
+    # 登録済み一覧
+    if not df.empty:
+        st.caption(f"登録済み: {len(df)}件")
+        to_delete = []
+        for _, row in df.iterrows():
+            ca, cb = st.columns([4, 1])
+            ca.markdown(f"**{row['code']}** {row['name']}")
+            if cb.button("🗑️", key=f"extra_del_{row['code']}", help=f"{row['code']}を削除"):
+                to_delete.append(row["code"])
+        if to_delete:
+            df = df[~df["code"].isin(to_delete)].reset_index(drop=True)
+            save_extra_tickers_to_sheets(df)
+            sync_extra_tickers_to_local()
+            st.rerun(scope="app")
+    else:
+        st.caption("まだ登録されていません")
 
 @st.fragment
 def _watchlist_ui():
@@ -806,6 +942,7 @@ def render_sector_rotation_page():
         # 📌 ウォッチリスト（フラグメントで独立）
         # ─────────────────────────────────────────
         _watchlist_ui()
+        _extra_tickers_ui()
 
     with st.spinner("セクター構成をスプレッドシートから読み込み中..."):
         sectors = load_sector_master_from_sheets(is_jp)

@@ -216,6 +216,29 @@ def get_topix500_tickers() -> list:
         print(f"JPX銘柄リスト取得失敗: {e}")
         return []
 
+
+def get_extra_tickers() -> list:
+    """extra_tickers.jsonから追加収集ティッカーを読み込む（streamlit_app.pyが同期済みの前提）"""
+    cache_path = os.path.join(WORK_DIR, "extra_tickers.json")
+    if not os.path.exists(cache_path):
+        return []
+    try:
+        with open(cache_path, "r") as f:
+            data = json.load(f)
+        codes = data.get("codes", [])
+        print(f"✅ 追加ティッカー: {len(codes)}件 ({cache_path})")
+        return codes
+    except Exception:
+        return []
+
+def get_all_collection_tickers() -> list:
+    """TOPIX500 + extra_tickersの全収集対象ティッカーを返す"""
+    topix = get_topix500_tickers()
+    extra = get_extra_tickers()
+    combined = list(dict.fromkeys(topix + extra))  # 重複除去・順序保持
+    print(f"✅ 全収集対象: TOPIX500={len(topix)} + 追加={len(extra)} = 計{len(combined)}銘柄")
+    return combined
+
 def load_tickers_from_file(file_path: str) -> list:
     """CSVまたはExcel(XLS/XLSX)ファイルから、1行目を検索して『コード』列を特定し、ティッカーリストを読み込む"""
     possible_paths = [
@@ -299,7 +322,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None):
     tickers = target_tickers if target_tickers else []
     
     if is_jp and not tickers:
-        tickers = get_topix500_tickers()
+        tickers = get_all_collection_tickers()
         
     if not tickers:
         print(f"[{market_name}] 更新対象銘柄リストが空です。処理をスキップします。")
