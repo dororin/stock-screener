@@ -415,11 +415,24 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None):
             print(f"  🧊 No new data added.")
 
 def merge_price_data(old_df, new_df):
+    """ticker単位でマージ: 新規データがあるtickerはそのtickerの旧データと結合、
+    新規データがないtickerは旧データをそのまま保持"""
     if new_df is None or new_df.empty: return old_df
     if old_df.empty: return new_df
-    new_min_date = new_df["date"].min()
-    old_part = old_df[old_df["date"] < new_min_date].copy()
-    combined = pd.concat([old_part, new_df], ignore_index=True)
+    # 新規データに含まれるtickerの旧データは、ticker別に最小日付以前のみ残す
+    new_tickers = new_df["ticker"].unique()
+    # 新規データに含まれないtickerは旧データをそのまま保持
+    old_untouched = old_df[~old_df["ticker"].isin(new_tickers)].copy()
+    # 新規データに含まれるtickerは、ticker別に新規の最小日付以前の旧データと結合
+    old_touched_parts = []
+    for t in new_tickers:
+        t_new = new_df[new_df["ticker"] == t]
+        t_old = old_df[old_df["ticker"] == t]
+        if not t_old.empty:
+            t_min = t_new["date"].min()
+            old_touched_parts.append(t_old[t_old["date"] < t_min])
+    old_touched = pd.concat(old_touched_parts, ignore_index=True) if old_touched_parts else pd.DataFrame()
+    combined = pd.concat([old_untouched, old_touched, new_df], ignore_index=True)
     combined = combined.drop_duplicates(subset=["date", "ticker"], keep="last")
     return combined.sort_values(["ticker", "date"]).reset_index(drop=True)
 
