@@ -317,7 +317,7 @@ def load_tickers_from_file(file_path: str) -> list:
 
 # --- データベース統合更新エンジン ---
 
-def update_price_database(is_jp: bool = True, target_tickers: list = None):
+def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False):
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
     
@@ -348,7 +348,10 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None):
 
         for t in tickers:
             t_last = last_updates_map.get(t)
-            if t_last and global_max_date and t_last >= global_max_date:
+            if force_refetch:
+                # force_refetch=True: 対象銘柄を全てGroup B（再取得）扱いにする
+                group_catchup.append(t)
+            elif t_last and global_max_date and t_last >= global_max_date:
                 group_up_to_date.append(t)
             else:
                 group_catchup.append(t)
@@ -381,7 +384,11 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None):
                 chunk = group_catchup[i:i+BATCH_SIZE]
                 
                 # 取得開始可能日の制限設定
-                start_date_dt = datetime(2023, 1, 1)
+                # force_refetch=True の場合はDBの最終日から再取得（当日分のみ）
+                if force_refetch and global_max_date:
+                    start_date_dt = global_max_date
+                else:
+                    start_date_dt = datetime(2023, 1, 1)
                 limit = None
                 if interval == "1m": limit = now - timedelta(days=6)
                 elif interval == "5m": limit = now - timedelta(days=58)

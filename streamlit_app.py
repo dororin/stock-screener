@@ -253,29 +253,116 @@ def get_db_last_update(interval: str, is_jp: bool = True) -> str:
     except Exception:
         return "不明"
 
-def run_incremental_update(is_jp: bool = True):
-    """差分更新: DBの最終日が今日から3日以上前の場合のみ実行（祝日・週末を考慮）"""
-    today = datetime.now().date()
-    last_str = get_db_last_update("1d", is_jp=is_jp)
-    if last_str == "不明":
-        return False, "DBが見つかりません"
-    last_date = pd.to_datetime(last_str).date()
-    # 3日以内なら最新とみなす（週末＋祝日を考慮）
-    if (today - last_date).days <= 3:
-        return False, f"最新（{last_str}）"
-    # 差分あり → 更新実行
+def analyze_db_update_needs(is_jp: bool = True):
+    """DBを分析して更新が必要な銘柄を3種類に分類して返す
+    Returns:
+        dict with keys:
+          - global_max_date: DBの最新日付
+          - needs_period_update: 期間差分が必要（最新日から3日超）
+          - refetch_tickers: is_finalized=Falseで再取得が必要な銘柄
+          - missing_tickers: DBに存在しない新規銘柄
+    """
     try:
-        # スプレッドシートのextra_tickersをローカルJSONに同期
-        sync_extra_tickers_to_local()
-        # TOPIX500 + extra_tickers の全銘柄で更新
-        tickers = stock_study.get_all_collection_tickers()
-        if not tickers:
-            return False, "JPXリスト取得失敗"
-        stock_study.update_price_database(is_jp=is_jp, target_tickers=tickers)
-        get_db_last_update.clear()  # キャッシュクリア
-        return True, f"{last_str} → {today} に更新"
+        db_df = stock_study.load_price_db("1d", is_jp=is_jp)
+        all_tickers = stock_study.get_all_collection_tickers()
+        today = datetime.now().date()
+
+        if db_df.empty:
+            return {
+                "global_max_date": None,
+                "needs_period_update": True,
+                "refetch_tickers": [],
+                "missing_tickers": all_tickers,
+            }
+
+        db_df["date"] = pd.to_datetime(db_df["date"])
+        global_max_date = db_df["date"].max().date()
+        needs_period_update = (today - global_max_date).days > 3
+
+        # is_finalized=False の銘柄（当日取得の未完成データ）
+        if "is_finalized" in db_df.columns:
+            unfinalized = db_df[db_df["is_finalized"] == False]["ticker"].unique().tolist()
+        else:
+            unfinalized = []
+
+        # DBに存在しない銘柄
+        db_tickers = set(db_df["ticker"].unique())
+        missing = [t for t in all_tickers if t not in db_tickers]
+
+        return {
+            "global_max_date": global_max_date,
+            "needs_period_update": needs_period_update,
+            "refetch_tickers": unfinalized,
+            "missing_tickers": missing,
+        }
     except Exception as e:
-        return False, f"更新エラー: {e}"
+        return {
+            "global_max_date": None,
+            "needs_period_update": True,
+            "refetch_tickers": [],
+            "missing_tickers": [],
+            "error": str(e),
+        }
+
+def run_incremental_update(is_jp: bool = True):
+    """3段階差分更新:
+    ① 期間差分（3日超）→ 全銘柄のGroup A/B更新
+    ② is_finalized=False → その銘柄の当日分を再取得
+    ③ DB未存在銘柄 → フルダウンロード
+    """
+    try:
+        sync_extra_tickers_to_local()
+    except Exception:
+        pass
+
+    needs = analyze_db_update_needs(is_jp=is_jp)
+    if "error" in needs:
+        return False, f"DB分析エラー: {needs['error']}"
+
+    updated = False
+    messages = []
+
+    # ① 期間差分更新
+    if needs["needs_period_update"]:
+        try:
+            all_tickers = stock_study.get_all_collection_tickers()
+            stock_study.update_price_database(is_jp=is_jp, target_tickers=all_tickers)
+            messages.append(f"期間更新完了({needs['global_max_date']}→今日)")
+            updated = True
+        except Exception as e:
+            messages.append(f"期間更新エラー: {e}")
+
+    # ② is_finalized=False の銘柄を再取得
+    elif needs["refetch_tickers"]:
+        try:
+            stock_study.update_price_database(
+                is_jp=is_jp,
+                target_tickers=needs["refetch_tickers"],
+                force_refetch=True
+            )
+            messages.append(f"未確定データ再取得({len(needs['refetch_tickers'])}銘柄)")
+            updated = True
+        except Exception as e:
+            messages.append(f"再取得エラー: {e}")
+
+    # ③ 未存在銘柄のフルダウンロード
+    if needs["missing_tickers"] and not needs["needs_period_update"]:
+        try:
+            stock_study.update_price_database(
+                is_jp=is_jp,
+                target_tickers=needs["missing_tickers"]
+            )
+            messages.append(f"新規銘柄追加({len(needs['missing_tickers'])}銘柄)")
+            updated = True
+        except Exception as e:
+            messages.append(f"新規取得エラー: {e}")
+
+    if not updated:
+        return False, f"最新（{needs['global_max_date']}）"
+
+    get_db_last_update.clear()
+    load_unified_db.clear()
+    return True, " / ".join(messages)
 
 
 # =====================================================================
