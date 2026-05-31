@@ -388,7 +388,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                 if force_refetch and global_max_date:
                     start_date_dt = global_max_date
                 else:
-                    start_date_dt = datetime(2015, 1, 1)
+                    start_date_dt = datetime(2023, 1, 1)
                 limit = None
                 if interval == "1m": limit = now - timedelta(days=6)
                 elif interval == "5m": limit = now - timedelta(days=58)
