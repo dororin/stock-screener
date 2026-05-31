@@ -312,7 +312,13 @@ def load_tickers_from_file(file_path: str) -> list:
 
 # --- データベース統合更新エンジン ---
 
-def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False):
+def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, log_func=None):
+    def log(msg):
+        if log_func:
+            log_func(msg)
+        else:
+            print(msg)
+
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
     
@@ -320,18 +326,18 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         tickers = get_all_collection_tickers()
         
     if not tickers:
-        print(f"[{market_name}] 更新対象銘柄リストが空です。処理をスキップします。")
+        log(f"[{market_name}] 更新対象銘柄リストが空です。処理をスキップします。")
         return
 
     now = datetime.now()
     suffix = ".T" if is_jp else ""
 
     for interval in TIMEFRAMES:
-        print(f"\n--- Database Sync: {market_name} ({interval}) ---")
+        log(f"\n--- Database Sync: {market_name} ({interval}) ---")
         try:
             db_df = load_price_db(interval, is_jp=is_jp)
         except FileNotFoundError as e:
-            print(f"Skipped: {e}")
+            log(f"Skipped: {e}")
             continue
 
         last_updates_map = {}
@@ -357,7 +363,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         if group_up_to_date:
             start_date_dt = global_max_date + timedelta(days=1) if interval == "1d" else global_max_date + timedelta(hours=1)
             if start_date_dt > now:
-                print(f"  ✨ All Group-A tickers are already up to date.")
+                log(f"  ✨ All Group-A tickers are already up to date.")
             else:
                 BATCH_SIZE = 50
                 for i in range(0, len(group_up_to_date), BATCH_SIZE):
@@ -369,7 +375,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                         if not chunk_processed.empty:
                             all_downloaded.append(chunk_processed)
                     except Exception as e:
-                        print(f"     Batch Error: {e}")
+                        log(f"     Batch Error: {e}")
                     time.sleep(1)
 
         # --- 新規/遅れ組 (Group B) 同期 ---
@@ -399,7 +405,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                     if not chunk_processed.empty:
                         all_downloaded.append(chunk_processed)
                 except Exception as e:
-                    print(f"     Batch Error: {e}")
+                    log(f"     Batch Error: {e}")
                 time.sleep(1.5)
 
         if all_downloaded:
@@ -412,9 +418,9 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             
             db_df = merge_price_data(db_df, new_combined)
             save_price_db(db_df, interval, is_jp=is_jp)
-            print(f"  ✅ Saved updated price_{market_name.lower()}_{interval}.parquet. Rows: {len(db_df)}")
+            log(f"  ✅ Saved updated price_{market_name.lower()}_{interval}.parquet. Rows: {len(db_df)}")
         else:
-            print(f"  🧊 No new data added.")
+            log(f"  🧊 No new data added.")
 
 def merge_price_data(old_df, new_df):
     """ticker単位でマージ: 新規データがあるtickerはそのtickerの旧データと結合、
