@@ -197,14 +197,9 @@ def get_topix500_tickers() -> list:
         target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
         topix500 = df_scale[df_scale["scale_type"].isin(target_scales)]['symbol'].dropna()
 
-        # ETF・ETN: 市場・商品区分列(index 3)で絞り込み
-        df_market = df_full.iloc[:, [1, 2, 3]].copy()
-        df_market.columns = ['symbol', 'name', 'market']
-        etf_etn = df_market[df_market["market"] == "ETF・ETN"]['symbol'].dropna()
-
-        all_symbols = pd.concat([topix500, etf_etn]).drop_duplicates()
-        codes = [str(s).strip().split('.')[0] for s in all_symbols if str(s).strip()]
-        print(f"✅ 収集対象: TOPIX500={len(topix500)}銘柄 + ETF/ETN={len(etf_etn)}銘柄 = 計{len(codes)}銘柄")
+                # TOPIX500の銘柄コードのみ取得（ETF・ETNは除外）
+        codes = [str(s).strip().split('.')[0] for s in topix500 if str(s).strip()]
+        print(f"✅ 収集対象: TOPIX500={len(topix500)}銘柄 = 計{len(codes)}銘柄")
         # 当日キャッシュ保存
         try:
             with open(cache_path, "w") as f:
