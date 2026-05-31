@@ -959,6 +959,11 @@ def render_sector_rotation_page():
         first_sector_tickers = list(sectors.values())[0][:3] if sectors else []
         matched = [t for t in first_sector_tickers if t in all_tickers]
         st.caption(f"🔍 セクターticker例: {first_sector_tickers} / うちDB一致: {matched}")
+        if matched:
+            sample_ticker = matched[0]
+            t_df = db_df[db_df["ticker"] == sample_ticker]
+            st.caption(f"🔍 {sample_ticker}のデータ: {len(t_df)}行 / 日付範囲: {t_df['date'].min()} 〜 {t_df['date'].max()}")
+            st.caption(f"🔍 period_days={period_days} / end_date={db_df['date'].max()} / start_date={db_df['date'].max() - timedelta(days=period_days)}")
     # --- デバッグここまで ---
 
     if db_df.empty:
