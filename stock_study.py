@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 import yfinance as yf
+import json
 import requests
 from datetime import datetime, timedelta
 import shutil
@@ -170,7 +171,19 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True):
 # --- TOPIXユニバースのダウンロード ---
 
 def get_topix500_tickers() -> list:
-    """JPX公式エクセルからTOPIX500（Core30+Large70+Mid400）＋ETF・ETNの銘柄コードを取得"""
+    """JPX公式エクセルからTOPIX500（Core30+Large70+Mid400）＋ETF・ETNの銘柄コードを取得（当日キャッシュあり）"""
+    # 当日キャッシュ確認
+    cache_path = os.path.join(WORK_DIR, "jpx_ticker_cache.json")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                cache = json.load(f)
+            if cache.get("date") == today_str and cache.get("tickers"):
+                print(f"✅ JPXリスト: 当日キャッシュ使用 ({len(cache['tickers'])}銘柄)")
+                return cache["tickers"]
+        except Exception:
+            pass
     try:
         resp = requests.get(JPX_URL, timeout=10)
         jpx_save_path = os.path.join(DRIVE_DIR, "jpx_stock_list_raw.xls")
@@ -192,6 +205,12 @@ def get_topix500_tickers() -> list:
         all_symbols = pd.concat([topix500, etf_etn]).drop_duplicates()
         codes = [str(s).strip().split('.')[0] for s in all_symbols if str(s).strip()]
         print(f"✅ 収集対象: TOPIX500={len(topix500)}銘柄 + ETF/ETN={len(etf_etn)}銘柄 = 計{len(codes)}銘柄")
+        # 当日キャッシュ保存
+        try:
+            with open(cache_path, "w") as f:
+                json.dump({"date": today_str, "tickers": codes}, f)
+        except Exception:
+            pass
         return codes
     except Exception as e:
         print(f"JPX銘柄リスト取得失敗: {e}")

@@ -241,6 +241,41 @@ def load_unified_db(interval: str, is_jp: bool = True) -> pd.DataFrame:
         st.warning(str(e))
         return pd.DataFrame()
 
+@st.cache_data(ttl=3600)
+def get_db_last_update(interval: str, is_jp: bool = True) -> str:
+    """DBの最終更新日を返す（キャッシュ1時間）"""
+    try:
+        df = stock_study.load_price_db(interval, is_jp=is_jp)
+        if df.empty: return "不明"
+        last = pd.to_datetime(df["date"]).max()
+        return last.strftime("%Y-%m-%d")
+    except Exception:
+        return "不明"
+
+def run_incremental_update(is_jp: bool = True):
+    """差分更新: 当日未更新かつ平日のみ実行。JPXリストは当日キャッシュ使用"""
+    today = datetime.now().date()
+    # 土日はスキップ
+    if today.weekday() >= 5:
+        return False, "週末のためスキップ"
+    last_str = get_db_last_update("1d", is_jp=is_jp)
+    if last_str == "不明":
+        return False, "DBが見つかりません"
+    last_date = pd.to_datetime(last_str).date()
+    if last_date >= today:
+        return False, f"最新（{last_str}）"
+    # 差分あり → 更新実行
+    try:
+        tickers = stock_study.get_topix500_tickers()
+        if not tickers:
+            return False, "JPXリスト取得失敗"
+        stock_study.update_price_database(is_jp=is_jp, target_tickers=tickers)
+        get_db_last_update.clear()  # キャッシュクリア
+        return True, f"{last_str} → {today} に更新"
+    except Exception as e:
+        return False, f"更新エラー: {e}"
+
+
 # =====================================================================
 # 超高速スクリーニング判定ロジック (Parquet直読み)
 # =====================================================================
@@ -724,6 +759,14 @@ def _watchlist_ui():
 def render_sector_rotation_page():
     st.title("🔄 セクターローテーション分析（統合版）")
 
+    # 差分更新（当日未更新かつ平日のみ・APIアクセスなしで即時判定）
+    if "sector_update_checked" not in st.session_state:
+        with st.spinner("📡 データベース差分チェック中..."):
+            updated, msg = run_incremental_update(is_jp=True)
+        if updated:
+            st.success(f"✅ データ更新完了: {msg}")
+        st.session_state["sector_update_checked"] = True
+
     # カスタム銘柄セクターのセッションステート初期化
     if CUSTOM_SECTOR_KEY not in st.session_state:
         # 初回起動時にスプレッドシートから復元
@@ -906,7 +949,7 @@ def get_benchmark_data(ticker, period_days, interval):
     """ベンチマークデータ取得（yfinance）"""
     try:
         end = datetime.now()
-        start = end - timedelta(days=period_days + 30)
+        start = end - timedelta(days=period_days + 365)  # DBの全期間をカバーするよう余裕を持たせる
         df_raw = yf.download(ticker, start=start.strftime("%Y-%m-%d"), interval=interval, auto_adjust=True, progress=False)
         if df_raw.empty: return pd.Series(dtype=float)
         df_raw = df_raw.reset_index()
@@ -926,10 +969,13 @@ def relativize_series(idx_series: pd.Series, bm_series: pd.Series) -> pd.Series:
     """セクター指数をベンチマークで割って相対強度系列に変換する"""
     if bm_series is None or bm_series.empty:
         return idx_series
-    common = idx_series.index.intersection(bm_series.index)
-    if len(common) < 2:
+    # idx_seriesの全日付にbm_seriesを合わせる（祝日等の欠損は前日値で補完）
+    bm_aligned = bm_series.reindex(idx_series.index, method='ffill')
+    # それでもNaNが残る場合（bm_seriesの開始日より前）はbackfillで補完
+    bm_aligned = bm_aligned.bfill()
+    if bm_aligned.isna().all() or (bm_aligned == 0).all():
         return idx_series
-    rel = (idx_series[common] / bm_series[common]) * 100
+    rel = idx_series / bm_aligned
     # 始点を100に正規化
     rel = rel / rel.iloc[0] * 100
     return rel
