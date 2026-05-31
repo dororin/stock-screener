@@ -255,9 +255,6 @@ def get_db_last_update(interval: str, is_jp: bool = True) -> str:
 def run_incremental_update(is_jp: bool = True):
     """差分更新: 当日未更新かつ平日のみ実行。JPXリストは当日キャッシュ使用"""
     today = datetime.now().date()
-    # 土日はスキップ
-    if today.weekday() >= 5:
-        return False, "週末のためスキップ"
     last_str = get_db_last_update("1d", is_jp=is_jp)
     if last_str == "不明":
         return False, "DBが見つかりません"
@@ -765,6 +762,18 @@ def render_sector_rotation_page():
             updated, msg = run_incremental_update(is_jp=True)
         if updated:
             st.success(f"✅ データ更新完了: {msg}")
+        else:
+            st.caption(f"🗄️ DB状態: {msg}")
+        st.session_state["sector_update_checked"] = True
+    if st.button("🔄 今すぐ差分更新", key="btn_force_update"):
+        st.session_state.pop("sector_update_checked", None)
+        get_db_last_update.clear()
+        with st.spinner("📡 差分更新中..."):
+            updated, msg = run_incremental_update(is_jp=True)
+        if updated:
+            st.success(f"✅ 更新完了: {msg}")
+        else:
+            st.warning(f"⚠️ {msg}")
         st.session_state["sector_update_checked"] = True
 
     # カスタム銘柄セクターのセッションステート初期化
