@@ -170,24 +170,33 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True):
 # --- TOPIXユニバースのダウンロード ---
 
 def get_topix500_tickers() -> list:
-    """JPX公式エクセルからTOPIX500（Core30+Large70+Mid400）の銘柄コードを取得"""
+    """JPX公式エクセルからTOPIX500（Core30+Large70+Mid400）＋ETF・ETNの銘柄コードを取得"""
     try:
         resp = requests.get(JPX_URL, timeout=10)
         jpx_save_path = os.path.join(DRIVE_DIR, "jpx_stock_list_raw.xls")
         with open(jpx_save_path, "wb") as f:
             f.write(resp.content)
-        df = pd.read_excel(jpx_save_path)
-        df = df.iloc[:, [1, 2, 3, 9]]
-        df.columns = ['symbol', 'name', 'market', 'scale_type']
+        df_full = pd.read_excel(jpx_save_path)
+
+        # TOPIX500（株式）: 規模区分列(index 9)で絞り込み
+        df_scale = df_full.iloc[:, [1, 2, 3, 9]].copy()
+        df_scale.columns = ['symbol', 'name', 'market', 'scale_type']
         target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
-        df = df[df["scale_type"].isin(target_scales)]
-        codes = [str(s).strip().split('.')[0] for s in df['symbol'].dropna() if str(s).strip()]
+        topix500 = df_scale[df_scale["scale_type"].isin(target_scales)]['symbol'].dropna()
+
+        # ETF・ETN: 市場・商品区分列(index 3)で絞り込み
+        df_market = df_full.iloc[:, [1, 2, 3]].copy()
+        df_market.columns = ['symbol', 'name', 'market']
+        etf_etn = df_market[df_market["market"] == "ETF・ETN"]['symbol'].dropna()
+
+        all_symbols = pd.concat([topix500, etf_etn]).drop_duplicates()
+        codes = [str(s).strip().split('.')[0] for s in all_symbols if str(s).strip()]
+        print(f"✅ 収集対象: TOPIX500={len(topix500)}銘柄 + ETF/ETN={len(etf_etn)}銘柄 = 計{len(codes)}銘柄")
         return codes
     except Exception as e:
         print(f"JPX銘柄リスト取得失敗: {e}")
         return []
 
-# お手持ちのCSVからA列の銘柄コードを読み込む例
 def load_tickers_from_file(file_path: str) -> list:
     """CSVまたはExcel(XLS/XLSX)ファイルから、1行目を検索して『コード』列を特定し、ティッカーリストを読み込む"""
     possible_paths = [
