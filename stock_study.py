@@ -574,7 +574,15 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
 
         last_updates_map = {}
         if not db_df.empty:
-            last_updates_map = db_df.groupby("ticker")["date"].max().to_dict()
+            # is_finalized == True (確定済み) のデータから最新日を取得
+            if "is_finalized" in db_df.columns:
+                finalized_df = db_df[db_df["is_finalized"] == True]
+                if not finalized_df.empty:
+                    last_updates_map = finalized_df.groupby("ticker")["date"].max().to_dict()
+            
+            # 確定データが1つもない、またはカラムがない場合は通常通り全体の max 日付を fallback として取得
+            if not last_updates_map:
+                last_updates_map = db_df.groupby("ticker")["date"].max().to_dict()
 
         global_max_date = max(last_updates_map.values()) if last_updates_map else None
         group_up_to_date, group_catchup = [], []
