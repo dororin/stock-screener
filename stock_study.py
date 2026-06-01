@@ -171,7 +171,7 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True):
 # --- TOPIXユニバースのダウンロード ---
 
 def get_topix500_tickers() -> list:
-    """JPX公式エクセルからTOPIX500（Core30+Large70+Mid400）＋ETF・ETNの銘柄コードを取得（当日キャッシュあり）"""
+    """JPX公式エクセルからTOPIX500（Core30+Large70+Mid400）の銘柄コードのみを取得（当日キャッシュあり、ETF/ETNは除外）"""
     cache_path = os.path.join(WORK_DIR, "jpx_ticker_cache.json")
     today_str = datetime.now().strftime("%Y-%m-%d")
     if os.path.exists(cache_path):
@@ -190,18 +190,15 @@ def get_topix500_tickers() -> list:
             f.write(resp.content)
         df_full = pd.read_excel(jpx_save_path)
 
+        # TOPIX500（株式）のみ: 規模区分列(index 9)で絞り込み（ETF・ETNの結合を廃止）
         df_scale = df_full.iloc[:, [1, 2, 3, 9]].copy()
         df_scale.columns = ['symbol', 'name', 'market', 'scale_type']
         target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
         topix500 = df_scale[df_scale["scale_type"].isin(target_scales)]['symbol'].dropna()
 
-        df_market = df_full.iloc[:, [1, 2, 3]].copy()
-        df_market.columns = ['symbol', 'name', 'market']
-        etf_etn = df_market[df_market["market"] == "ETF・ETN"]['symbol'].dropna()
-
-        all_symbols = pd.concat([topix500, etf_etn]).drop_duplicates()
+        all_symbols = topix500.drop_duplicates()
         codes = [str(s).strip().split('.')[0] for s in all_symbols if str(s).strip()]
-        print(f"✅ 収集対象: TOPIX500={len(topix500)}銘柄 + ETF/ETN={len(etf_etn)}銘柄 = 計{len(codes)}銘柄")
+        print(f"✅ 収集対象: TOPIX500={len(codes)}銘柄")
         try:
             with open(cache_path, "w") as f:
                 json.dump({"date": today_str, "tickers": codes}, f)
@@ -297,7 +294,7 @@ def load_tickers_from_file(file_path: str) -> list:
         seen = set()
         unique_cleaned = [x for x in cleaned if not (x in seen or seen.add(x))]
         
-        print(f"✅ ファイル '{actual_path}' から {len(unique_cleaned)} 個の固有銘柄を読み込みました。")
+        print(f"✅ ファイル '{actual_path}' から {len(unique_cleaned)} 個 of 固有銘柄を読み込みました。")
         return unique_cleaned
         
     except Exception as e:
@@ -307,14 +304,12 @@ def load_tickers_from_file(file_path: str) -> list:
 # --- ティッカーシンボルのサニタイズ処理 ---
 
 def sanitize_ticker(ticker: str, is_jp: bool = True) -> str:
-    """ティッカーを大文字にし、空白を除去してサフィックス（.T等）を取り除いた純粋な形にする"""
     t = str(ticker).strip().upper()
     if is_jp and t.endswith(".T"):
         t = t[:-2]
     return t
 
 def get_download_symbol(ticker: str, is_jp: bool = True) -> str:
-    """yfinanceダウンロード用に適切なサフィックスを付与したティッカー名を取得する"""
     pure_ticker = sanitize_ticker(ticker, is_jp)
     if is_jp and not pure_ticker.endswith(".T") and pure_ticker.isdigit():
         return f"{pure_ticker}.T"
@@ -323,11 +318,6 @@ def get_download_symbol(ticker: str, is_jp: bool = True) -> str:
 # --- データベース統合更新エンジン・個別修復・再構築 ---
 
 def rebuild_single_ticker_db(ticker: str, is_jp: bool = True, interval: str = "1d") -> bool:
-    """
-    指定 ticker の過去データを yfinance から auto_adjust=True かつ period='max' でフル再取得し、
-    Parquet データベースの指定銘柄を完全に上書き再構築する（長期足・日足(1d)専用）。
-    短期足に対してはデータ永久消失を防ぐためガード（処理中断）をかける。
-    """
     if interval != "1d":
         msg = f"❌ 【ガード発動】短期足（{interval}）に対するフル再構築は、データ永久消失リスクを回避するため実行できません。"
         print(msg)
@@ -344,7 +334,6 @@ def rebuild_single_ticker_db(ticker: str, is_jp: bool = True, interval: str = "1
     except FileNotFoundError:
         db_df = pd.DataFrame()
         
-    # 既存の同一銘柄データを削除
     if not db_df.empty:
         db_df = db_df[db_df["ticker"] != pure_ticker]
         
@@ -370,16 +359,10 @@ def rebuild_single_ticker_db(ticker: str, is_jp: bool = True, interval: str = "1
         return False
 
 def repair_single_ticker_short_term_db(ticker: str, interval: str, is_jp: bool = True) -> bool:
-    """
-    【短期足修復】日時スタンプ完全一致方式による重複排除マージを適用した、短期足用の安全な治療・修復アルゴリズム。
-    取得制限期間の最大範囲を指定して新規に取得し、期間内に株式分割(Splits)を検知した場合は
-    既存の全蓄積データに対して数学的一括自己調整（価格に R を乗算、出来高に R を除算）を行います。
-    """
     pure_ticker = sanitize_ticker(ticker, is_jp)
     symbol = get_download_symbol(pure_ticker, is_jp)
     now = datetime.now()
     
-    # 1. 既存データのロード
     try:
         db_df = load_price_db(interval, is_jp=is_jp)
     except FileNotFoundError:
@@ -387,7 +370,6 @@ def repair_single_ticker_short_term_db(ticker: str, interval: str, is_jp: bool =
         
     old_df = db_df[db_df["ticker"] == pure_ticker].copy() if not db_df.empty else pd.DataFrame()
     
-    # 2. 新規取得制限期間の定義
     if interval == "1m":
         start_date_dt = now - timedelta(days=6)
     elif interval == "5m":
@@ -401,7 +383,6 @@ def repair_single_ticker_short_term_db(ticker: str, interval: str, is_jp: bool =
         
     try:
         print(f"📥 [{pure_ticker}] {interval} 修復用の新規データを取得中 ({start_date_dt.strftime('%Y-%m-%d')} ~)...")
-        # actions=True, auto_adjust=Falseで生Closeを取得
         df_raw = yf.download(
             symbol,
             start=start_date_dt.strftime("%Y-%m-%d"),
@@ -419,7 +400,6 @@ def repair_single_ticker_short_term_db(ticker: str, interval: str, is_jp: bool =
             print(f"⚠️ パース処理の結果、有効なデータが確認できませんでした。")
             return False
             
-        # 3. 株式分割の自動チェックと遡及適用（自己修復）
         has_split = False
         split_ratio = 1.0
         if "stock splits" in new_df.columns:
@@ -439,7 +419,6 @@ def repair_single_ticker_short_term_db(ticker: str, interval: str, is_jp: bool =
             if "volume" in old_df.columns:
                 old_df["volume"] = old_df["volume"] / split_ratio
                 
-        # 4. 日時スタンプ完全一致方式による重複排除
         if not old_df.empty:
             new_dates = new_df["date"]
             old_df_filtered = old_df[~old_df["date"].isin(new_dates)]
@@ -447,7 +426,6 @@ def repair_single_ticker_short_term_db(ticker: str, interval: str, is_jp: bool =
         else:
             combined_ticker = new_df
             
-        # 5. 全体Parquetへの結合と上書き保存
         if not db_df.empty:
             other_tickers_df = db_df[db_df["ticker"] != pure_ticker]
             final_df = pd.concat([other_tickers_df, combined_ticker], ignore_index=True)
@@ -468,11 +446,6 @@ def repair_single_ticker_short_term_db(ticker: str, interval: str, is_jp: bool =
         return False
 
 def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, is_jp: bool = True) -> pd.DataFrame:
-    """
-    新旧株価データを日時スタンプ完全一致方式で安全にマージする関数。
-    価格比率のみによる単純な境界チェックによる分割検知を廃止し、'stock splits' 列をスキャンして判定します。
-    分割が検知された場合、古いデータに対して一括して数学的自己調整（R=1/Splits値を乗算、出来高に除算）を実行します。
-    """
     if new_df is None or new_df.empty: return old_df
     if old_df.empty: return new_df
 
@@ -488,7 +461,6 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
             processed_parts.append(t_new)
             continue
             
-        # 'stock splits' カラムを用いた確実な分割の判定
         has_split = False
         split_ratio = 1.0
         if "stock splits" in t_new.columns:
@@ -508,7 +480,6 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
             if "volume" in t_old.columns:
                 t_old["volume"] = t_old["volume"] / split_ratio
                 
-        # 日時スタンプ完全一致方式による重複排除
         new_dates = t_new["date"]
         t_old_filtered = t_old[~t_old["date"].isin(new_dates)]
         
@@ -520,10 +491,6 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
     return combined.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 def parse_yfinance_batch(df_raw, chunk_tickers, is_jp: bool = True):
-    """
-    yfinanceの一括取得（actions=True）データフレームをパースし、整形された単一のデータフレームを返します。
-    マルチインデックスカラムおよび大文字小文字（Stock Splits, Dividends等）の表記ブレを考慮したパース処理を行います。
-    """
     if df_raw.empty: return pd.DataFrame()
     all_rows = []
     
@@ -531,7 +498,6 @@ def parse_yfinance_batch(df_raw, chunk_tickers, is_jp: bool = True):
     suffix = ".T" if is_jp else ""
     
     if not is_multi:
-        # シングルインデックス（yf.downloadに単一のティッカーが指定されたケース）
         if len(chunk_tickers) == 1:
             t_df = df_raw.copy()
             t_df = t_df.dropna(how="all").reset_index()
@@ -548,7 +514,6 @@ def parse_yfinance_batch(df_raw, chunk_tickers, is_jp: bool = True):
         else:
             return pd.DataFrame()
             
-    # マルチインデックスケースの処理
     for ticker in chunk_tickers:
         symbol = f"{ticker}{suffix}"
         try:
@@ -582,11 +547,6 @@ def parse_yfinance_batch(df_raw, chunk_tickers, is_jp: bool = True):
     return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
 
 def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False):
-    """
-    全銘柄の差分同期エンジン（自動権利落ち防衛トリガー付き）。
-    日足(1d)同期時に分割、配当などの権利落ちを検知した場合は、即座に対象銘柄に限り過去全期間フルダウンロードし直して上書き更新します。
-    短期足(1m, 5m, 60m)の同期時は、配当を無視し株式分割検知時のみ一括数学的調整を適用します。
-    """
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
     
@@ -600,7 +560,6 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
     now = datetime.now()
     suffix = ".T" if is_jp else ""
     
-    # ティッカーのサニタイズ適用
     tickers = [sanitize_ticker(t, is_jp) for t in tickers]
 
     for interval in TIMEFRAMES:
@@ -707,10 +666,8 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                         if rebuild_success:
                             reset_tickers.append(ticker)
                             
-                # フル再構築（自動リセット）された銘柄はマージから除外
                 if reset_tickers:
                     new_combined = new_combined[~new_combined["ticker"].isin(reset_tickers)]
-                    # フル再構築によりParquetが更新されているため、最新データをロードし直します
                     db_df = load_price_db(interval, is_jp=is_jp)
             
             if not new_combined.empty:
