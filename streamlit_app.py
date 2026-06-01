@@ -1322,8 +1322,64 @@ if selected_page == "データ管理・保守":
                     st.success(f"✅ [{pure_t}] の {rep_interval} データベースの修復に成功しました！")
                 else:
                     st.error(f"❌ [{pure_t}] の修復処理を実行できませんでした。")
-                    
-    st.stop()
+    st.divider()
+        
+    # 【セクション4】 全件一括フルダウンロード・再構築（初期化・白紙復旧用）
+    st.subheader("4️⃣ 全件一括フルダウンロード・再構築（初期化・デバッグ用）")
+    st.write(
+        "既存のデータベースデータを一度完全に消去、または白紙状態から復旧させるための **「一発クリーン構築ボタン」** です。"
+        "通常の差分ダウンロードと異なり、株式分割などの再帰的な検知処理を通さず、全銘柄をまとめて並列バッチで新規ダウンロードします。"
+        "※日足は2020年からの全期間、短期足はyfinanceの提供限界（1m:6日、5m:58日、60m:718日）を対象に取得します。"
+    )
+    
+    fb_col1, fb_col2 = st.columns([2, 1])
+    with fb_col1:
+        rebuild_interval = st.selectbox(
+            "一括再構築する時間足（タイムフレーム）を選択してください", 
+            ["1m", "5m", "60m", "1d"], 
+            index=3, 
+            key="rebuild_interval_select"
+        )
+    with fb_col2:
+        st.write(" ")
+        st.write(" ")
+        btn_full_rebuild = st.button(
+            "💥 一括フルダウンロードを実行", 
+            use_container_width=True, 
+            type="primary"
+        )
+        
+    if btn_full_rebuild:
+        status_box = st.status(f"📡 {market_mode} {rebuild_interval} データベースを一括クリーンビルド中...", expanded=True)
+        with status_box:
+            st.write("既存のParquetファイルをクリアしています...")
+            filename = stock_study.get_db_filename(rebuild_interval, is_jp=is_jp)
+            work_file = os.path.join(stock_study.WORK_DIR, filename)
+            
+            if os.path.exists(work_file):
+                try:
+                    os.remove(work_file)
+                    st.write("🗑️ 既存の破損/ローカルファイルを正常に削除しました。")
+                except Exception as e:
+                    st.write(f"⚠️ 既存ファイルのクリアに失敗（新規書き出し時に自動上書きされます）: {e}")
+            
+            st.write("yfinance からバッチダウンロードを開始します（レート制限防止のために少し時間がかかります）...")
+            try:
+                success = stock_study.full_rebuild_all_database(is_jp=is_jp, interval=rebuild_interval)
+                if success:
+                    # キャッシュクリアして次回ロードに最新を反映
+                    get_db_last_update.clear()
+                    load_unified_db.clear()
+                    status_box.update(label="✅ 一括フルダウンロード完了！", state="complete")
+                    st.success(f"{rebuild_interval} データベースのクリーン再構築が完了しました！セクターローテーション等をお試しください。")
+                else:
+                    status_box.update(label="❌ ダウンロード失敗", state="error")
+                    st.error("データを1件も取得できませんでした。ネットワークやAPI制限を確認してください。")
+            except Exception as e:
+                status_box.update(label="❌ エラー発生", state="error")
+                st.error(f"再構築中に予期せぬエラーが発生しました: {e}")
+                
+    st.stop()                    
 
 
 # =====================================================================

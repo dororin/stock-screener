@@ -160,7 +160,9 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True):
     work_file = os.path.join(WORK_DIR, filename)
     drive_file = os.path.join(DRIVE_DIR, filename)
     
-    df.to_parquet(work_file, index=False)
+    # 【重要修正】辞書エンコーディングをオフにして、複数辞書ページの重複書き込みバグを強制回避
+    df.to_parquet(work_file, index=False, use_dictionary=False)
+    
     api_success = upload_to_drive_api(filename, work_file)
     if not api_success:
         try:
@@ -705,3 +707,71 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d") -> bool:
+    """
+    指定した市場と時間足のデータを完全にゼロから新規取得し、Parquetデータベースとして新規保存します。
+    """
+    market_name = "JP" if is_jp else "US"
+    tickers = get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
+    
+    if not tickers:
+        print("❌ 収集対象の銘柄コードが見つかりません。")
+        return False
+        
+    tickers = [sanitize_ticker(t, is_jp) for t in tickers]
+    suffix = ".T" if is_jp else ""
+    now = datetime.now()
+    
+    # 時間足に応じた取得開始日の算出（yfinanceの取得限界制限を考慮）
+    if interval == "1m":
+        start_date_dt = now - timedelta(days=6)
+    elif interval == "5m":
+        start_date_dt = now - timedelta(days=58)
+    elif interval == "60m":
+        start_date_dt = now - timedelta(days=718)
+    else:  # "1d" (日足)
+        # スクリーニングに必要な移動平均期間（200日以上）を十分に満たし、
+        # ダウンロード負荷を現実的に抑えるため「2020年以降(約6年間)」をデフォルトに設定
+        start_date_dt = datetime(2020, 1, 1)
+        
+    print(f"🚨 [全体一括再構築] {market_name} ({interval}) をゼロから新規作成します。 (開始日: {start_date_dt.strftime('%Y-%m-%d')})")
+    
+    all_downloaded = []
+    # 安全にダウンロードするため、30銘柄ずつの小バッチに分けてループ実行
+    BATCH_SIZE = 30
+    for i in range(0, len(tickers), BATCH_SIZE):
+        chunk = tickers[i:i+BATCH_SIZE]
+        symbols = [f"{t}{suffix}" for t in chunk]
+        try:
+            df_raw = yf.download(
+                symbols,
+                start=start_date_dt.strftime("%Y-%m-%d"),
+                interval=interval,
+                auto_adjust=(interval == "1d"), # 日足は自動調整、短期足は未調整で配当なども残す
+                actions=True,
+                progress=False,
+                threads=True,
+                timeout=30
+            )
+            chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
+            if not chunk_processed.empty:
+                all_downloaded.append(chunk_processed)
+        except Exception as e:
+            print(f"⚠️ バッチ取得エラー ({i}-{i+BATCH_SIZE}): {e}")
+        time.sleep(1.5) # レートリミット回避のディレイ
+        
+    if all_downloaded:
+        final_df = pd.concat(all_downloaded, ignore_index=True)
+        if "date" in final_df.columns:
+            if interval == "1d":
+                final_df["is_finalized"] = final_df["date"].dt.date < now.date()
+            else:
+                final_df["is_finalized"] = final_df["date"] < (now - timedelta(hours=1))
+        
+        final_df = final_df.sort_values(["ticker", "date"]).reset_index(drop=True)
+        # use_dictionary=False を適用して保存する
+        save_price_db(final_df, interval, is_jp=is_jp)
+        return True
+    else:
+        return False
