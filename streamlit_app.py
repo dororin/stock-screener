@@ -24,7 +24,6 @@ import re
 # =====================================================================
 # 📂 データベースを安全に一元管理する自作ライブラリをインポート
 # =====================================================================
-# パスずれによるインポートエラーを強制防止
 current_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
 if current_dir not in sys.path:
     sys.path.append(current_dir)
@@ -35,7 +34,6 @@ import stock_study
 # セクターローテーション用 定数・設定
 # =====================================================================
 
-# --- デフォルトセクター定義 ---
 JP_SECTORS = {
     "半導体・装置": ["8035", "6857", "6146", "6920", "6963", "4063", "6981"],
     "電気機器": ["6758", "6861", "6954", "6902", "7751", "6971"],
@@ -152,7 +150,6 @@ def get_sector_spreadsheet():
     if gc is None: return None
     try:
         cfg = st.secrets["connections"]["gsheets"]
-        # sector_spreadsheetがあればそれを使い、無ければ従来のspreadsheetを使います
         url = cfg.get("sector_spreadsheet", cfg.get("spreadsheet"))
         return gc.open_by_url(url)
     except Exception:
@@ -197,7 +194,6 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
 WATCHLIST_SHEET_NAME = "watchlist"
 
 def load_watchlist_from_sheets() -> dict:
-    """watchlistシートから {code: name} を読み込む。シートがなければ空dictを返す"""
     sh = get_sector_spreadsheet()
     if sh is None:
         return {}
@@ -215,7 +211,6 @@ def load_watchlist_from_sheets() -> dict:
         return {}
 
 def save_watchlist_to_sheets(watchlist: dict):
-    """watchlistシートに {code: name} を全上書き保存。シートがなければ作成する"""
     sh = get_sector_spreadsheet()
     if sh is None:
         return
@@ -244,7 +239,6 @@ def load_unified_db(interval: str, is_jp: bool = True) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def get_db_last_update(interval: str, is_jp: bool = True) -> str:
-    """DBの最終更新日を返す（キャッシュ1時間）"""
     try:
         df = stock_study.load_price_db(interval, is_jp=is_jp)
         if df.empty: return "不明"
@@ -254,17 +248,9 @@ def get_db_last_update(interval: str, is_jp: bool = True) -> str:
         return "不明"
 
 def analyze_db_update_needs(is_jp: bool = True):
-    """DBを分析して更新が必要な銘柄を3種類に分類して返す
-    Returns:
-        dict with keys:
-          - global_max_date: DBの最新日付
-          - needs_period_update: 期間差分が必要（最新日から3日超）
-          - refetch_tickers: is_finalized=Falseで再取得が必要な銘柄
-          - missing_tickers: DBに存在しない新規銘柄
-    """
     try:
         db_df = stock_study.load_price_db("1d", is_jp=is_jp)
-        all_tickers = stock_study.get_all_collection_tickers()
+        all_tickers = stock_study.get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
         today = datetime.now().date()
 
         if db_df.empty:
@@ -279,13 +265,11 @@ def analyze_db_update_needs(is_jp: bool = True):
         global_max_date = db_df["date"].max().date()
         needs_period_update = (today - global_max_date).days > 3
 
-        # is_finalized=False の銘柄（当日取得の未完成データ）
         if "is_finalized" in db_df.columns:
             unfinalized = db_df[db_df["is_finalized"] == False]["ticker"].unique().tolist()
         else:
             unfinalized = []
 
-        # DBに存在しない銘柄
         db_tickers = set(db_df["ticker"].unique())
         missing = [t for t in all_tickers if t not in db_tickers]
 
@@ -305,13 +289,9 @@ def analyze_db_update_needs(is_jp: bool = True):
         }
 
 def run_incremental_update(is_jp: bool = True):
-    """3段階差分更新:
-    ① 期間差分（3日超）→ 全銘柄のGroup A/B更新
-    ② is_finalized=False → その銘柄の当日分を再取得
-    ③ DB未存在銘柄 → フルダウンロード
-    """
     try:
-        sync_extra_tickers_to_local()
+        if is_jp:
+            sync_extra_tickers_to_local()
     except Exception:
         pass
 
@@ -325,7 +305,7 @@ def run_incremental_update(is_jp: bool = True):
     # ① 期間差分更新
     if needs["needs_period_update"]:
         try:
-            all_tickers = stock_study.get_all_collection_tickers()
+            all_tickers = stock_study.get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
             stock_study.update_price_database(is_jp=is_jp, target_tickers=all_tickers)
             messages.append(f"期間更新完了({needs['global_max_date']}→今日)")
             updated = True
@@ -756,7 +736,6 @@ EXTRA_TICKERS_CACHE_KEY = "extra_tickers_loaded"
 
 @st.cache_data(ttl=3600)
 def load_extra_tickers_from_sheets() -> pd.DataFrame:
-    """extra_tickersシートから追加収集ティッカーを読み込む。シートがなければ空DataFrameを返す"""
     sh = get_sector_spreadsheet()
     if sh is None:
         return pd.DataFrame(columns=["code", "name", "memo"])
@@ -773,7 +752,6 @@ def load_extra_tickers_from_sheets() -> pd.DataFrame:
         return pd.DataFrame(columns=["code", "name", "memo"])
 
 def save_extra_tickers_to_sheets(df: pd.DataFrame):
-    """extra_tickersシートに保存。シートがなければ作成する"""
     sh = get_sector_spreadsheet()
     if sh is None:
         return
@@ -790,7 +768,6 @@ def save_extra_tickers_to_sheets(df: pd.DataFrame):
         pass
 
 def sync_extra_tickers_to_local():
-    """スプレッドシートのextra_tickersをローカルJSONに同期（stock_study.pyが参照）"""
     try:
         df = load_extra_tickers_from_sheets()
         codes = df["code"].tolist() if not df.empty else []
@@ -805,27 +782,24 @@ def sync_extra_tickers_to_local():
 # 🔄 セクターローテーション: ページ描画
 # =====================================================================
 def get_jpx_full_list():
-    """TOPIX500 + ETF/ETN全銘柄を返す（検索用）"""
     try:
         url = 'https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls'
         df_full = pd.read_excel(url)
-        # TOPIX500
         df_scale = df_full.iloc[:, [1, 2, 9]].copy()
         df_scale.columns = ['symbol', 'name', 'scale_type']
         target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
         topix = df_scale[df_scale['scale_type'].isin(target_scales)][['symbol', 'name']]
-        # ETF・ETN
+        
         df_market = df_full.iloc[:, [1, 2, 3]].copy()
         df_market.columns = ['symbol', 'name', 'market']
         etf = df_market[df_market['market'] == 'ETF・ETN'][['symbol', 'name']]
-        # 結合
+        
         combined = pd.concat([topix, etf]).drop_duplicates(subset=['symbol'])
         combined['symbol'] = pd.to_numeric(combined['symbol'], errors='coerce')
         combined = combined.dropna(subset=['symbol'])
         combined['symbol'] = combined['symbol'].astype(int).astype(str)
         return combined.reset_index(drop=True)
     except Exception:
-        # フォールバック：既存のget_jpx_list()
         df = get_jpx_list()
         if df.empty:
             return pd.DataFrame(columns=['symbol', 'name'])
@@ -838,14 +812,12 @@ CUSTOM_SECTOR_KEY = "custom_sector_tickers"
 
 @st.fragment
 def _extra_tickers_ui():
-    """追加収集ティッカー管理UI（フラグメント）"""
     st.divider()
     st.subheader("⚙️ 収集対象ETF設定")
-    st.caption("ColabのDBに収集する追加ティッカーを管理します")
+    st.caption("データベースに収集する追加ティッカーを管理します")
 
     df = load_extra_tickers_from_sheets()
 
-    # 検索・追加UI
     q = st.text_input(
         "銘柄コード・名前で検索",
         placeholder="例: 1306 / TOPIX / 半導体",
@@ -877,7 +849,6 @@ def _extra_tickers_ui():
         elif len(q) == 1:
             st.caption("もう1文字以上入力すると候補が表示されます")
 
-    # 登録済み一覧
     if not df.empty:
         st.caption(f"登録済み: {len(df)}件")
         to_delete = []
@@ -896,7 +867,6 @@ def _extra_tickers_ui():
 
 @st.fragment
 def _watchlist_ui():
-    """ウォッチリスト操作UI（フラグメント: 操作してもチャートを再実行しない）"""
     st.divider()
     st.subheader("📌 ウォッチリスト")
 
@@ -923,12 +893,10 @@ def _watchlist_ui():
             )
             found = jpx_df[mask].head(8)
             if not found.empty:
-                # ダミー先頭付きプルダウン → 選択した瞬間に追加
                 PLACEHOLDER = "── 選択してください ──"
                 options = [PLACEHOLDER] + [
                     f"{row['symbol']}　{row['name']}" for _, row in found.iterrows()
                 ]
-                # code/name マップ
                 code_map = {
                     f"{row['symbol']}　{row['name']}": (str(row['symbol']), str(row['name']))
                     for _, row in found.iterrows()
@@ -957,7 +925,6 @@ def _watchlist_ui():
     elif len(q) == 1:
         st.caption("もう1文字以上入力すると候補が表示されます")
 
-    # 登録済み一覧
     custom_tickers = st.session_state[CUSTOM_SECTOR_KEY]
     if custom_tickers:
         st.caption(f"登録済み: {len(custom_tickers)}銘柄")
@@ -980,31 +947,9 @@ def _watchlist_ui():
 def render_sector_rotation_page():
     st.title("🔄 セクターローテーション分析（統合版）")
 
-    # 差分更新（当日未更新かつ平日のみ・APIアクセスなしで即時判定）
-    if "sector_update_checked" not in st.session_state:
-        with st.spinner("📡 データベース差分チェック中..."):
-            updated, msg = run_incremental_update(is_jp=True)
-        if updated:
-            st.success(f"✅ データ更新完了: {msg}")
-        else:
-            st.caption(f"🗄️ DB状態: {msg}")
-        st.session_state["sector_update_checked"] = True
-    if st.button("🔄 今すぐ差分更新", key="btn_force_update"):
-        st.session_state.pop("sector_update_checked", None)
-        get_db_last_update.clear()
-        with st.spinner("📡 差分更新中..."):
-            updated, msg = run_incremental_update(is_jp=True)
-        if updated:
-            st.success(f"✅ 更新完了: {msg}")
-        else:
-            st.warning(f"⚠️ {msg}")
-        st.session_state["sector_update_checked"] = True
-
-    # カスタム銘柄セクターのセッションステート初期化
     if CUSTOM_SECTOR_KEY not in st.session_state:
-        # 初回起動時にスプレッドシートから復元
         loaded = load_watchlist_from_sheets()
-        st.session_state[CUSTOM_SECTOR_KEY] = loaded  # {code: name}
+        st.session_state[CUSTOM_SECTOR_KEY] = loaded
     with st.sidebar:
         st.subheader("⚙️ 表示設定")
         market_mode = st.radio("マーケット", ["日本株 🇯🇵", "米国株 🇺🇸"], horizontal=True)
@@ -1026,41 +971,20 @@ def render_sector_rotation_page():
         st.divider()
         n_cols = st.slider("グリッド列数", 2, 4, 3)
 
-        # ─────────────────────────────────────────
-        # 📌 ウォッチリスト（フラグメントで独立）
-        # ─────────────────────────────────────────
         _watchlist_ui()
         _extra_tickers_ui()
 
     with st.spinner("セクター構成をスプレッドシートから読み込み中..."):
         sectors = load_sector_master_from_sheets(is_jp)
 
-    # データベースロード
     db_df = load_unified_db(interval, is_jp=is_jp)
 
-    # --- デバッグ（確認後削除）---
-    if not db_df.empty:
-        all_tickers = db_df["ticker"].unique()
-        sample = sorted(all_tickers)
-        st.caption(f"🔍 DB総銘柄数: {len(all_tickers)} / 先頭5: {sample[:5]} / 末尾5: {sample[-5:]}")
-        first_sector_tickers = list(sectors.values())[0][:3] if sectors else []
-        matched = [t for t in first_sector_tickers if t in all_tickers]
-        st.caption(f"🔍 セクターticker例: {first_sector_tickers} / うちDB一致: {matched}")
-        if matched:
-            sample_ticker = matched[0]
-            t_df = db_df[db_df["ticker"] == sample_ticker]
-            st.caption(f"🔍 {sample_ticker}のデータ: {len(t_df)}行 / 日付範囲: {t_df['date'].min()} 〜 {t_df['date'].max()}")
-            st.caption(f"🔍 period_days={period_days} / end_date={db_df['date'].max()} / start_date={db_df['date'].max() - timedelta(days=period_days)}")
-    # --- デバッグここまで ---
-
     if db_df.empty:
-        st.info("💡 データベースがまだ作成されていません。Google Colabなどで `stock_study.py` を実行してデータベースを作成してください。")
+        st.info("💡 データベースがまだ作成されていません。「データ管理・保守」画面で差分ダウンロードを実行してください。")
         return
 
     bm_series = get_benchmark_data(bm_ticker, period_days, interval) if bm_ticker else None
 
-
-    # サマリー
     sector_index_cache = {}
     momentum_scores = {}
     for sname, tickers in sectors.items():
@@ -1080,7 +1004,6 @@ def render_sector_rotation_page():
             with rank_cols[i+3]: st.metric(f"🔴 #{len(sorted_sectors)-2+i}", sname, f"{mom:+.2f}%")
         st.divider()
 
-    # グリッド
     st.markdown(f"### 📈 セクターミニチャート（{period_label} / {tf_label}）")
     sector_list = list(sectors.items())
     rows_needed = (len(sector_list) + n_cols - 1) // n_cols
@@ -1110,9 +1033,6 @@ def render_sector_rotation_page():
                     if st.button("詳細表示", key=f"detail_{sname}", use_container_width=True):
                         st.session_state.selected_sector = sname
 
-    # ─────────────────────────────────────────
-    # 📌 ウォッチリスト（カスタム銘柄）ミニチャート
-    # ─────────────────────────────────────────
     custom_tickers = st.session_state.get(CUSTOM_SECTOR_KEY, {})
     if custom_tickers:
         st.divider()
@@ -1129,7 +1049,6 @@ def render_sector_rotation_page():
                 code = custom_codes[idx]
                 name = custom_tickers[code]
 
-                # 個別銘柄のインデックス系列を計算
                 single_series = compute_sector_index_from_df(db_df, [code], period_days, resample_weekly)
                 single_series = relativize_series(single_series, bm_series)
                 mom_single = get_sector_momentum(single_series, days=min(5, period_days)) if not single_series.empty else 0.0
@@ -1152,9 +1071,8 @@ def render_sector_rotation_page():
                                 key=f"watch_mini_{code}"
                             )
                         else:
-                            st.caption("データなし（DBにティッカーが存在しない可能性があります）")
+                            st.caption("データなし")
 
-    # 詳細画面表示
     if st.session_state.selected_sector and st.session_state.selected_sector in sectors:
         st.divider()
         sel_name = st.session_state.selected_sector
@@ -1194,10 +1112,9 @@ def get_sector_momentum(index_series, days=5):
 
 @st.cache_data(ttl=600)
 def get_benchmark_data(ticker, period_days, interval):
-    """ベンチマークデータ取得（yfinance）"""
     try:
         end = datetime.now()
-        start = end - timedelta(days=period_days + 365)  # DBの全期間をカバーするよう余裕を持たせる
+        start = end - timedelta(days=period_days + 365)
         df_raw = yf.download(ticker, start=start.strftime("%Y-%m-%d"), interval=interval, auto_adjust=True, progress=False)
         if df_raw.empty: return pd.Series(dtype=float)
         df_raw = df_raw.reset_index()
@@ -1214,17 +1131,13 @@ def get_benchmark_data(ticker, period_days, interval):
         return pd.Series(dtype=float)
 
 def relativize_series(idx_series: pd.Series, bm_series: pd.Series) -> pd.Series:
-    """セクター指数をベンチマークで割って相対強度系列に変換する"""
     if bm_series is None or bm_series.empty:
         return idx_series
-    # idx_seriesの全日付にbm_seriesを合わせる（祝日等の欠損は前日値で補完）
     bm_aligned = bm_series.reindex(idx_series.index, method='ffill')
-    # それでもNaNが残る場合（bm_seriesの開始日より前）はbackfillで補完
     bm_aligned = bm_aligned.bfill()
     if bm_aligned.isna().all() or (bm_aligned == 0).all():
         return idx_series
     rel = idx_series / bm_aligned
-    # 始点を100に正規化
     rel = rel / rel.iloc[0] * 100
     return rel
 
@@ -1273,29 +1186,171 @@ if 'naaim_df' not in st.session_state: st.session_state.naaim_df = pd.DataFrame(
 if 'performed_scan' not in st.session_state: st.session_state.performed_scan = False
 
 with st.sidebar:
-    selected_page = st.radio("画面選択", ["スクリーニング", "マーケット情報", "セクターローテーション"])
+    selected_page = st.radio("画面選択", ["スクリーニング", "マーケット情報", "セクターローテーション", "データ管理・保守"])
     st.divider()
 
+# =====================================================================
+# 🗄️ データ管理・保守画面のレイアウトとロジック (新規追加)
+# =====================================================================
+if selected_page == "データ管理・保守":
+    st.title("🗄️ データベース管理・保守センター")
+    st.caption("自動防衛ロジックを搭載した、安全な一元データ管理システムです。")
+    
+    m_col1, m_col2 = st.columns([1, 1])
+    with m_col1:
+        market_mode = st.radio("対象市場の選択", ["日本株 🇯🇵", "米国株 🇺🇸"], horizontal=True)
+        is_jp = (market_mode == "日本株 🇯🇵")
+    with m_col2:
+        try:
+            last_date = get_db_last_update("1d", is_jp=is_jp)
+        except Exception:
+            last_date = "未確認"
+        st.metric(label="現在の 日足(1d) 最終更新日", value=last_date)
+        
+    st.divider()
+    
+    # 【セクション1】 全体差分ダウンロード（自動権利落ち防衛）
+    st.subheader("1️⃣ 全体差分ダウンロード（自動権利落ち防衛）")
+    st.write(
+        "普段のデイリー更新を行うセクションです。最新日までの株価データを各時間足(1m, 5m, 60m, 1d)ごとに差分収集します。"
+        "データ取得時に配当金や株式分割などの権利落ち情報を検知すると、**日足なら自動で過去全期間を再構築し、短期足なら既存データを失わずに数学的調整**を自動実行してデータの整合性を防衛します。"
+    )
+    
+    if st.button("🔄 全体差分ダウンロードを実行", key="btn_all_diff_update", type="primary"):
+        status_box = st.status("📡 データベース全体差分同期中...", expanded=True)
+        with status_box:
+            st.write("追加収集ティッカーのローカル同期を実行中...")
+            try:
+                sync_extra_tickers_to_local()
+                st.write("✅ ティッカーリストの同期に成功しました。")
+            except Exception as e:
+                st.write(f"⚠️ ティッカー同期スキップ（キャッシュを使用します）: {e}")
+                
+            st.write("差分情報のスキャンと必要更新箇所の算出中...")
+            needs = analyze_db_update_needs(is_jp=is_jp)
+            
+            if needs.get("needs_period_update"):
+                st.write(f"⚠️ 3日以上のデータ未同期を検出（最新日: {needs['global_max_date']}）。全期間を対象に更新を開始します...")
+            if needs.get("refetch_tickers"):
+                st.write(f"🔄 未確定データ（当日未引け値等）の再取得対象: {len(needs['refetch_tickers'])} 銘柄")
+            if needs.get("missing_tickers"):
+                st.write(f"➕ 新しくリストに追加された新規取得対象: {len(needs['missing_tickers'])} 銘柄")
+            
+            st.write("各タイムフレームの安全な差分取得タスクを開始します...")
+            with st.spinner("ダウンロード中... (処理には1〜2分かかる場合があります)"):
+                try:
+                    all_tickers = stock_study.get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
+                    stock_study.update_price_database(is_jp=is_jp, target_tickers=all_tickers)
+                    
+                    get_db_last_update.clear()
+                    load_unified_db.clear()
+                    
+                    status_box.update(label="✅ 全体差分ダウンロード完了！", state="complete")
+                    st.success("すべてのParquetデータベースファイルが正常に同期されました。")
+                except Exception as e:
+                    status_box.update(label="❌ エラーが発生しました", state="error")
+                    st.error(f"データベースの更新処理中に例外エラーが発生しました: {e}")
+                    
+    st.divider()
+    
+    # 【セクション2】手動フル再取得・再構築（日足長期足専用）
+    st.subheader("2️⃣ 手動フル再取得・再構築（日足長期足専用）")
+    st.markdown(
+        """<div style="background-color:#ffebe9; border-left: 6px solid #ff3b30; padding:15px; border-radius:4px; margin-bottom:15px;">
+        <span style="font-weight:700; color:#ff3b30; font-size:1.0rem;">⚠️ 警告（必ずご確認ください）</span><br/>
+        本処理は <strong>日足（1d）のデータベースファイルのみに適用されます</strong>。
+        既存の過去データを一度全クリアしたうえで、yfinanceから全期間の調整後（auto_adjust=True）データをフルダウンロードして再構築します。<br/>
+        分足や1時間足（60m）などの短期足データベースに対して本処理を実行すると、yfinanceの過去データ提供期間制限（1m: 7日、5m: 60日、60m: 730日）により、
+        <strong>制限範囲より古いすべての蓄積データが永久に消失します</strong>。
+        短期足の修復や調整には、以下の【短期足修復】機能を使用してください。
+        </div>""", unsafe_allow_html=True
+    )
+    
+    r_col1, r_col2 = st.columns([3, 1])
+    with r_col1:
+        rebuild_ticker = st.text_input("フル再構築を実行する銘柄コードを入力してください", placeholder="例: 7203 や AAPL", key="rebuild_ticker_box")
+    with r_col2:
+        st.write(" ")
+        st.write(" ")
+        btn_rebuild = st.button("🚀 フル再構築を実行", use_container_width=True, type="secondary")
+        
+    if btn_rebuild:
+        if not rebuild_ticker:
+            st.error("銘柄コードが正しく入力されていません。")
+        else:
+            pure_t = stock_study.sanitize_ticker(rebuild_ticker, is_jp=is_jp)
+            with st.spinner(f"🔄 [{pure_t}] の全期間調整後データを取得し、1dデータベースを再構築しています..."):
+                success = stock_study.rebuild_single_ticker_db(pure_t, is_jp=is_jp, interval="1d")
+                if success:
+                    get_db_last_update.clear()
+                    load_unified_db.clear()
+                    st.success(f"✅ [{pure_t}] の日足(1d)データベースの再構築が正常に完了しました。")
+                else:
+                    st.error(f"❌ [{pure_t}] の再構築処理に失敗しました。ティッカー名が有効かご確認ください。")
+                    
+    st.divider()
+    
+    # 【セクション3】手動ピンポイント部分修復（短期足・日足未満すべてに対応）
+    st.subheader("3️⃣ 手動ピンポイント部分修復（短期足・日足未満すべてに対応）")
+    st.write(
+        "特定の分足や1時間足（および日足）において、データの欠損やズレが発生した場合の治療セクションです。"
+        "既存の古い蓄積データを破壊することなく、yfinanceから取得制限範囲の最大データを落とし、"
+        "**「日時スタンプ完全一致方式による重複排除マージ」**により、重なる期間だけを正確に書き換えます。"
+        "治療期間内に株式分割（Splits）を検知した場合は、古いデータに自動で比率を掛けて遡及調整します。"
+    )
+    
+    rep_col1, rep_col2, rep_col3 = st.columns([2, 1, 1])
+    with rep_col1:
+        rep_ticker = st.text_input("安全修復を実行する銘柄コードを入力してください", placeholder="例: 7203 や AAPL", key="rep_ticker_box")
+    with rep_col2:
+        rep_interval = st.selectbox("対象の時間足（修復するデータベース）", ["1m", "5m", "60m", "1d"], index=2, key="rep_interval_box")
+    with rep_col3:
+        st.write(" ")
+        st.write(" ")
+        btn_repair = st.button("🔧 安全修復を実行", use_container_width=True)
+        
+    if btn_repair:
+        if not rep_ticker:
+            st.error("銘柄コードが入力されていません。")
+        else:
+            pure_t = stock_study.sanitize_ticker(rep_ticker, is_jp=is_jp)
+            with st.spinner(f"🔧 [{pure_t}] の {rep_interval} データベースをピンポイント修復マージ中..."):
+                success = stock_study.repair_single_ticker_short_term_db(pure_t, interval=rep_interval, is_jp=is_jp)
+                if success:
+                    get_db_last_update.clear()
+                    load_unified_db.clear()
+                    st.success(f"✅ [{pure_t}] の {rep_interval} データベースの修復に成功しました！")
+                else:
+                    st.error(f"❌ [{pure_t}] の修復処理を実行できませんでした。")
+                    
+    st.stop()
+
+
+# =====================================================================
+# 📊 セクターローテーション画面のルーティング
+# =====================================================================
 if selected_page == "セクターローテーション":
     render_sector_rotation_page()
     st.stop()
 
-# --- マーケット情報ページ ---
+# =====================================================================
+# 📈 マーケット情報画面のルーティング
+# =====================================================================
 if selected_page == "マーケット情報":
     st.title("📈 マーケット情報")
-    if st.button("データ取得・更新", type="primary"):
-        with st.spinner("更新中..."):
+    if st.button("マーケット指数データを最新化", type="primary"):
+        with st.spinner("外部サイトから指数情報を収集しています..."):
             df_s = update_and_load_saitei_data()
             if not df_s.empty: st.session_state.saitei_df = df_s
             df_m = update_and_load_sinyou_data()
             if not df_m.empty: st.session_state.sinyou_df = df_m
             df_n = update_and_load_naaim_data()
             if not df_n.empty: st.session_state.naaim_df = df_n
-            st.success("更新完了")
+            st.success("指数データの取得が完了しました。")
     st.write("---")
     col1, col2 = st.columns([2, 3])
     with col1: st.subheader("📊 分析ダッシュボード")
-    with col2: period = st.radio("期間:", ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "3年", "全"], index=3, horizontal=True, label_visibility="collapsed")
+    with col2: period = st.radio("表示期間の変更:", ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "3年", "全"], index=3, horizontal=True, label_visibility="collapsed")
     
     end_dt = st.session_state.saitei_df['Date'].max() if not st.session_state.saitei_df.empty else pd.Timestamp.now()
     if period == "1ヶ月": start_dt = end_dt - pd.DateOffset(months=1)
@@ -1324,17 +1379,17 @@ if selected_page == "マーケット情報":
                 if not v.empty: fig.update_yaxes(range=[v['Nikkei225'].min()*0.98, v['Nikkei225'].max()*1.02], row=1, col=1, secondary_y=False)
             fig.update_yaxes(fixedrange=True)
             st.plotly_chart(fig, use_container_width=True)
-    else: st.info("「データ取得・更新」ボタンを押してください。")
+    else: st.info("「マーケット指数データを最新化」ボタンを押して、スプレッドシートおよび最新データをロードしてください。")
     
     st.write("---")
     st.subheader("🔍 個別銘柄 信用残検索 (IRBank)")
     c1, c2 = st.columns([1, 4])
     search_code = c1.text_input("銘柄コード", value="1321", placeholder="例: 1321")
     if search_code:
-        with st.spinner(f"{search_code} のデータを取得中..."):
+        with st.spinner(f"{search_code} の信用残データを取得中..."):
             idf = fetch_irbank_margin(search_code)
             if not idf.empty:
-                p = st.radio("表示期間:", ["6ヶ月", "1年", "3年", "全"], key="ir_p", horizontal=True)
+                p = st.radio("表示期間の変更:", ["6ヶ月", "1年", "3年", "全"], key="ir_p", horizontal=True)
                 i_end = idf['Date'].max()
                 if p == "6ヶ月": i_start = i_end - pd.DateOffset(months=6)
                 elif p == "1年": i_start = i_end - pd.DateOffset(years=1)
@@ -1346,17 +1401,18 @@ if selected_page == "マーケット情報":
                     ifig = plot_individual_margin(vdf, search_code)
                     st.plotly_chart(ifig, use_container_width=True)
             else:
-                st.warning("データが見つかりませんでした。コードを確認してください。")
+                st.warning("IRBankからデータが見つかりませんでした。日本株のコードを再確認してください。")
     st.stop()
 
-# --- スクリーニングページ ---
+# =====================================================================
+# 🔍 スクリーニング画面のルーティング
+# =====================================================================
 if selected_page == "スクリーニング":
     st.title("WVF + Trend Screener :blue[Pro]")
     
     with st.sidebar:
         st.subheader("スクリーニング操作")
         
-        # 履歴ロード
         with st.expander("📂 履歴表示", expanded=True):
             ids = get_history_list()
             if ids:
@@ -1370,7 +1426,6 @@ if selected_page == "スクリーニング":
         
         if st.button("🚀 スクリーニング開始", use_container_width=True):
             with st.spinner("データベースからTOPIX500データを抽出中..."):
-                # 日本株日足データベース (price_jp_1d.parquet) をロード
                 db_df = load_unified_db("1d", is_jp=True)
                 
                 if not db_df.empty:
@@ -1386,7 +1441,6 @@ if selected_page == "スクリーニング":
                     st.success("結果を保存しました！")
                     st.rerun()
 
-    # 結果の表示
     if not st.session_state.result_df.empty:
         rdf = st.session_state.result_df
         for i in range(0, len(rdf), 2):
@@ -1416,8 +1470,3 @@ if selected_page == "スクリーニング":
             st.warning("条件に一致する銘柄は見つかりませんでした。")
         else:
             st.info("左サイドバーの「🚀 スクリーニング開始」ボタンを押してください。データベースから超高速判定を行います。")
-# --- マーケット情報ページ (従来ロジックそのまま維持) ---
-if selected_page == "マーケット情報":
-    st.title("📈 マーケット情報")
-    # (既存のマーケット情報画面描画ロジックが安全に動作)
-    st.info("インクリメンタルなマーケット情報を表示します。")

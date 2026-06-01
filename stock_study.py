@@ -172,7 +172,6 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True):
 
 def get_topix500_tickers() -> list:
     """JPX公式エクセルからTOPIX500（Core30+Large70+Mid400）＋ETF・ETNの銘柄コードを取得（当日キャッシュあり）"""
-    # 当日キャッシュ確認
     cache_path = os.path.join(WORK_DIR, "jpx_ticker_cache.json")
     today_str = datetime.now().strftime("%Y-%m-%d")
     if os.path.exists(cache_path):
@@ -191,13 +190,11 @@ def get_topix500_tickers() -> list:
             f.write(resp.content)
         df_full = pd.read_excel(jpx_save_path)
 
-        # TOPIX500（株式）: 規模区分列(index 9)で絞り込み
         df_scale = df_full.iloc[:, [1, 2, 3, 9]].copy()
         df_scale.columns = ['symbol', 'name', 'market', 'scale_type']
         target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
         topix500 = df_scale[df_scale["scale_type"].isin(target_scales)]['symbol'].dropna()
 
-        # ETF・ETN: 市場・商品区分列(index 3)で絞り込み
         df_market = df_full.iloc[:, [1, 2, 3]].copy()
         df_market.columns = ['symbol', 'name', 'market']
         etf_etn = df_market[df_market["market"] == "ETF・ETN"]['symbol'].dropna()
@@ -205,7 +202,6 @@ def get_topix500_tickers() -> list:
         all_symbols = pd.concat([topix500, etf_etn]).drop_duplicates()
         codes = [str(s).strip().split('.')[0] for s in all_symbols if str(s).strip()]
         print(f"✅ 収集対象: TOPIX500={len(topix500)}銘柄 + ETF/ETN={len(etf_etn)}銘柄 = 計{len(codes)}銘柄")
-        # 当日キャッシュ保存
         try:
             with open(cache_path, "w") as f:
                 json.dump({"date": today_str, "tickers": codes}, f)
@@ -216,9 +212,8 @@ def get_topix500_tickers() -> list:
         print(f"JPX銘柄リスト取得失敗: {e}")
         return []
 
-
 def get_extra_tickers() -> list:
-    """extra_tickers.jsonから追加収集ティッカーを読み込む（streamlit_app.pyが同期済みの前提）"""
+    """extra_tickers.jsonから追加収集ティッカーを読み込む"""
     cache_path = os.path.join(WORK_DIR, "extra_tickers.json")
     if not os.path.exists(cache_path):
         return []
@@ -275,8 +270,6 @@ def load_tickers_from_file(file_path: str) -> list:
         raw_tickers = []
         ticker_col = None
         
-        # 1行目のヘッダー名（df.columns）から『コード』に関連する文字が含まれる列を検索
-        # 日本語の「コード」「銘柄コード」や、英語の「ticker」「symbol」「code」に対応します
         target_keywords = ['コード', 'ticker', 'symbol', 'code', '銘柄コード']
         for col in df.columns:
             col_str = str(col).strip().lower()
@@ -288,23 +281,19 @@ def load_tickers_from_file(file_path: str) -> list:
             raw_tickers = df[ticker_col].dropna().astype(str).tolist()
             print(f"🔍 1行目から『{ticker_col}』列を自動検出しました。この列からコードを抽出します。")
         else:
-            # 万が一キーワードが見つからなかった場合は、1列目（インデックス0）を代替として読み込みます
             raw_tickers = df.iloc[:, 0].dropna().astype(str).tolist()
             print("⚠️ 1行目に『コード』に該当する見出しが見つかりませんでした。代わりに1列目のデータを読み込みます。")
             
-            # 見出し行がないファイルで、1行目のコードが列名として読み込まれた場合の救済
             first_col_name = str(df.columns[0]).strip().split('.')[0]
             if first_col_name and not any(h in first_col_name.lower() for h in ['name', 'date', '日付', '市場', '価格', 'close']):
                 raw_tickers.insert(0, str(df.columns[0]))
         
-        # データの整形（小数の削除など）
         cleaned = []
         for t in raw_tickers:
             t_clean = t.strip().split('.')[0]
             if t_clean and t_clean.isalnum():
                 cleaned.append(t_clean)
                 
-        # 重複を排除しつつ、順序を維持
         seen = set()
         unique_cleaned = [x for x in cleaned if not (x in seen or seen.add(x))]
         
@@ -315,9 +304,289 @@ def load_tickers_from_file(file_path: str) -> list:
         print(f"❌ 【エラー】ファイルの読み込み中に問題が発生しました: {e}")
         return []
 
-# --- データベース統合更新エンジン ---
+# --- ティッカーシンボルのサニタイズ処理 ---
+
+def sanitize_ticker(ticker: str, is_jp: bool = True) -> str:
+    """ティッカーを大文字にし、空白を除去してサフィックス（.T等）を取り除いた純粋な形にする"""
+    t = str(ticker).strip().upper()
+    if is_jp and t.endswith(".T"):
+        t = t[:-2]
+    return t
+
+def get_download_symbol(ticker: str, is_jp: bool = True) -> str:
+    """yfinanceダウンロード用に適切なサフィックスを付与したティッカー名を取得する"""
+    pure_ticker = sanitize_ticker(ticker, is_jp)
+    if is_jp and not pure_ticker.endswith(".T") and pure_ticker.isdigit():
+        return f"{pure_ticker}.T"
+    return pure_ticker
+
+# --- データベース統合更新エンジン・個別修復・再構築 ---
+
+def rebuild_single_ticker_db(ticker: str, is_jp: bool = True, interval: str = "1d") -> bool:
+    """
+    指定 ticker の過去データを yfinance から auto_adjust=True かつ period='max' でフル再取得し、
+    Parquet データベースの指定銘柄を完全に上書き再構築する（長期足・日足(1d)専用）。
+    短期足に対してはデータ永久消失を防ぐためガード（処理中断）をかける。
+    """
+    if interval != "1d":
+        msg = f"❌ 【ガード発動】短期足（{interval}）に対するフル再構築は、データ永久消失リスクを回避するため実行できません。"
+        print(msg)
+        if HAS_STREAMLIT:
+            st.error(msg)
+        return False
+        
+    pure_ticker = sanitize_ticker(ticker, is_jp)
+    symbol = get_download_symbol(pure_ticker, is_jp)
+    
+    print(f"🔄 [{pure_ticker}] 1d データベースをフル再構築します...")
+    try:
+        db_df = load_price_db("1d", is_jp=is_jp)
+    except FileNotFoundError:
+        db_df = pd.DataFrame()
+        
+    # 既存の同一銘柄データを削除
+    if not db_df.empty:
+        db_df = db_df[db_df["ticker"] != pure_ticker]
+        
+    try:
+        df_raw = yf.download(symbol, period="max", interval="1d", auto_adjust=True, actions=True, progress=False)
+        if df_raw.empty:
+            print(f"⚠️ {symbol} のデータが取得できませんでした。")
+            return False
+            
+        df_clean = parse_yfinance_batch(df_raw, [pure_ticker], is_jp=is_jp)
+        if not df_clean.empty:
+            df_clean["is_finalized"] = True
+            db_df = pd.concat([db_df, df_clean], ignore_index=True)
+            db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
+            save_price_db(db_df, "1d", is_jp=is_jp)
+            print(f"✅ [{pure_ticker}] 1d フル再構築が完了しました。 (行数: {len(df_clean)})")
+            return True
+        else:
+            print(f"⚠️ [{pure_ticker}] パース結果が空です。")
+            return False
+    except Exception as e:
+        print(f"❌ [{pure_ticker}] フル再構築中にエラーが発生しました: {e}")
+        return False
+
+def repair_single_ticker_short_term_db(ticker: str, interval: str, is_jp: bool = True) -> bool:
+    """
+    【短期足修復】日時スタンプ完全一致方式による重複排除マージを適用した、短期足用の安全な治療・修復アルゴリズム。
+    取得制限期間の最大範囲を指定して新規に取得し、期間内に株式分割(Splits)を検知した場合は
+    既存の全蓄積データに対して数学的一括自己調整（価格に R を乗算、出来高に R を除算）を行います。
+    """
+    pure_ticker = sanitize_ticker(ticker, is_jp)
+    symbol = get_download_symbol(pure_ticker, is_jp)
+    now = datetime.now()
+    
+    # 1. 既存データのロード
+    try:
+        db_df = load_price_db(interval, is_jp=is_jp)
+    except FileNotFoundError:
+        db_df = pd.DataFrame()
+        
+    old_df = db_df[db_df["ticker"] == pure_ticker].copy() if not db_df.empty else pd.DataFrame()
+    
+    # 2. 新規取得制限期間の定義
+    if interval == "1m":
+        start_date_dt = now - timedelta(days=6)
+    elif interval == "5m":
+        start_date_dt = now - timedelta(days=58)
+    elif interval == "60m":
+        start_date_dt = now - timedelta(days=718)
+    elif interval == "1d":
+        start_date_dt = now - timedelta(days=365)
+    else:
+        start_date_dt = now - timedelta(days=7)
+        
+    try:
+        print(f"📥 [{pure_ticker}] {interval} 修復用の新規データを取得中 ({start_date_dt.strftime('%Y-%m-%d')} ~)...")
+        # actions=True, auto_adjust=Falseで生Closeを取得
+        df_raw = yf.download(
+            symbol,
+            start=start_date_dt.strftime("%Y-%m-%d"),
+            interval=interval,
+            auto_adjust=False,
+            actions=True,
+            progress=False
+        )
+        if df_raw.empty:
+            print(f"⚠️ {symbol} の新規取得データが空です。修復を中断します。")
+            return False
+            
+        new_df = parse_yfinance_batch(df_raw, [pure_ticker], is_jp=is_jp)
+        if new_df.empty:
+            print(f"⚠️ パース処理の結果、有効なデータが確認できませんでした。")
+            return False
+            
+        # 3. 株式分割の自動チェックと遡及適用（自己修復）
+        has_split = False
+        split_ratio = 1.0
+        if "stock splits" in new_df.columns:
+            splits_active = new_df["stock splits"].dropna()
+            splits_active = splits_active[(splits_active > 0) & (splits_active != 1.0)]
+            if not splits_active.empty:
+                S = splits_active.iloc[-1]
+                split_ratio = 1.0 / S
+                has_split = True
+                print(f"⚠️ [分割検知] 修復期間中に株式分割（分割比: {S}）を検知。既存の全蓄積データに遡及適用します (R = {split_ratio:.4f})")
+                
+        if has_split and not old_df.empty:
+            price_cols = ["open", "high", "low", "close"]
+            for col in price_cols:
+                if col in old_df.columns:
+                    old_df[col] = old_df[col] * split_ratio
+            if "volume" in old_df.columns:
+                old_df["volume"] = old_df["volume"] / split_ratio
+                
+        # 4. 日時スタンプ完全一致方式による重複排除
+        if not old_df.empty:
+            new_dates = new_df["date"]
+            old_df_filtered = old_df[~old_df["date"].isin(new_dates)]
+            combined_ticker = pd.concat([old_df_filtered, new_df], ignore_index=True)
+        else:
+            combined_ticker = new_df
+            
+        # 5. 全体Parquetへの結合と上書き保存
+        if not db_df.empty:
+            other_tickers_df = db_df[db_df["ticker"] != pure_ticker]
+            final_df = pd.concat([other_tickers_df, combined_ticker], ignore_index=True)
+        else:
+            final_df = combined_ticker
+            
+        if "is_finalized" not in final_df.columns:
+            final_df["is_finalized"] = True
+        else:
+            final_df.loc[final_df["ticker"] == pure_ticker, "is_finalized"] = True
+            
+        final_df = final_df.sort_values(["ticker", "date"]).reset_index(drop=True)
+        save_price_db(final_df, interval, is_jp=is_jp)
+        print(f"✅ [{pure_ticker}] {interval} 重複排除マージによる安全修復が完了しました。 (行数: {len(combined_ticker)})")
+        return True
+    except Exception as e:
+        print(f"❌ [{pure_ticker}] 修復処理中にエラーが発生しました: {e}")
+        return False
+
+def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, is_jp: bool = True) -> pd.DataFrame:
+    """
+    新旧株価データを日時スタンプ完全一致方式で安全にマージする関数。
+    価格比率のみによる単純な境界チェックによる分割検知を廃止し、'stock splits' 列をスキャンして判定します。
+    分割が検知された場合、古いデータに対して一括して数学的自己調整（R=1/Splits値を乗算、出来高に除算）を実行します。
+    """
+    if new_df is None or new_df.empty: return old_df
+    if old_df.empty: return new_df
+
+    new_tickers = new_df["ticker"].unique()
+    old_untouched = old_df[~old_df["ticker"].isin(new_tickers)].copy()
+    
+    processed_parts = []
+    for t in new_tickers:
+        t_new = new_df[new_df["ticker"] == t].sort_values("date")
+        t_old = old_df[old_df["ticker"] == t].sort_values("date")
+        
+        if t_old.empty:
+            processed_parts.append(t_new)
+            continue
+            
+        # 'stock splits' カラムを用いた確実な分割の判定
+        has_split = False
+        split_ratio = 1.0
+        if "stock splits" in t_new.columns:
+            splits_active = t_new["stock splits"].dropna()
+            splits_active = splits_active[(splits_active > 0) & (splits_active != 1.0)]
+            if not splits_active.empty:
+                S = splits_active.iloc[-1]
+                split_ratio = 1.0 / S
+                has_split = True
+                print(f"⚠️ [分割検知] Ticker {t}: 株式分割（{S}）が確認されました。過去データ全体に数学的自己調整を適用します (R = {split_ratio:.4f})")
+                
+        if has_split:
+            price_cols = ["open", "high", "low", "close"]
+            for col in price_cols:
+                if col in t_old.columns:
+                    t_old[col] = t_old[col] * split_ratio
+            if "volume" in t_old.columns:
+                t_old["volume"] = t_old["volume"] / split_ratio
+                
+        # 日時スタンプ完全一致方式による重複排除
+        new_dates = t_new["date"]
+        t_old_filtered = t_old[~t_old["date"].isin(new_dates)]
+        
+        t_combined = pd.concat([t_old_filtered, t_new], ignore_index=True)
+        processed_parts.append(t_combined)
+        
+    combined = pd.concat([old_untouched] + processed_parts, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["date", "ticker"], keep="last")
+    return combined.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+def parse_yfinance_batch(df_raw, chunk_tickers, is_jp: bool = True):
+    """
+    yfinanceの一括取得（actions=True）データフレームをパースし、整形された単一のデータフレームを返します。
+    マルチインデックスカラムおよび大文字小文字（Stock Splits, Dividends等）の表記ブレを考慮したパース処理を行います。
+    """
+    if df_raw.empty: return pd.DataFrame()
+    all_rows = []
+    
+    is_multi = isinstance(df_raw.columns, pd.MultiIndex)
+    suffix = ".T" if is_jp else ""
+    
+    if not is_multi:
+        # シングルインデックス（yf.downloadに単一のティッカーが指定されたケース）
+        if len(chunk_tickers) == 1:
+            t_df = df_raw.copy()
+            t_df = t_df.dropna(how="all").reset_index()
+            t_df.columns = [str(c).lower() for c in t_df.columns]
+            t_df = t_df.rename(columns={"datetime": "date", "index": "date"})
+            
+            dt_col = pd.to_datetime(t_df["date"])
+            t_df["date"] = dt_col.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None) if dt_col.dt.tz is not None else dt_col
+            t_df["ticker"] = str(chunk_tickers[0])
+            
+            target_cols = ["date", "ticker", "open", "high", "low", "close", "volume", "stock splits", "dividends"]
+            valid_cols = [c for c in target_cols if c in t_df.columns]
+            return t_df[valid_cols]
+        else:
+            return pd.DataFrame()
+            
+    # マルチインデックスケースの処理
+    for ticker in chunk_tickers:
+        symbol = f"{ticker}{suffix}"
+        try:
+            if symbol in df_raw.columns.get_level_values(1):
+                t_df = df_raw.xs(symbol, axis=1, level=1).copy()
+            elif symbol in df_raw.columns.get_level_values(0):
+                t_df = df_raw[symbol].copy()
+            else:
+                alt_symbol = ticker
+                if alt_symbol in df_raw.columns.get_level_values(1):
+                    t_df = df_raw.xs(alt_symbol, axis=1, level=1).copy()
+                elif alt_symbol in df_raw.columns.get_level_values(0):
+                    t_df = df_raw[alt_symbol].copy()
+                else:
+                    continue
+
+            t_df = t_df.dropna(how="all").reset_index()
+            t_df.columns = [str(c).lower() for c in t_df.columns]
+            t_df = t_df.rename(columns={"datetime": "date", "index": "date"}) 
+            
+            dt_col = pd.to_datetime(t_df["date"])
+            t_df["date"] = dt_col.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None) if dt_col.dt.tz is not None else dt_col
+            t_df["ticker"] = str(ticker)
+            
+            target_cols = ["date", "ticker", "open", "high", "low", "close", "volume", "stock splits", "dividends"]
+            valid_cols = [c for c in target_cols if c in t_df.columns]
+            all_rows.append(t_df[valid_cols])
+        except Exception:
+            continue
+            
+    return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
 
 def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False):
+    """
+    全銘柄の差分同期エンジン（自動権利落ち防衛トリガー付き）。
+    日足(1d)同期時に分割、配当などの権利落ちを検知した場合は、即座に対象銘柄に限り過去全期間フルダウンロードし直して上書き更新します。
+    短期足(1m, 5m, 60m)の同期時は、配当を無視し株式分割検知時のみ一括数学的調整を適用します。
+    """
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
     
@@ -330,6 +599,9 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
 
     now = datetime.now()
     suffix = ".T" if is_jp else ""
+    
+    # ティッカーのサニタイズ適用
+    tickers = [sanitize_ticker(t, is_jp) for t in tickers]
 
     for interval in TIMEFRAMES:
         print(f"\n--- Database Sync: {market_name} ({interval}) ---")
@@ -349,7 +621,6 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         for t in tickers:
             t_last = last_updates_map.get(t)
             if force_refetch:
-                # force_refetch=True: 対象銘柄を全てGroup B（再取得）扱いにする
                 group_catchup.append(t)
             elif t_last and global_max_date and t_last >= global_max_date:
                 group_up_to_date.append(t)
@@ -369,8 +640,8 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                     chunk = group_up_to_date[i:i+BATCH_SIZE]
                     symbols = [f"{t}{suffix}" for t in chunk]
                     try:
-                        df_raw = yf.download(symbols, start=start_date_dt.strftime("%Y-%m-%d"), interval=interval, auto_adjust=False, progress=False, threads=True, timeout=30)
-                        chunk_processed = parse_yfinance_batch(df_raw, chunk)
+                        df_raw = yf.download(symbols, start=start_date_dt.strftime("%Y-%m-%d"), interval=interval, auto_adjust=False, actions=True, progress=False, threads=True, timeout=30)
+                        chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
                         if not chunk_processed.empty:
                             all_downloaded.append(chunk_processed)
                     except Exception as e:
@@ -383,8 +654,6 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             for i in range(0, len(group_catchup), BATCH_SIZE):
                 chunk = group_catchup[i:i+BATCH_SIZE]
                 
-                # 取得開始可能日の制限設定
-                # force_refetch=True の場合はDBの最終日から再取得（当日分のみ）
                 if force_refetch and global_max_date:
                     start_date_dt = global_max_date
                 else:
@@ -399,8 +668,8 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
 
                 symbols = [f"{t}{suffix}" for t in chunk]
                 try:
-                    df_raw = yf.download(symbols, start=start_date_dt.strftime("%Y-%m-%d"), interval=interval, auto_adjust=False, progress=False, threads=True, timeout=30)
-                    chunk_processed = parse_yfinance_batch(df_raw, chunk)
+                    df_raw = yf.download(symbols, start=start_date_dt.strftime("%Y-%m-%d"), interval=interval, auto_adjust=False, actions=True, progress=False, threads=True, timeout=30)
+                    chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
                     if not chunk_processed.empty:
                         all_downloaded.append(chunk_processed)
                 except Exception as e:
@@ -415,95 +684,48 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                 else:
                     new_combined["is_finalized"] = new_combined["date"] < (now - timedelta(hours=1))
             
-            db_df = merge_price_data(db_df, new_combined)
-            save_price_db(db_df, interval, is_jp=is_jp)
-            print(f"  ✅ Saved updated price_{market_name.lower()}_{interval}.parquet. Rows: {len(db_df)}")
+            # --- 権利落ち自動トリガー（日足 1d のみ適用） ---
+            reset_tickers = []
+            if interval == "1d":
+                for ticker in new_combined["ticker"].unique():
+                    t_new = new_combined[new_combined["ticker"] == ticker]
+                    has_action = False
+                    
+                    if "stock splits" in t_new.columns:
+                        splits_active = t_new["stock splits"].dropna()
+                        if not splits_active[(splits_active > 0) & (splits_active != 1.0)].empty:
+                            has_action = True
+                            
+                    if "dividends" in t_new.columns:
+                        divs_active = t_new["dividends"].dropna()
+                        if not divs_active[divs_active > 0].empty:
+                            has_action = True
+                            
+                    if has_action:
+                        print(f"🚨 [権利落ち自動トリガー発動] {ticker} に分割または配当を検知しました。過去全期間をフル再構築します。")
+                        rebuild_success = rebuild_single_ticker_db(ticker, is_jp=is_jp, interval="1d")
+                        if rebuild_success:
+                            reset_tickers.append(ticker)
+                            
+                # フル再構築（自動リセット）された銘柄はマージから除外
+                if reset_tickers:
+                    new_combined = new_combined[~new_combined["ticker"].isin(reset_tickers)]
+                    # フル再構築によりParquetが更新されているため、最新データをロードし直します
+                    db_df = load_price_db(interval, is_jp=is_jp)
+            
+            if not new_combined.empty:
+                db_df = merge_price_data(db_df, new_combined, interval, is_jp=is_jp)
+                save_price_db(db_df, interval, is_jp=is_jp)
+                print(f"  ✅ Saved updated price_{market_name.lower()}_{interval}.parquet. Rows: {len(db_df)}")
+            else:
+                print(f"  🧊 No extra new data left to merge after triggers.")
         else:
             print(f"  🧊 No new data added.")
-
-def merge_price_data(old_df, new_df, is_jp=True):
-    if new_df is None or new_df.empty: return old_df
-    if old_df.empty: return new_df
-
-    new_tickers = new_df["ticker"].unique()
-    old_untouched = old_df[~old_df["ticker"].isin(new_tickers)].copy()
-    
-    old_touched_parts = []
-    re_download_tickers = []  # 分割を検知して再ダウンロードが必要な銘柄リスト
-
-    for t in new_tickers:
-        t_new = new_df[new_df["ticker"] == t].sort_values("date")
-        t_old = old_df[old_df["ticker"] == t].sort_values("date")
-        
-        if not t_old.empty and not t_new.empty:
-            # 境界値のチェック：DBの最終日価格 と 新データの初日価格
-            old_last_price = t_old["close"].iloc[-1]
-            new_first_price = t_new["close"].iloc[0]
-            
-            # 1日の間に価格が30%以上減少、または40%以上増加しているかチェック（分割/併合の検知）
-            ratio = new_first_price / old_last_price
-            if ratio < 0.7 or ratio > 1.4:
-                print(f"⚠️ [分割/併合検知] Ticker {t}: 価格が {old_last_price:.1f} から {new_first_price:.1f} へ急変しています。フルダウンロードリストに追加します。")
-                re_download_tickers.append(t)
-                continue  # 古いデータは結合せず、破棄する
-                
-            t_min = t_new["date"].min()
-            old_touched_parts.append(t_old[t_old["date"] < t_min])
-            
-    # 検知された銘柄をその場でフルダウンロード（再取得）する
-    if re_download_tickers:
-        suffix = ".T" if is_jp else ""
-        print(f"🔄 {len(re_download_tickers)}件の銘柄について過去全期間（調整後）データを再取得します...")
-        for t in re_download_tickers:
-            try:
-                # auto_adjust=True で全期間ダウンロード
-                df_heal = yf.download(f"{t}{suffix}", start="2023-01-01", auto_adjust=True, progress=False)
-                if not df_heal.empty:
-                    # 整形処理（parse_yfinance_batchと同様の処理）を行い、new_df側へ追加する
-                    df_heal_clean = parse_single_ticker(df_heal, t) # 自作の整形関数
-                    new_df = pd.concat([new_df, df_heal_clean], ignore_index=True)
-            except Exception as e:
-                print(f"❌ {t} の自己修復ダウンロードに失敗しました: {e}")
-
-    old_touched = pd.concat(old_touched_parts, ignore_index=True) if old_touched_parts else pd.DataFrame()
-    combined = pd.concat([old_untouched, old_touched, new_df], ignore_index=True)
-    combined = combined.drop_duplicates(subset=["date", "ticker"], keep="last")
-    return combined.sort_values(["ticker", "date"]).reset_index(drop=True)
-
-def parse_yfinance_batch(df_raw, chunk_tickers):
-    if df_raw.empty: return pd.DataFrame()
-    all_rows = []
-    for ticker in chunk_tickers:
-        # 数字のみ、または「数字から始まる4桁」であれば日本株コード（.T付き）とみなす
-        is_jp_ticker = ticker.isdigit() or (len(ticker) == 4 and ticker[0].isdigit())
-        symbol = f"{ticker}.T" if is_jp_ticker else ticker
-        try:
-            if symbol in df_raw.columns.get_level_values(1):
-                t_df = df_raw.xs(symbol, axis=1, level=1).copy()
-            elif symbol in df_raw.columns.get_level_values(0):
-                t_df = df_raw[symbol].copy()
-            else:
-                continue
-
-            t_df = t_df.dropna(how="all").reset_index()
-            t_df.columns = [str(c).lower() for c in t_df.columns]
-            t_df = t_df.rename(columns={"datetime": "date", "index": "date"}) 
-            
-            dt_col = pd.to_datetime(t_df["date"])
-            t_df["date"] = dt_col.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None) if dt_col.dt.tz is not None else dt_col
-            t_df["ticker"] = str(ticker)
-            
-            valid_cols = [c for c in ["date", "ticker", "open", "high", "low", "close", "volume"] if c in t_df.columns]
-            all_rows.append(t_df[valid_cols])
-        except Exception:
-            continue
-    return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
 
 def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--market", type=str, default="jp", choices=["jp", "us"])
-    # --file を基本としつつ、従来の --csv でも同じ変数 file_path に入るようにします
     parser.add_argument("--file", "--csv", dest="file_path", type=str, default=None, 
                         help="Path to custom CSV/XLS/XLSX ticker list")
     args = parser.parse_args()
