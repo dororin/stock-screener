@@ -1236,11 +1236,25 @@ if selected_page == "データ管理・保守":
             if needs.get("missing_tickers"):
                 st.write(f"➕ 新しくリストに追加された新規取得対象: {len(needs['missing_tickers'])} 銘柄")
             
+# =====================================================================
+# 修正後：全体差分ダウンロード実行ブロック (コールバックの定義と引き渡し)
+# =====================================================================
             st.write("各タイムフレームの安全な差分取得タスクを開始します...")
+            
+            # 💡 【追加】進捗を1行ずつ st.status コンテナ内に出力するコールバック関数
+            def update_status_on_screen(msg):
+                st.write(f"  * {msg}")
+                
             with st.spinner("ダウンロード中... (処理には1〜2分かかる場合があります)"):
                 try:
                     all_tickers = stock_study.get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
-                    stock_study.update_price_database(is_jp=is_jp, target_tickers=all_tickers)
+                    
+                    # 💡 status_callback 引数に定義した関数を渡します
+                    stock_study.update_price_database(
+                        is_jp=is_jp, 
+                        target_tickers=all_tickers, 
+                        status_callback=update_status_on_screen
+                    )
                     
                     get_db_last_update.clear()
                     load_unified_db.clear()

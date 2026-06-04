@@ -548,15 +548,21 @@ def parse_yfinance_batch(df_raw, chunk_tickers, is_jp: bool = True):
             
     return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
 
-def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False):
+def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None):
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
     
+    # 💡 コールバック関数と標準出力を統一して処理する内部ヘルパー
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+            
     if is_jp and not tickers:
         tickers = get_all_collection_tickers()
         
     if not tickers:
-        print(f"[{market_name}] 更新対象銘柄リストが空です。処理をスキップします。")
+        log(f"[{market_name}] 更新対象銘柄リストが空です。処理をスキップします。")
         return
 
     now = datetime.now()
@@ -565,11 +571,11 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
     tickers = [sanitize_ticker(t, is_jp) for t in tickers]
 
     for interval in TIMEFRAMES:
-        print(f"\n--- Database Sync: {market_name} ({interval}) ---")
+        log(f"⏱️ 【{market_name}】{interval} データベースの同期処理を開始します...")
         try:
             db_df = load_price_db(interval, is_jp=is_jp)
         except FileNotFoundError as e:
-            print(f"Skipped: {e}")
+            log(f"⚠️ スキップ: {e}")
             continue
 
         last_updates_map = {}
@@ -602,11 +608,13 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         if group_up_to_date:
             start_date_dt = global_max_date + timedelta(days=1) if interval == "1d" else global_max_date + timedelta(hours=1)
             if start_date_dt > now:
-                print(f"  ✨ All Group-A tickers are already up to date.")
+                log(f"  ✨ Group-A ({len(group_up_to_date)}銘柄) はすでに最新状態です。")
             else:
+                log(f"  📥 Group-A ({len(group_up_to_date)}銘柄) の最新分を取得中...")
                 BATCH_SIZE = 50
                 for i in range(0, len(group_up_to_date), BATCH_SIZE):
                     chunk = group_up_to_date[i:i+BATCH_SIZE]
+                    log(f"    -> {interval} (Group A): {i}/{len(group_up_to_date)} 銘柄ダウンロード中...")
                     symbols = [f"{t}{suffix}" for t in chunk]
                     try:
                         df_raw = yf.download(symbols, start=start_date_dt.strftime("%Y-%m-%d"), interval=interval, auto_adjust=False, actions=True, progress=False, threads=True, timeout=30)
@@ -614,14 +622,16 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                         if not chunk_processed.empty:
                             all_downloaded.append(chunk_processed)
                     except Exception as e:
-                        print(f"     Batch Error: {e}")
+                        log(f"     Batch Error: {e}")
                     time.sleep(1)
 
         # --- 新規/遅れ組 (Group B) 同期 ---
         if group_catchup:
+            log(f"  📥 Group-B 新規/未同期組 ({len(group_catchup)}銘柄) の取得を開始...")
             BATCH_SIZE = 20
             for i in range(0, len(group_catchup), BATCH_SIZE):
                 chunk = group_catchup[i:i+BATCH_SIZE]
+                log(f"    -> {interval} (Group B): {i}/{len(group_catchup)} 銘柄ダウンロード中...")
                 
                 if force_refetch and global_max_date:
                     start_date_dt = global_max_date
@@ -642,7 +652,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                     if not chunk_processed.empty:
                         all_downloaded.append(chunk_processed)
                 except Exception as e:
-                    print(f"     Batch Error: {e}")
+                    log(f"     Batch Error: {e}")
                 time.sleep(1.5)
 
         if all_downloaded:
@@ -671,7 +681,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                             has_action = True
                             
                     if has_action:
-                        print(f"🚨 [権利落ち自動トリガー発動] {ticker} に分割または配当を検知しました。過去全期間をフル再構築します。")
+                        log(f"🚨 [権利落ち自動トリガー発動] {ticker} に分割または配当を検知。過去全期間をフル再構築します。")
                         rebuild_success = rebuild_single_ticker_db(ticker, is_jp=is_jp, interval="1d")
                         if rebuild_success:
                             reset_tickers.append(ticker)
@@ -683,11 +693,11 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             if not new_combined.empty:
                 db_df = merge_price_data(db_df, new_combined, interval, is_jp=is_jp)
                 save_price_db(db_df, interval, is_jp=is_jp)
-                print(f"  ✅ Saved updated price_{market_name.lower()}_{interval}.parquet. Rows: {len(db_df)}")
+                log(f"  ✅ {interval} データベースの更新を完了し、保存しました。")
             else:
-                print(f"  🧊 No extra new data left to merge after triggers.")
+                log(f"  🧊 トリガー再構築により、追加マージデータはありません。")
         else:
-            print(f"  🧊 No new data added.")
+            log(f"  🧊 新規追加データはありませんでした。")
 
 def main():
     import argparse
