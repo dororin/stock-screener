@@ -548,11 +548,38 @@ def parse_yfinance_batch(df_raw, chunk_tickers, is_jp: bool = True):
             
     return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
 
+def get_benchmark_latest_date(interval: str, is_jp: bool = True) -> pd.Timestamp:
+    """
+    yfinanceから代表ベンチマーク（日本株なら1306.T、米国株ならSPY）の最新の取引日時を1件取得する。
+    """
+    bm_symbol = "1306.T" if is_jp else "SPY"
+    try:
+        # 過去5日分を取得（休日や深夜でも確実に直近データを得るため）
+        df_bm = yf.download(bm_symbol, period="5d", interval=interval, progress=False, auto_adjust=True)
+        if df_bm.empty:
+            return None
+        
+        # yfinanceのインデックス（DatetimeIndex）から最新の行のタイムスタンプを取得
+        latest_dt = df_bm.index[-1]
+        
+        # データベース側のtz-naive形式にタイムゾーンを合わせる
+        if latest_dt.tzinfo is not None:
+            if is_jp:
+                latest_dt = latest_dt.tz_convert("Asia/Tokyo").tz_localize(None)
+            else:
+                latest_dt = latest_dt.tz_localize(None)
+        else:
+            latest_dt = pd.to_datetime(latest_dt)
+            
+        return latest_dt
+    except Exception:
+        return None
+
 def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None):
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
     
-    # 💡 コールバック関数と標準出力を統一して処理する内部ヘルパー
+    # コールバック関数と標準出力を統一して処理する内部ヘルパー
     def log(msg):
         print(msg)
         if status_callback:
@@ -578,15 +605,26 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             log(f"⚠️ スキップ: {e}")
             continue
 
+        # 💡 【スマートロジック：ベンチマーク先行比較】
+        db_max_date = db_df["date"].max() if not db_df.empty else None
+        
+        if db_max_date is not None:
+            bm_last_date = get_benchmark_latest_date(interval, is_jp=is_jp)
+            if bm_last_date is not None:
+                # 比較：ベンチマークの最新時刻が、DBの物理的な最新時刻以下なら同期は不要
+                if bm_last_date <= db_max_date:
+                    log(f"  ✨ 【同期スキップ判定】ベンチマークの最新時刻 ({bm_last_date}) ≦ DBの最新時刻 ({db_max_date})。")
+                    log(f"  現在のところ、これ以上新しいデータは配信されていないため、同期をスキップします。")
+                    continue
+                else:
+                    log(f"  📥 【同期実行判定】ベンチマークの最新時刻 ({bm_last_date}) ＞ DBの最新時刻 ({db_max_date})。差分の取得を開始します。")
+
         last_updates_map = {}
         if not db_df.empty:
-            # is_finalized == True (確定済み) のデータから最新日を取得
             if "is_finalized" in db_df.columns:
                 finalized_df = db_df[db_df["is_finalized"] == True]
                 if not finalized_df.empty:
                     last_updates_map = finalized_df.groupby("ticker")["date"].max().to_dict()
-            
-            # 確定データが1つもない、またはカラムがない場合は通常通り全体の max 日付を fallback として取得
             if not last_updates_map:
                 last_updates_map = db_df.groupby("ticker")["date"].max().to_dict()
 
