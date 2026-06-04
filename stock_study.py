@@ -575,6 +575,35 @@ def get_benchmark_latest_date(interval: str, is_jp: bool = True) -> pd.Timestamp
     except Exception:
         return None
 
+def get_benchmark_latest_date(interval: str, is_jp: bool = True) -> pd.Timestamp:
+    """
+    yfinanceから超高流動性の代表銘柄（日本株ならトヨタ7203.T、米国株ならAAPL）の最新取引日時を取得する。
+    取得に失敗した場合は、第二候補（日経平均 / S&P500）から取得を試みる。
+    """
+    # 第一候補に個別代表株、第二候補にインデックスを設定
+    symbols = ["7203.T", "^N225"] if is_jp else ["AAPL", "^GSPC"]
+    
+    for bm_symbol in symbols:
+        try:
+            # 休日や深夜でも確実に直近データを得るため5日分を取得
+            df_bm = yf.download(bm_symbol, period="5d", interval=interval, progress=False, auto_adjust=True)
+            if not df_bm.empty:
+                latest_dt = df_bm.index[-1]
+                
+                # データベース側のtz-naive形式にタイムゾーンを合わせる
+                if latest_dt.tzinfo is not None:
+                    if is_jp:
+                        latest_dt = latest_dt.tz_convert("Asia/Tokyo").tz_localize(None)
+                    else:
+                        latest_dt = latest_dt.tz_localize(None)
+                else:
+                    latest_dt = pd.to_datetime(latest_dt)
+                return latest_dt
+        except Exception:
+            continue  # 失敗した場合は次の候補を試す
+            
+    return None
+
 def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None):
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
@@ -605,93 +634,84 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             log(f"⚠️ スキップ: {e}")
             continue
 
-        # 💡 【スマートロジック：ベンチマーク先行比較】
+        # 💡 【スマートロジック：ベンチマーク先行比較（デバッグ情報付き）】
         db_max_date = db_df["date"].max() if not db_df.empty else None
         
         if db_max_date is not None:
             bm_last_date = get_benchmark_latest_date(interval, is_jp=is_jp)
+            
+            # 現在の比較状況をログに出力
+            log(f"  🔍 [判定情報] ベンチマーク最新時刻: {bm_last_date} | DBの物理最新時刻: {db_max_date}")
+            
             if bm_last_date is not None:
-                # 比較：ベンチマークの最新時刻が、DBの物理的な最新時刻以下なら同期は不要
+                # 比較：ベンチマークの最新時刻が、DBの物理的な最新時刻以下ならこの時間足は丸ごとスキップ
                 if bm_last_date <= db_max_date:
-                    log(f"  ✨ 【同期スキップ判定】ベンチマークの最新時刻 ({bm_last_date}) ≦ DBの最新時刻 ({db_max_date})。")
-                    log(f"  現在のところ、これ以上新しいデータは配信されていないため、同期をスキップします。")
+                    log(f"  ✨ 【同期スキップ】すでに最新状態（または休場・深夜）のため、同期処理をスキップします。")
                     continue
                 else:
-                    log(f"  📥 【同期実行判定】ベンチマークの最新時刻 ({bm_last_date}) ＞ DBの最新時刻 ({db_max_date})。差分の取得を開始します。")
+                    log(f"  📥 【同期実行】新データを確認したため、差分を同期します。")
+            else:
+                log(f"  ⚠️ ベンチマーク時刻の取得に失敗したため、安全のため通常の同期処理に移行します。")
 
+        # 各銘柄の物理的な最新日付を取得（未確定分も含む）
         last_updates_map = {}
         if not db_df.empty:
-            if "is_finalized" in db_df.columns:
-                finalized_df = db_df[db_df["is_finalized"] == True]
-                if not finalized_df.empty:
-                    last_updates_map = finalized_df.groupby("ticker")["date"].max().to_dict()
-            if not last_updates_map:
-                last_updates_map = db_df.groupby("ticker")["date"].max().to_dict()
+            last_updates_map = db_df.groupby("ticker")["date"].max().to_dict()
 
-        global_max_date = max(last_updates_map.values()) if last_updates_map else None
-        group_up_to_date, group_catchup = [], []
-
+        # 💡 【自律分散グループ化】最新日付ごとに銘柄をグループに分類
+        groups = {}
         for t in tickers:
             t_last = last_updates_map.get(t)
             if force_refetch:
-                group_catchup.append(t)
-            elif t_last and global_max_date and t_last >= global_max_date:
-                group_up_to_date.append(t)
+                t_key = None
             else:
-                group_catchup.append(t)
+                t_key = pd.to_datetime(t_last) if t_last is not None else None
+            groups.setdefault(t_key, []).append(t)
 
         all_downloaded = []
 
-        # --- 最新組 (Group A) 同期 ---
-        if group_up_to_date:
-            start_date_dt = global_max_date + timedelta(days=1) if interval == "1d" else global_max_date + timedelta(hours=1)
-            if start_date_dt > now:
-                log(f"  ✨ Group-A ({len(group_up_to_date)}銘柄) はすでに最新状態です。")
+        # グループごとに適切な開始日からダウンロード
+        for t_last, chunk_tickers in groups.items():
+            if t_last is None:
+                # 新規銘柄：過去制限最大から取得
+                if interval == "1m": start_date_dt = now - timedelta(days=6)
+                elif interval == "5m": start_date_dt = now - timedelta(days=58)
+                elif interval == "60m": start_date_dt = now - timedelta(days=718)
+                else: start_date_dt = datetime(2020, 1, 1)
+                log(f"  📥 新規または再取得銘柄 ({len(chunk_tickers)}件) をフル同期... (開始: {start_date_dt.strftime('%Y-%m-%d')})")
             else:
-                log(f"  📥 Group-A ({len(group_up_to_date)}銘柄) の最新分を取得中...")
-                BATCH_SIZE = 50
-                for i in range(0, len(group_up_to_date), BATCH_SIZE):
-                    chunk = group_up_to_date[i:i+BATCH_SIZE]
-                    log(f"    -> {interval} (Group A): {i}/{len(group_up_to_date)} 銘柄ダウンロード中...")
-                    symbols = [f"{t}{suffix}" for t in chunk]
-                    try:
-                        df_raw = yf.download(symbols, start=start_date_dt.strftime("%Y-%m-%d"), interval=interval, auto_adjust=False, actions=True, progress=False, threads=True, timeout=30)
-                        chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
-                        if not chunk_processed.empty:
-                            all_downloaded.append(chunk_processed)
-                    except Exception as e:
-                        log(f"     Batch Error: {e}")
-                    time.sleep(1)
-
-        # --- 新規/遅れ組 (Group B) 同期 ---
-        if group_catchup:
-            log(f"  📥 Group-B 新規/未同期組 ({len(group_catchup)}銘柄) の取得を開始...")
-            BATCH_SIZE = 20
-            for i in range(0, len(group_catchup), BATCH_SIZE):
-                chunk = group_catchup[i:i+BATCH_SIZE]
-                log(f"    -> {interval} (Group B): {i}/{len(group_catchup)} 銘柄ダウンロード中...")
+                # 既存銘柄：その銘柄自身の最新保存日から現在までを同期
+                start_date_dt = t_last
                 
-                if force_refetch and global_max_date:
-                    start_date_dt = global_max_date
-                else:
-                    start_date_dt = datetime(2023, 1, 1)
-                limit = None
-                if interval == "1m": limit = now - timedelta(days=6)
-                elif interval == "5m": limit = now - timedelta(days=58)
-                elif interval == "60m": limit = now - timedelta(days=720)
+                # 直近2分以内に同期された既存銘柄は除外（連続実行時の不要なリクエスト防止）
+                if interval != "1d" and (now - start_date_dt).total_seconds() < 120:
+                    continue
                 
-                if limit and start_date_dt < limit:
-                    start_date_dt = limit
+                log(f"  📥 既存銘柄 ({len(chunk_tickers)}件) を差分同期... (開始: {start_date_dt.strftime('%Y-%m-%d %H:%M')})")
 
+            # バッチサイズごとに分割して一括ダウンロード
+            BATCH_SIZE = 50
+            for i in range(0, len(chunk_tickers), BATCH_SIZE):
+                chunk = chunk_tickers[i:i+BATCH_SIZE]
+                log(f"    -> {interval}: {i}/{len(chunk_tickers)} 銘柄ダウンロード中...")
                 symbols = [f"{t}{suffix}" for t in chunk]
                 try:
-                    df_raw = yf.download(symbols, start=start_date_dt.strftime("%Y-%m-%d"), interval=interval, auto_adjust=False, actions=True, progress=False, threads=True, timeout=30)
+                    df_raw = yf.download(
+                        symbols, 
+                        start=start_date_dt.strftime("%Y-%m-%d") if interval == "1d" else start_date_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                        interval=interval, 
+                        auto_adjust=False, 
+                        actions=True, 
+                        progress=False, 
+                        threads=True, 
+                        timeout=30
+                    )
                     chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
                     if not chunk_processed.empty:
                         all_downloaded.append(chunk_processed)
                 except Exception as e:
                     log(f"     Batch Error: {e}")
-                time.sleep(1.5)
+                time.sleep(1)
 
         if all_downloaded:
             new_combined = pd.concat(all_downloaded, ignore_index=True)
