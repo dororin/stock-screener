@@ -577,15 +577,13 @@ def get_benchmark_latest_date(interval: str, is_jp: bool = True) -> pd.Timestamp
 
 def get_benchmark_latest_date(interval: str, is_jp: bool = True) -> pd.Timestamp:
     """
-    yfinanceから超高流動性の代表銘柄（日本株ならトヨタ7203.T、米国株ならAAPL）の最新取引日時を取得する。
-    取得に失敗した場合は、第二候補（日経平均 / S&P500）から取得を試みる。
+    yfinanceから超高流動性の代表銘柄の最新取引日時を取得する。
+    大引け後の時間外ノイズデータ（15:00以降）をカットするため、取引終了時刻で時間をクリップ（丸め）する。
     """
-    # 第一候補に個別代表株、第二候補にインデックスを設定
     symbols = ["7203.T", "^N225"] if is_jp else ["AAPL", "^GSPC"]
     
     for bm_symbol in symbols:
         try:
-            # 休日や深夜でも確実に直近データを得るため5日分を取得
             df_bm = yf.download(bm_symbol, period="5d", interval=interval, progress=False, auto_adjust=True)
             if not df_bm.empty:
                 latest_dt = df_bm.index[-1]
@@ -598,9 +596,17 @@ def get_benchmark_latest_date(interval: str, is_jp: bool = True) -> pd.Timestamp
                         latest_dt = latest_dt.tz_localize(None)
                 else:
                     latest_dt = pd.to_datetime(latest_dt)
+                
+                # 💡 【追加】大引け後の時間外ノイズ時刻（日本株15:00、米国株16:00以降）をクリップ
+                if interval != "1d":
+                    limit_hour = 15 if is_jp else 16
+                    limit_time = datetime.strptime(f"{limit_hour}:00:00", "%H:%M:%S").time()
+                    if latest_dt.time() > limit_time:
+                        latest_dt = latest_dt.replace(hour=limit_hour, minute=0, second=0, microsecond=0)
+                
                 return latest_dt
         except Exception:
-            continue  # 失敗した場合は次の候補を試す
+            continue
             
     return None
 
@@ -638,6 +644,13 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         db_max_date = db_df["date"].max() if not db_df.empty else None
         
         if db_max_date is not None:
+            # 💡 【追加】DB最新時刻に対しても大引け後の時間外ノイズ（日本株15:00、米国株16:00以降）をクリップ
+            if interval != "1d":
+                limit_hour = 15 if is_jp else 16
+                limit_time = datetime.strptime(f"{limit_hour}:00:00", "%H:%M:%S").time()
+                if db_max_date.time() > limit_time:
+                    db_max_date = db_max_date.replace(hour=limit_hour, minute=0, second=0, microsecond=0)
+            
             bm_last_date = get_benchmark_latest_date(interval, is_jp=is_jp)
             
             # 現在の比較状況をログに出力
