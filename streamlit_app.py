@@ -2007,18 +2007,25 @@ if selected_page == "スクリーニング":
                             i1, i2 = st.columns([1, 2])
                             if r['チャート']:
                                 try:
-                                    chart_df = pd.read_json(r['チャート'])
-                                    chart_df['date'] = pd.to_datetime(chart_df['date'])
-                                    with i1:
-                                        render_lwc_candle_mini(
-                                            chart_df,
-                                            sma_fast=chart_df.set_index('date')['sma50'],
-                                            sma_slow=chart_df.set_index('date')['sma200'],
-                                            key=f"sc_{r['コード']}_{i}_{j}",
-                                            height=180,
-                                        )
-                                except Exception:
-                                    pass
+                                    _raw = r['チャート']
+                                    # Google Sheets経由で読んだ場合に文字列が二重エスケープされることがあるため対処
+                                    if isinstance(_raw, str) and len(_raw) > 10:
+                                        chart_df = pd.read_json(_raw)
+                                        chart_df['date'] = pd.to_datetime(chart_df['date'])
+                                        chart_df = chart_df.sort_values('date').reset_index(drop=True)
+                                        _sma_fast = chart_df.set_index('date')['sma50'] if 'sma50' in chart_df.columns else None
+                                        _sma_slow = chart_df.set_index('date')['sma200'] if 'sma200' in chart_df.columns else None
+                                        _lwc_key = f"sc_{r['コード']}_{i}_{j}"
+                                        with i1:
+                                            render_lwc_candle_mini(
+                                                chart_df,
+                                                sma_fast=_sma_fast,
+                                                sma_slow=_sma_slow,
+                                                key=_lwc_key,
+                                                height=180,
+                                            )
+                                except Exception as _e:
+                                    i1.caption(f"⚠️ {_e}")
                             m1 = i2.columns(3)
                             m1[0].metric("現在値", f"¥{r['現在値']:,.1f}")
                             m1[1].metric("消灯目安", f"¥{r['消灯目安(安値)']:,.1f}")
