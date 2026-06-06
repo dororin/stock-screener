@@ -365,6 +365,10 @@ def repair_single_ticker_short_term_db(ticker: str, interval: str, is_jp: bool =
     symbol = get_download_symbol(pure_ticker, is_jp)
     now = datetime.now()
     
+    # 💡 【統合仕様適用】日足(1d)が選ばれた場合は、過去365日ではなく、全期間(period="max")のフル再構築へ誘導・統合します
+    if interval == "1d":
+        return rebuild_single_ticker_db(pure_ticker, is_jp=is_jp, interval="1d")
+        
     try:
         db_df = load_price_db(interval, is_jp=is_jp)
     except FileNotFoundError:
@@ -378,13 +382,12 @@ def repair_single_ticker_short_term_db(ticker: str, interval: str, is_jp: bool =
         start_date_dt = now - timedelta(days=58)
     elif interval == "60m":
         start_date_dt = now - timedelta(days=718)
-    elif interval == "1d":
-        start_date_dt = now - timedelta(days=365)
     else:
         start_date_dt = now - timedelta(days=7)
         
     try:
         print(f"📥 [{pure_ticker}] {interval} 修復用の新規データを取得中 ({start_date_dt.strftime('%Y-%m-%d')} ~)...")
+        # タイムゾーンのバグを回避するため、日付のみ(時分秒なし)で取得開始
         df_raw = yf.download(
             symbol,
             start=start_date_dt.strftime("%Y-%m-%d"),
@@ -410,8 +413,34 @@ def repair_single_ticker_short_term_db(ticker: str, interval: str, is_jp: bool =
             if not splits_active.empty:
                 S = splits_active.iloc[-1]
                 split_ratio = 1.0 / S
-                has_split = True
-                print(f"⚠️ [分割検知] 修復期間中に株式分割（分割比: {S}）を検知。既存の全蓄積データに遡及適用します (R = {split_ratio:.4f})")
+                
+                # 💡 【二重処理ガード】既存DB(old_df)と新データ(new_df)の同一日での価格比較
+                split_row = new_df[new_df["stock splits"] > 0]
+                split_row = split_row[split_row["stock splits"] != 1.0]
+                split_date = pd.to_datetime(split_row.iloc[-1]["date"])
+                
+                # 分割日前（split_dateより過去）のデータをそれぞれ抽出
+                t_old_pre = old_df[pd.to_datetime(old_df["date"]) < split_date] if not old_df.empty else pd.DataFrame()
+                t_new_pre = new_df[pd.to_datetime(new_df["date"]) < split_date]
+                
+                apply_split = True
+                if not t_old_pre.empty:
+                    # 共通して存在する過去の同一日時を探す
+                    common_dates = t_old_pre["date"].isin(t_new_pre["date"])
+                    if common_dates.any():
+                        last_common_date = t_old_pre[common_dates]["date"].max()
+                        
+                        price_db = t_old_pre[t_old_pre["date"] == last_common_date]["close"].iloc[-1]
+                        price_new = t_new_pre[t_new_pre["date"] == last_common_date]["close"].iloc[-1]
+                        
+                        # 💡 【ガード判定】DB内がすでに調整済みであれば、二重処理を回避
+                        if price_db <= (price_new * 1.1):
+                            apply_split = False
+                            print(f"ℹ️ [{pure_ticker}] {interval} データベースの過去データはすでに調整済みであることを確認しました。二重処理をスキップします。")
+                
+                if apply_split and not old_df.empty:
+                    has_split = True
+                    print(f"⚠️ [分割検知] 修復期間中に株式分割（分割比: {S}）を検知。既存の全蓄積データに遡及適用します (R = {split_ratio:.4f})")
                 
         if has_split and not old_df.empty:
             price_cols = ["open", "high", "low", "close"]
@@ -471,8 +500,35 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
             if not splits_active.empty:
                 S = splits_active.iloc[-1]
                 split_ratio = 1.0 / S
-                has_split = True
-                print(f"⚠️ [分割検知] Ticker {t}: 株式分割（{S}）が確認されました。過去データ全体に数学的自己調整を適用します (R = {split_ratio:.4f})")
+                
+                # 💡 【二重処理ガード】分割日前における、既存DB(t_old)と新データ(t_new)の同一日での価格比較
+                split_row = t_new[t_new["stock splits"] > 0]
+                split_row = split_row[split_row["stock splits"] != 1.0]
+                split_date = pd.to_datetime(split_row.iloc[-1]["date"])
+                
+                # 分割日前（split_dateより過去）のデータをそれぞれ抽出
+                t_old_pre = t_old[pd.to_datetime(t_old["date"]) < split_date]
+                t_new_pre = t_new[pd.to_datetime(t_new["date"]) < split_date]
+                
+                # 共通して存在する過去の同一日時スタンプを探す
+                common_dates = t_old_pre["date"].isin(t_new_pre["date"])
+                
+                apply_split = True
+                if common_dates.any():
+                    # 最も分割日に近い共通の過去日時を取得
+                    last_common_date = t_old_pre[common_dates]["date"].max()
+                    
+                    price_db = t_old_pre[t_old_pre["date"] == last_common_date]["close"].iloc[-1]
+                    price_new = t_new_pre[t_new_pre["date"] == last_common_date]["close"].iloc[-1]
+                    
+                    # 💡 【ガード判定】ローカル価格が新価格(調整後)とほぼ同じなら、すでに調整済みとみなす
+                    if price_db <= (price_new * 1.1):
+                        apply_split = False
+                        print(f"ℹ️ [{t}] {interval} データベースの過去データはすでに調整済みであることを確認しました。二重処理をスキップします。")
+                
+                if apply_split:
+                    has_split = True
+                    print(f"⚠️ [分割検知] Ticker {t}: 株式分割（{S}）が確認されました。過去データ全体に数学的自己調整を適用します (R = {split_ratio:.4f})")
                 
         if has_split:
             price_cols = ["open", "high", "low", "close"]
@@ -838,6 +894,11 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         if all_downloaded:
             new_combined = pd.concat(all_downloaded, ignore_index=True)
             if "date" in new_combined.columns:
+                # 💡 【分足確定判定の修正案適用】
+                # 日足・短期足に関わらず、データの「日付部分（dt.date）」が現在の日付（now.date()）より過去であれば確定(True)、
+                # 今日（当日分）であれば一律で未確定(False)と判定します。
+                # これにより、当日取得した不安定なデータは、翌日以降に必ず公式の綺麗な確定データでリフレッシュされます。
+                new_combined["is_finalized"] = new_combined["date"].dt.date < now.date()
                 if interval == "1d":
                     new_combined["is_finalized"] = new_combined["date"].dt.date < now.date()
                 else:
@@ -892,7 +953,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                 log(f"  🧊 トリガー再構築により、追加マージデータはありません。")
         else:
             log(f"  🧊 新規追加データはありませんでした。")
-            
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
@@ -999,33 +1060,68 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
         else:
             print(msg)
 
+    ticker_symbol = f"{ticker}.T" if is_jp and ticker.isdigit() else ticker
+    
+    # 💡 [二重処理ガード用] yfinanceから最新の正しい日足（調整後）を5日分だけ取得
+    try:
+        df_check = yf.download(ticker_symbol, period="5d", interval="1d", auto_adjust=True, progress=False)
+        if df_check.empty:
+            _log(f"  ⚠️ [{ticker}] 調整確認用の基準日足データを取得できませんでした。波及処理を中止します。")
+            return
+        check_dates = df_check.index
+    except Exception as e:
+        _log(f"  ⚠️ [{ticker}] 基準日足データ取得エラー: {e}")
+        return
+
     short_intervals = ["60m", "5m", "1m"]
     for interval in short_intervals:
         try:
-            # データベースファイルを一時ロード
             db_df = load_price_db(interval, is_jp=is_jp)
             if db_df.empty:
                 continue
             
             mask = db_df["ticker"] == ticker
-            if not db_df[mask].empty:
-                _log(f"  🔄 [{ticker}] {interval} データベースに事前分割調整を波及中 (ratio: {split_ratio:.4f})...")
+            ticker_db = db_df[mask].copy()
+            if ticker_db.empty:
+                continue
+            
+            ticker_db["date"] = pd.to_datetime(ticker_db["date"])
+            
+            # yfinanceの日足データと、短期足DBに共通して存在する「過去の日付」を特定
+            common_dates = ticker_db["date"].dt.date.isin(check_dates.date)
+            
+            apply_split = True
+            if common_dates.any():
+                last_common_dt = ticker_db[common_dates]["date"].max()
+                check_date_only = last_common_dt.date()
                 
+                # 短期足DB(db_df)の終値を取得
+                price_db = ticker_db[ticker_db["date"] == last_common_dt]["close"].iloc[-1]
+                
+                # 正確な日足(df_check)の調整後の価格を取得
+                matching_check_row = df_check[df_check.index.date == check_date_only]
+                if not matching_check_row.empty:
+                    price_real = matching_check_row["Close"].iloc[-1]
+                    
+                    # 💡 【ガード判定】DBの価格が実勢(調整後)とほぼ同じなら、波及調整をスキップ
+                    if price_db <= (price_real * 1.1):
+                        apply_split = False
+                        _log(f"  ℹ️ [{ticker}] {interval} データベースはすでに波及調整済みであることを確認しました。二重処理をスキップします。")
+            
+            if apply_split:
+                _log(f"  🔄 [{ticker}] {interval} データベースに事前分割調整を波及中 (ratio: {split_ratio:.4f})...")
                 # 4本値（価格）の調整
                 price_cols = ["open", "high", "low", "close"]
                 for col in price_cols:
                     if col in db_df.columns:
                         db_df.loc[mask, col] = db_df.loc[mask, col] * split_ratio
-                        
                 # 出来高（volume）の調整
                 if "volume" in db_df.columns:
                     db_df.loc[mask, "volume"] = db_df.loc[mask, "volume"] / split_ratio
                 
-                # 調整後の状態をデータベースに上書き保存
                 save_price_db(db_df, interval, is_jp=is_jp)
                 
         except FileNotFoundError:
-            # まだ該当時間足のファイルが作成されていない場合は無視して次に進みます
             pass
         except Exception as e:
             _log(f"  ⚠️ [{ticker}] {interval} への分割波及処理中にエラーが発生しました: {e}")
