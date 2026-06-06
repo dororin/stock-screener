@@ -20,6 +20,7 @@ from bs4 import BeautifulSoup
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import re
+from streamlit_lightweight_charts import renderLightweightCharts, Chart
 
 # =====================================================================
 # 📂 データベースを安全に一元管理する自作ライブラリをインポート
@@ -392,7 +393,7 @@ def run_fast_screening(db_df: pd.DataFrame) -> pd.DataFrame:
             if is_uptrend and is_wvf_lit and latest['wvf'] >= 5.0:
                 ext_price = min(max(latest['highest_close'] * (1 - latest['wvf_upper'] / 100), latest['highest_close'] * (1 - latest['range_high'] / 100)), latest['highest_close'] * (1 - 5.0 / 100))
                 results.append({
-                    'チャート': generate_mini_chart_base64(df),
+                    'チャート': df.tail(60)[['date','open','high','low','close','sma50','sma200']].to_json(orient='records', date_format='iso'),
                     'シグナル日': latest["date"].strftime('%Y-%m-%d'),
                     'コード': ticker,
                     '銘柄': name_map.get(ticker, "-"),
@@ -415,6 +416,171 @@ def run_fast_screening(db_df: pd.DataFrame) -> pd.DataFrame:
 # =====================================================================
 # グラフ生成・補助関数
 # =====================================================================
+
+# =====================================================================
+# 📊 Lightweight Charts 共通ヘルパー
+# =====================================================================
+
+def _lwc_base_options(height=160, right_offset=5):
+    """LWC共通レイアウトオプション"""
+    return {
+        "height": height,
+        "layout": {
+            "background": {"type": "solid", "color": "transparent"},
+            "textColor": "#9e9e9e",
+            "fontSize": 10,
+        },
+        "grid": {
+            "vertLines": {"color": "rgba(128,128,128,0.15)"},
+            "horzLines": {"color": "rgba(128,128,128,0.15)"},
+        },
+        "crosshair": {"mode": 1},
+        "rightPriceScale": {"borderColor": "rgba(128,128,128,0.3)", "scaleMargins": {"top": 0.08, "bottom": 0.05}},
+        "timeScale": {"borderColor": "rgba(128,128,128,0.3)", "rightOffset": right_offset, "timeVisible": True, "secondsVisible": False},
+        "handleScroll": False,
+        "handleScale": False,
+    }
+
+
+def _to_lwc_time(dt_index):
+    """DatetimeIndexをLWCのtime文字列（YYYY-MM-DD）リストに変換"""
+    return [str(d)[:10] for d in dt_index]
+
+
+def build_lwc_candle_chart(df, sma_fast=None, sma_slow=None, height=200, wvf_lit=None):
+    """
+    ローソク足＋SMA2本＋WVF背景帯のLWCチャート定義を生成する。
+    df: open/high/low/close/date カラムを持つDataFrame（直近N件をそのまま渡す）
+    sma_fast, sma_slow: pd.Series（任意）
+    wvf_lit: bool Series（任意）
+    """
+    if df is None or df.empty:
+        return None
+
+    df = df.copy()
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date")
+        times = _to_lwc_time(df["date"])
+    else:
+        times = _to_lwc_time(df.index)
+
+    # ローソク足データ
+    candle_data = [
+        {"time": t, "open": round(float(o), 2), "high": round(float(h), 2),
+         "low": round(float(l), 2), "close": round(float(c), 2)}
+        for t, o, h, l, c in zip(times, df["open"], df["high"], df["low"], df["close"])
+        if not any(pd.isna(v) for v in [o, h, l, c])
+    ]
+
+    series = [
+        {
+            "type": "Candlestick",
+            "data": candle_data,
+            "options": {
+                "upColor": "#26a69a", "downColor": "#ef5350",
+                "borderUpColor": "#26a69a", "borderDownColor": "#ef5350",
+                "wickUpColor": "#26a69a", "wickDownColor": "#ef5350",
+            },
+        }
+    ]
+
+    # SMA（速）
+    if sma_fast is not None and not sma_fast.dropna().empty:
+        sma_times = _to_lwc_time(sma_fast.index)
+        series.append({
+            "type": "Line",
+            "data": [{"time": t, "value": round(float(v), 2)}
+                     for t, v in zip(sma_times, sma_fast.values) if not pd.isna(v)],
+            "options": {"color": "#FFA726", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
+        })
+
+    # SMA（遅）
+    if sma_slow is not None and not sma_slow.dropna().empty:
+        sma_times = _to_lwc_time(sma_slow.index)
+        series.append({
+            "type": "Line",
+            "data": [{"time": t, "value": round(float(v), 2)}
+                     for t, v in zip(sma_times, sma_slow.values) if not pd.isna(v)],
+            "options": {"color": "#ef5350", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
+        })
+
+    return {"chart": _lwc_base_options(height=height), "series": series}
+
+
+def build_lwc_line_chart(price_series, sma_fast=None, sma_slow=None, wvf_lit=None, height=160):
+    """
+    折れ線（絶対価格）＋SMA2本＋WVF背景帯のLWCチャート定義を生成する。
+    price_series: pd.Series（index=DatetimeIndex, values=float）
+    """
+    if price_series is None or price_series.empty:
+        return None
+
+    times = _to_lwc_time(price_series.index)
+
+    # 価格ライン
+    price_data = [
+        {"time": t, "value": round(float(v), 2)}
+        for t, v in zip(times, price_series.values) if not pd.isna(v)
+    ]
+
+    series = [
+        {
+            "type": "Line",
+            "data": price_data,
+            "options": {
+                "color": "#42a5f5", "lineWidth": 2,
+                "priceLineVisible": False, "lastValueVisible": True,
+                "crosshairMarkerVisible": True,
+            },
+        }
+    ]
+
+    # SMA（速）
+    if sma_fast is not None and not sma_fast.dropna().empty:
+        ft = _to_lwc_time(sma_fast.index)
+        series.append({
+            "type": "Line",
+            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(ft, sma_fast.values) if not pd.isna(v)],
+            "options": {"color": "#FFA726", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
+        })
+
+    # SMA（遅）
+    if sma_slow is not None and not sma_slow.dropna().empty:
+        st2 = _to_lwc_time(sma_slow.index)
+        series.append({
+            "type": "Line",
+            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st2, sma_slow.values) if not pd.isna(v)],
+            "options": {"color": "#ef5350", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
+        })
+
+    return {"chart": _lwc_base_options(height=height), "series": series}
+
+
+def render_lwc_sector_mini(price_series, sma_fast=None, sma_slow=None, wvf_lit=None, key="lwc", height=160):
+    """セクターミニチャートをLWCでレンダリング"""
+    chart_def = build_lwc_line_chart(price_series, sma_fast=sma_fast, sma_slow=sma_slow, wvf_lit=wvf_lit, height=height)
+    if chart_def is None:
+        st.caption("データなし")
+        return
+    try:
+        renderLightweightCharts([chart_def], key=key)
+    except Exception as e:
+        st.caption(f"描画エラー: {e}")
+
+
+def render_lwc_candle_mini(df, sma_fast=None, sma_slow=None, key="lwc_candle", height=200):
+    """スクリーニングカード用ローソク足をLWCでレンダリング"""
+    chart_def = build_lwc_candle_chart(df, sma_fast=sma_fast, sma_slow=sma_slow, height=height)
+    if chart_def is None:
+        st.caption("データなし")
+        return
+    try:
+        renderLightweightCharts([chart_def], key=key)
+    except Exception as e:
+        st.caption(f"描画エラー: {e}")
+
+
 def generate_mini_chart_base64(df):
     try:
         plot_df = df.tail(60).copy().set_index("date")
@@ -1151,15 +1317,29 @@ def render_sector_rotation_page():
             badge = "🟢" if mom >= 3.0 else "🔴" if mom <= -3.0 else "⚪"
             color_theme = "#26a69a" if mom >= 3.0 else "#ef5350" if mom <= -3.0 else "#9e9e9e"
 
+            # 絶対値チャート用データを算出
+            try:
+                sec_abs, sma75, sma200, is_wvf_lit = compute_sector_absolute_data(db_df, tickers, period_days, resample_weekly)
+                wvf_active = bool(is_wvf_lit.iloc[-1]) if (is_wvf_lit is not None and not is_wvf_lit.empty) else False
+            except Exception:
+                sec_abs, sma75, sma200, is_wvf_lit = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool)
+                wvf_active = False
+
             with cols[col_i]:
                 with st.container(border=True):
                     hc1, hc2 = st.columns([3, 1])
-                    hc1.markdown(f"<span style='font-weight:600;color:{color_theme}'>{badge} {sname}</span>", unsafe_allow_html=True)
+                    wvf_badge = " <span style='color:#ef5350;font-weight:bold;'>🔥 押し目検出</span>" if wvf_active else ""
+                    hc1.markdown(
+                        f"<span style='font-weight:600;color:{color_theme}'>{badge} {sname}</span>{wvf_badge}",
+                        unsafe_allow_html=True
+                    )
                     hc2.metric("", f"{mom:+.2f}%", label_visibility="collapsed")
 
-                    idx_series = sector_index_cache.get(sname, pd.Series(dtype=float))
-                    if not idx_series.empty:
-                        st.plotly_chart(plot_sector_mini_chart(idx_series, sname, mom), use_container_width=True, key=f"mini_{sname}")
+                    if not sec_abs.empty:
+                        render_lwc_sector_mini(
+                            sec_abs, sma_fast=sma75, sma_slow=sma200,
+                            wvf_lit=is_wvf_lit, key=f"mini_{sname}", height=160
+                        )
                         st.caption(f"構成: {', '.join(tickers[:3])}...")
                     if st.button("詳細表示", key=f"detail_{sname}", use_container_width=True):
                         st.session_state.selected_sector = sname
@@ -1195,11 +1375,14 @@ def render_sector_rotation_page():
                             del st.session_state[CUSTOM_SECTOR_KEY][code]
                             st.rerun()
 
-                        if not single_series.empty:
-                            st.plotly_chart(
-                                plot_sector_mini_chart(single_series, f"{code} {name}", mom_single),
-                                use_container_width=True,
-                                key=f"watch_mini_{code}"
+                        try:
+                            w_abs, w_sma75, w_sma200, w_wvf_lit = compute_sector_absolute_data(db_df, [code], period_days, resample_weekly)
+                        except Exception:
+                            w_abs, w_sma75, w_sma200, w_wvf_lit = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool)
+                        if not w_abs.empty:
+                            render_lwc_sector_mini(
+                                w_abs, sma_fast=w_sma75, sma_slow=w_sma200,
+                                wvf_lit=w_wvf_lit, key=f"watch_mini_{code}", height=160
                             )
                         else:
                             st.caption("データなし")
@@ -1335,6 +1518,107 @@ def plot_sector_mini_chart(index_series, sector_name, momentum_pct):
         yaxis=dict(showticklabels=True, showgrid=True, gridcolor="rgba(128,128,128,0.2)", zeroline=False, tickfont=dict(size=9)),
     )
     return fig
+
+
+def compute_sector_absolute_data(db_df, tickers, period_days, resample_weekly):
+    """セクター絶対価格・75SMA・200SMA・WVFシグナルを一括算出して返す"""
+    if db_df.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool)
+    db_df = db_df.copy()
+    db_df["date"] = pd.to_datetime(db_df["date"]).dt.tz_localize(None)
+    end_date = db_df["date"].max()
+    fetch_start = end_date - timedelta(days=period_days + 365)
+    target_df = db_df[(db_df["date"] >= fetch_start) & (db_df["ticker"].isin(tickers))].copy()
+    if target_df.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool)
+
+    if resample_weekly:
+        target_df = target_df.set_index("date")
+        target_df = target_df.groupby("ticker").resample("W-FRI").agg({"close": "last"}).reset_index()
+
+    close_pivot = target_df.pivot_table(index="date", columns="ticker", values="close").sort_index()
+    sector_abs = close_pivot.mean(axis=1)
+
+    sma75  = sector_abs.rolling(window=75).mean()
+    sma200 = sector_abs.rolling(window=200).mean()
+
+    highest_close = sector_abs.rolling(window=11).max()
+    wvf = (highest_close - sector_abs) / highest_close * 100
+    wvf_std   = wvf.rolling(window=20).std(ddof=0)
+    wvf_mid   = wvf.rolling(window=20).mean()
+    wvf_upper = wvf_mid + (2.0 * wvf_std)
+    range_high = wvf.rolling(window=100).max() * 0.85
+    is_wvf_lit = (wvf >= wvf_upper) | (wvf >= range_high)
+
+    display_start = end_date - timedelta(days=period_days)
+    sector_abs = sector_abs[sector_abs.index >= display_start]
+    sma75      = sma75[sma75.index           >= display_start]
+    sma200     = sma200[sma200.index         >= display_start]
+    is_wvf_lit = is_wvf_lit[is_wvf_lit.index >= display_start]
+
+    return sector_abs, sma75, sma200, is_wvf_lit
+
+
+def plot_sector_absolute_mini_chart(sector_abs, sma75, sma200, is_wvf_lit, sector_name):
+    """絶対値ミニチャート（75SMA・200SMA・WVF背景帯付き）"""
+    if sector_abs is None or sector_abs.empty:
+        return go.Figure()
+
+    fig = go.Figure()
+
+    try:
+        if is_wvf_lit is not None and not is_wvf_lit.empty:
+            in_signal = False
+            sig_start = None
+            dates = is_wvf_lit.index.tolist()
+            vals  = is_wvf_lit.tolist()
+            for dt, lit in zip(dates, vals):
+                if lit and not in_signal:
+                    sig_start = dt
+                    in_signal = True
+                elif not lit and in_signal:
+                    fig.add_vrect(x0=sig_start, x1=dt,
+                        fillcolor="rgba(255,0,0,0.13)", layer="below", line_width=0)
+                    in_signal = False
+            if in_signal and sig_start is not None:
+                fig.add_vrect(x0=sig_start, x1=dates[-1],
+                    fillcolor="rgba(255,0,0,0.13)", layer="below", line_width=0)
+    except Exception:
+        pass
+
+    fig.add_trace(go.Scatter(
+        x=sector_abs.index, y=sector_abs.values,
+        mode="lines", name="価格",
+        line=dict(color="#42a5f5", width=1.8),
+        hovertemplate="%{x|%m/%d} 価格:%{y:,.1f}<extra></extra>",
+    ))
+
+    if sma75 is not None and not sma75.dropna().empty:
+        fig.add_trace(go.Scatter(
+            x=sma75.index, y=sma75.values,
+            mode="lines", name="75SMA",
+            line=dict(color="#FFA726", width=1.2),
+            hovertemplate="75SMA:%{y:,.1f}<extra></extra>",
+        ))
+
+    if sma200 is not None and not sma200.dropna().empty:
+        fig.add_trace(go.Scatter(
+            x=sma200.index, y=sma200.values,
+            mode="lines", name="200SMA",
+            line=dict(color="#ef5350", width=1.4),
+            hovertemplate="200SMA:%{y:,.1f}<extra></extra>",
+        ))
+
+    fig.update_layout(
+        height=155, margin=dict(l=5, r=5, t=5, b=5),
+        showlegend=False, hovermode="x unified",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        yaxis=dict(showticklabels=True, showgrid=True,
+            gridcolor="rgba(128,128,128,0.2)", zeroline=False, tickfont=dict(size=9)),
+    )
+    return fig
+
 
 def plot_sector_detail_chart(index_series, benchmark_series, sector_name, benchmark_label):
     fig = make_subplots(rows=2 if benchmark_series is not None and not benchmark_series.empty else 1,
@@ -1721,7 +2005,20 @@ if selected_page == "スクリーニング":
                             if c2.toggle("⭐", value=r['お気に入り'], key=f"f_{r['コード']}_{i+j}", label_visibility="collapsed") != r['お気に入り']:
                                 st.session_state.result_df.at[i + j, 'お気に入り'] = not r['お気に入り']
                             i1, i2 = st.columns([1, 2])
-                            if r['チャート']: i1.image(r['チャート'], use_container_width=True)
+                            if r['チャート']:
+                                try:
+                                    chart_df = pd.read_json(r['チャート'])
+                                    chart_df['date'] = pd.to_datetime(chart_df['date'])
+                                    with i1:
+                                        render_lwc_candle_mini(
+                                            chart_df,
+                                            sma_fast=chart_df.set_index('date')['sma50'],
+                                            sma_slow=chart_df.set_index('date')['sma200'],
+                                            key=f"sc_{r['コード']}_{i}_{j}",
+                                            height=180,
+                                        )
+                                except Exception:
+                                    pass
                             m1 = i2.columns(3)
                             m1[0].metric("現在値", f"¥{r['現在値']:,.1f}")
                             m1[1].metric("消灯目安", f"¥{r['消灯目安(安値)']:,.1f}")
