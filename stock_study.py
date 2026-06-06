@@ -28,7 +28,7 @@ if HAS_STREAMLIT:
         pass
 
 JPX_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
-TIMEFRAMES = ["1m", "5m", "60m", "1d"]
+TIMEFRAMES = ["1d", "60m", "5m", "1m"]
 
 # --- 環境判定とディレクトリ設定 ---
 def setup_directories():
@@ -780,7 +780,6 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                     continue
                 
                 # 💡 【改善】開始時刻は「日付のみ（%Y-%m-%d）」にして、yfinanceのタイムゾーンバグを完全に回避
-                # 1m足等でも前日の日付単位に切り下げるため、余白（バッファ）は自動的に日付として確保されます
                 start_date_str = start_date_dt.strftime("%Y-%m-%d")
                 log(f"  📥 既存銘柄 ({len(chunk_tickers)}件) を差分同期... (開始: {start_date_str} *yfinance安定化適用済み*)")
 
@@ -803,7 +802,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
 
                     df_raw = yf.download(
                         symbols, 
-                        start=start_date_str if t_last is not None else start_date_dt.strftime("%Y-%m-%d"), # 💡 短期足も含め、startには常に時分秒を付けず、日付のみを渡す
+                        start=start_date_str if t_last is not None else start_date_dt.strftime("%Y-%m-%d"),
                         interval=interval, 
                         auto_adjust=False, 
                         actions=True, 
@@ -830,7 +829,6 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                             err_sample = list(batch_errors.values())[0]
                             log(f"      ❌ APIエラーによりデータ取得失敗: {err_sample} (他 {len(batch_errors)-1}件の不具合)")
                         else:
-                            # 💡 日付単位で指定するため、「取引データなし」は基本発生せず、確実に差分が取得できるようになります。
                             log(f"      🧊 APIは正常応答しましたが、指定日（{start_date_str}）以降に新しい取引データがありませんでした（出来高0、または未生成）。")
                             
                 except Exception as e:
@@ -851,19 +849,33 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                 for ticker in new_combined["ticker"].unique():
                     t_new = new_combined[new_combined["ticker"] == ticker]
                     has_action = False
+                    has_split = False
+                    split_ratio = 1.0
                     
+                    # 1dデータより、有効な分割マークがあるか確認
                     if "stock splits" in t_new.columns:
                         splits_active = t_new["stock splits"].dropna()
-                        if not splits_active[(splits_active > 0) & (splits_active != 1.0)].empty:
+                        splits_active = splits_active[(splits_active > 0) & (splits_active != 1.0)]
+                        if not splits_active.empty:
+                            S = splits_active.iloc[-1]
+                            split_ratio = 1.0 / S
                             has_action = True
+                            has_split = True
                             
+                    # 配当金マークの確認
                     if "dividends" in t_new.columns:
                         divs_active = t_new["dividends"].dropna()
                         if not divs_active[divs_active > 0].empty:
                             has_action = True
                             
                     if has_action:
-                        log(f"🚨 [権利落ち自動トリガー発動] {ticker} に分割または配当を検知。過去全期間をフル再構築します。")
+                        # 💡 株式分割の場合のみ、他の短期足に先に価格調整を波及させる
+                        if has_split:
+                            log(f"🚨 [分割波及トリガー] {ticker} に株式分割（比: {1.0/split_ratio:.1f}）を検知。短期足DBを事前調整します。")
+                            propagate_split_to_other_timeframes(ticker, split_ratio, is_jp=is_jp, log_func=log)
+                            
+                        # 日足（1d）データベース自体のフル再構築を実行
+                        log(f"🚨 [権利落ち自動トリガー発動] {ticker} に分割または配当を検知。日足(1d)をフル再構築します。")
                         rebuild_success = rebuild_single_ticker_db(ticker, is_jp=is_jp, interval="1d")
                         if rebuild_success:
                             reset_tickers.append(ticker)
@@ -880,7 +892,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                 log(f"  🧊 トリガー再構築により、追加マージデータはありません。")
         else:
             log(f"  🧊 新規追加データはありませんでした。")
-                                
+            
 def main():
     import argparse
     parser = argparse.ArgumentParser()
@@ -975,3 +987,45 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d") -> bool:
         return True
     else:
         return False
+
+def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: bool = True, log_func=None):
+    """
+    日足で検知した株式分割の比率を、他の短期足（60m, 5m, 1m）の
+    データベースに事前に反映（価格調整・出来高調整）させる。
+    """
+    def _log(msg):
+        if log_func:
+            log_func(msg)
+        else:
+            print(msg)
+
+    short_intervals = ["60m", "5m", "1m"]
+    for interval in short_intervals:
+        try:
+            # データベースファイルを一時ロード
+            db_df = load_price_db(interval, is_jp=is_jp)
+            if db_df.empty:
+                continue
+            
+            mask = db_df["ticker"] == ticker
+            if not db_df[mask].empty:
+                _log(f"  🔄 [{ticker}] {interval} データベースに事前分割調整を波及中 (ratio: {split_ratio:.4f})...")
+                
+                # 4本値（価格）の調整
+                price_cols = ["open", "high", "low", "close"]
+                for col in price_cols:
+                    if col in db_df.columns:
+                        db_df.loc[mask, col] = db_df.loc[mask, col] * split_ratio
+                        
+                # 出来高（volume）の調整
+                if "volume" in db_df.columns:
+                    db_df.loc[mask, "volume"] = db_df.loc[mask, "volume"] / split_ratio
+                
+                # 調整後の状態をデータベースに上書き保存
+                save_price_db(db_df, interval, is_jp=is_jp)
+                
+        except FileNotFoundError:
+            # まだ該当時間足のファイルが作成されていない場合は無視して次に進みます
+            pass
+        except Exception as e:
+            _log(f"  ⚠️ [{ticker}] {interval} への分割波及処理中にエラーが発生しました: {e}")
