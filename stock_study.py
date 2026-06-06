@@ -640,9 +640,11 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             log(f"⚠️ スキップ: {e}")
             continue
 
-        # --- ベンチマーク先行比較（中略、既存通り） ---
+        # 💡 【スマートロジック：ベンチマーク先行比較（デバッグ情報付き）】
         db_max_date = db_df["date"].max() if not db_df.empty else None
+        
         if db_max_date is not None:
+            # 💡 【追加】DB最新時刻に対しても大引け後の時間外ノイズ（日本株15:00、米国株16:00以降）をクリップ
             if interval != "1d":
                 limit_hour = 15 if is_jp else 16
                 limit_time = datetime.strptime(f"{limit_hour}:00:00", "%H:%M:%S").time()
@@ -650,8 +652,12 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                     db_max_date = db_max_date.replace(hour=limit_hour, minute=0, second=0, microsecond=0)
             
             bm_last_date = get_benchmark_latest_date(interval, is_jp=is_jp)
+            
+            # 現在の比較状況をログに出力
             log(f"  🔍 [判定情報] ベンチマーク最新時刻: {bm_last_date} | DBの物理最新時刻: {db_max_date}")
+            
             if bm_last_date is not None:
+                # 比較：ベンチマークの最新時刻が、DBの物理的な最新時刻以下ならこの時間足は丸ごとスキップ
                 if bm_last_date <= db_max_date:
                     log(f"  ✨ 【同期スキップ】すでに最新状態（または休場・深夜）のため、同期処理をスキップします。")
                     continue
@@ -660,13 +666,13 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             else:
                 log(f"  ⚠️ ベンチマーク時刻の取得に失敗したため、安全のため通常の同期処理に移行します。")
 
-        # 各銘柄の物理的な最新日付を取得
+        # 各銘柄の物理的な最新日付を取得（未確定分も含む）
         last_updates_map = {}
         if not db_df.empty:
             last_updates_map = db_df.groupby("ticker")["date"].max().to_dict()
 
         # =====================================================================
-        # 💡 【新規実装】3レイヤー・バケットグループ化ロジック
+        # 💡 【アップデート】3レイヤー・バケットグループ化ロジック（未来ズレ対応）
         # =====================================================================
         
         # 1. 基準最新時刻（最頻値）の算出
@@ -686,6 +692,9 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         else: # "1d" (日足)
             max_delay = timedelta(days=10)
 
+        # 💡 【追加】未来へのズレを許容する誤差幅（例: 5分）
+        future_tolerance = timedelta(minutes=5)
+
         group_A_tickers = []  # 最新グループ（重複ゼロ）
         group_B_tickers = []  # 軽微な遅れグループ（最古一括化）
         group_C_tickers = []  # 例外・新規・大遅延グループ（個別隔離）
@@ -703,40 +712,43 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             
             if base_time is None:
                 group_C_tickers.append(t)
-            elif t_last_dt == base_time:
-                group_A_tickers.append(t)
             else:
                 delay = base_time - t_last_dt
-                # 0を超えて許容閾値内の遅れであればグループB、それ以外（未来、または大遅れ）はグループC
-                if timedelta(0) < delay <= max_delay:
+                
+                # 💡 【改善】基準より「5分以内」の未来に進んでいるズレは、最新（グループA）として吸収
+                if -future_tolerance <= delay <= timedelta(0):
+                    group_A_tickers.append(t)
+                elif timedelta(0) < delay <= max_delay:
+                    # 軽微な遅れ：グループB
                     group_B_tickers.append(t)
                     group_B_timestamps.append(t_last_dt)
                 else:
+                    # 5分を超える未来（データ異常）または 4時間を超える大遅延：グループC
                     group_C_tickers.append(t)
 
         # 4. 一括化・丸め処理を適用した最終グループ辞書の組み立て
         groups = {}
 
-        # 【グループA（最新）】そのまま登録
+        # 【グループA（最新）】
         if group_A_tickers:
             groups[base_time] = group_A_tickers
 
-        # 【グループB（軽微な遅れ）】最古タイムスタンプに揃えて「切り良い時間」に丸める
+        # 【グループB（軽微な遅れ）】
         if group_B_tickers and group_B_timestamps:
             oldest_b_time = min(group_B_timestamps)
             
-            # 時間足に応じたバケッティング（切り下げ丸め）
+            # 時間足に応じたバケッティング
             if interval in ["1m", "5m"]:
-                rounded_time = oldest_b_time.floor("30min")  # 30分単位に丸めて秒も00に
+                rounded_time = oldest_b_time.floor("30min")
             elif interval == "60m":
-                rounded_time = oldest_b_time.floor("h")      # 1時間単位に丸める
+                rounded_time = oldest_b_time.floor("h")
             else:
-                rounded_time = oldest_b_time.floor("D")      # 日付単位に丸める
+                rounded_time = oldest_b_time.floor("D")
                 
             groups[rounded_time] = group_B_tickers
             log(f"  📦 [一括化適用] 遅延{len(group_B_tickers)}銘柄を最古の丸め時刻 [{rounded_time}] に引き下げて1つのグループに統合しました。")
 
-        # 【グループC（例外・大遅延・新規上場）】個々の本来の開始日時のまま独立して登録
+        # 【グループC（例外・大遅延・新規上場）】
         for t in group_C_tickers:
             t_last = last_updates_map.get(t)
             t_key = pd.to_datetime(t_last) if t_last is not None else None
@@ -746,7 +758,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             log(f"  ⚠️ [個別隔離適用] 新規上場または極端な大遅延を持つ {len(group_C_tickers)} 銘柄を例外枠として個別同期リストに隔離しました。")
 
         # =====================================================================
-        # ダウンロード処理 (既存のループ処理がそのまま利用可能です)
+        # ダウンロード処理 (余白引き下げ、エラー分析、100バッチ対応版)
         # =====================================================================
         all_downloaded = []
 
@@ -760,22 +772,42 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                 else: start_date_dt = datetime(2020, 1, 1)
                 log(f"  📥 新規または再取得銘柄 ({len(chunk_tickers)}件) をフル同期... (開始: {start_date_dt.strftime('%Y-%m-%d')})")
             else:
-                # 既存銘柄：丸められた一括時刻、または個別の最新時刻
+                # 既存銘柄の同期
                 start_date_dt = t_last
                 
-                # 直近2分以内に同期された既存銘柄は除外
-                if interval != "1d" and (now - start_date_dt).total_seconds() < 120:
+                # 💡 【追加】yfinanceの空応答を防ぐため、開始日時を少し過去に引き下げる（既存差分のみ適用）
+                if interval == "1m":
+                    start_date_dt = start_date_dt - timedelta(minutes=30)  # 30分の余白
+                elif interval == "5m":
+                    start_date_dt = start_date_dt - timedelta(hours=2)     # 2時間の余白
+                elif interval == "60m":
+                    start_date_dt = start_date_dt - timedelta(hours=6)     # 6時間の余白
+                elif interval == "1d":
+                    start_date_dt = start_date_dt - timedelta(days=2)      # 2日の余白
+
+                # 直近2分以内に同期された既存銘柄は除外（余白引き下げ前の本来の t_last で判定）
+                if interval != "1d" and (now - t_last).total_seconds() < 120:
                     continue
                 
-                log(f"  📥 既存銘柄 ({len(chunk_tickers)}件) を差分同期... (開始: {start_date_dt.strftime('%Y-%m-%d %H:%M')})")
+                log(f"  📥 既存銘柄 ({len(chunk_tickers)}件) を差分同期... (開始: {start_date_dt.strftime('%Y-%m-%d %H:%M')} *余白適用済み*)")
 
-            # バッチサイズごとに分割して一括ダウンロード
-            BATCH_SIZE = 50
+            # 💡 【修正】100銘柄ごとに拡大してバッチ一括ダウンロード
+            BATCH_SIZE = 100
             for i in range(0, len(chunk_tickers), BATCH_SIZE):
                 chunk = chunk_tickers[i:i+BATCH_SIZE]
                 log(f"    -> {interval}: {i}/{len(chunk_tickers)} 銘柄ダウンロード中...")
                 symbols = [f"{t}{suffix}" for t in chunk]
                 try:
+                    # 💡 【追加】エラー判別の準備。過去のエラーログをこのバッチ分だけ一旦リセット
+                    batch_errors = {}
+                    try:
+                        import yfinance.shared as yf_shared
+                        for sym in symbols:
+                            if hasattr(yf_shared, "_ERRORS") and sym in yf_shared._ERRORS:
+                                del yf_shared._ERRORS[sym]
+                    except Exception:
+                        pass
+
                     df_raw = yf.download(
                         symbols, 
                         start=start_date_dt.strftime("%Y-%m-%d") if interval == "1d" else start_date_dt.strftime("%Y-%m-%d %H:%M:%S"),
@@ -786,15 +818,75 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                         threads=True, 
                         timeout=30
                     )
+                    
+                    # 💡 【追加】ダウンロード直後のエラー情報の回収
+                    try:
+                        import yfinance.shared as yf_shared
+                        if hasattr(yf_shared, "_ERRORS"):
+                            batch_errors = {sym: yf_shared._ERRORS[sym] for sym in symbols if sym in yf_shared._ERRORS}
+                    except Exception:
+                        pass
+
                     chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
+                    
                     if not chunk_processed.empty:
                         all_downloaded.append(chunk_processed)
+                    else:
+                        # 💡 【追加】取得できなかった原因の判別ログ出力
+                        if batch_errors:
+                            err_sample = list(batch_errors.values())[0]
+                            log(f"      ❌ APIエラーによりデータ取得失敗: {err_sample} (他 {len(batch_errors)-1}件の不具合)")
+                        else:
+                            log(f"      🧊 APIは正常応答しましたが、取得対象期間（{start_date_dt.strftime('%H:%M')}以降）に新しい取引データがありませんでした（出来高0、または未生成）。")
+                            
                 except Exception as e:
                     log(f"     Batch Error: {e}")
                 time.sleep(1)
 
-        # (中略: マージ・権利落ち自動トリガー・保存処理等、既存通り)
-        
+        if all_downloaded:
+            new_combined = pd.concat(all_downloaded, ignore_index=True)
+            if "date" in new_combined.columns:
+                if interval == "1d":
+                    new_combined["is_finalized"] = new_combined["date"].dt.date < now.date()
+                else:
+                    new_combined["is_finalized"] = new_combined["date"] < (now - timedelta(hours=1))
+            
+            # --- 権利落ち自動トリガー（日足 1d のみ適用） ---
+            reset_tickers = []
+            if interval == "1d":
+                for ticker in new_combined["ticker"].unique():
+                    t_new = new_combined[new_combined["ticker"] == ticker]
+                    has_action = False
+                    
+                    if "stock splits" in t_new.columns:
+                        splits_active = t_new["stock splits"].dropna()
+                        if not splits_active[(splits_active > 0) & (splits_active != 1.0)].empty:
+                            has_action = True
+                            
+                    if "dividends" in t_new.columns:
+                        divs_active = t_new["dividends"].dropna()
+                        if not divs_active[divs_active > 0].empty:
+                            has_action = True
+                            
+                    if has_action:
+                        log(f"🚨 [権利落ち自動トリガー発動] {ticker} に分割または配当を検知。過去全期間をフル再構築します。")
+                        rebuild_success = rebuild_single_ticker_db(ticker, is_jp=is_jp, interval="1d")
+                        if rebuild_success:
+                            reset_tickers.append(ticker)
+                            
+                if reset_tickers:
+                    new_combined = new_combined[~new_combined["ticker"].isin(reset_tickers)]
+                    db_df = load_price_db(interval, is_jp=is_jp)
+            
+            if not new_combined.empty:
+                db_df = merge_price_data(db_df, new_combined, interval, is_jp=is_jp)
+                save_price_db(db_df, interval, is_jp=is_jp)
+                log(f"  ✅ {interval} データベースの更新を完了し、保存しました。")
+            else:
+                log(f"  🧊 トリガー再構築により、追加マージデータはありません。")
+        else:
+            log(f"  🧊 新規追加データはありませんでした。")
+                    
 def main():
     import argparse
     parser = argparse.ArgumentParser()
