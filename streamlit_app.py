@@ -2010,7 +2010,7 @@ if selected_page == "スクリーニング":
                                     _raw = r['チャート']
                                     # Google Sheets経由で読んだ場合に文字列が二重エスケープされることがあるため対処
                                     if isinstance(_raw, str) and len(_raw) > 10:
-                                        chart_df = pd.read_json(_raw)
+                                        chart_df = pd.read_json(io.StringIO(_raw))
                                         chart_df['date'] = pd.to_datetime(chart_df['date'])
                                         chart_df = chart_df.sort_values('date').reset_index(drop=True)
                                         _sma_fast = chart_df.set_index('date')['sma50'] if 'sma50' in chart_df.columns else None
