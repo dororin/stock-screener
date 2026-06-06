@@ -1111,21 +1111,66 @@ def get_sector_momentum(index_series, days=5):
     return float((recent.iloc[-1] / recent.iloc[0] - 1) * 100)
 
 @st.cache_data(ttl=600)
+@st.cache_data(ttl=600)
 def get_benchmark_data(ticker, period_days, interval):
     try:
+        # --- 1. ローカルの修正済み Parquet データベースに存在するか優先確認 ---
+        is_jp = False
+        pure_ticker = str(ticker).strip()
+        if pure_ticker.upper().endswith(".T"):
+            pure_ticker = pure_ticker[:-2]
+            is_jp = True
+        elif pure_ticker.isdigit():
+            is_jp = True
+            
+        db_df = load_unified_db(interval, is_jp=is_jp)
+        if not db_df.empty and "ticker" in db_df.columns:
+            # データベース内に対象ティッカーが存在するかスキャン
+            ticker_db = db_df[db_df["ticker"] == pure_ticker].copy()
+            if not ticker_db.empty and len(ticker_db) >= 10:
+                ticker_db["date"] = pd.to_datetime(ticker_db["date"]).dt.tz_localize(None)
+                end_date = ticker_db["date"].max()
+                # 累積基準のために、指定期間より余裕を持って過去から切り出す
+                start_date = end_date - timedelta(days=period_days + 365)
+                ticker_db = ticker_db[ticker_db["date"] >= start_date].sort_values("date")
+                
+                if not ticker_db.empty:
+                    close = ticker_db.set_index("date")["close"]
+                    ret = close.pct_change()
+                    idx = (1 + ret).cumprod() * 100
+                    if len(idx) > 0: 
+                        idx.iloc[0] = 100.0
+                    return idx
+
+        # --- 2. データベースに存在しない場合は yfinance から直接ダウンロード ---
         end = datetime.now()
         start = end - timedelta(days=period_days + 365)
         df_raw = yf.download(ticker, start=start.strftime("%Y-%m-%d"), interval=interval, auto_adjust=True, progress=False)
-        if df_raw.empty: return pd.Series(dtype=float)
+        if df_raw.empty: 
+            return pd.Series(dtype=float)
+        
         df_raw = df_raw.reset_index()
         df_raw.columns = [str(c).lower() if not isinstance(c, tuple) else str(c[0]).lower() for c in df_raw.columns]
         date_col = "date" if "date" in df_raw.columns else "datetime"
         df_raw = df_raw.rename(columns={date_col: "date"})
         df_raw["date"] = pd.to_datetime(df_raw["date"]).dt.tz_localize(None)
-        close = df_raw.set_index("date")["close"]
-        ret = close.pct_change()
+        close = df_raw.set_index("date")["close"].copy()
+        
+        # 💡 [急落防衛ロジック] 未調整の分割などの急落（40%以上）を検知して累積リターンの崩れを防ぐ
+        if len(close) > 1:
+            raw_pct = close.pct_change().copy()
+            anomaly_mask = raw_pct <= -0.40  # 40%以上の急落
+            if anomaly_mask.any():
+                for idx_loc in raw_pct[anomaly_mask].index:
+                    # 累積計算へのノイズを抑えるため、見かけ上の分割日リターンを一時的に 0% に書き換える
+                    raw_pct.loc[idx_loc] = 0.0
+            ret = raw_pct
+        else:
+            ret = close.pct_change()
+            
         idx = (1 + ret).cumprod() * 100
-        if len(idx) > 0: idx.iloc[0] = 100.0
+        if len(idx) > 0: 
+            idx.iloc[0] = 100.0
         return idx
     except Exception:
         return pd.Series(dtype=float)
