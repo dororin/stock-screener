@@ -1304,39 +1304,59 @@ if selected_page == "データ管理・保守":
                     
     st.divider()
     
-    # 【セクション3】手動ピンポイント部分修復（短期足・日足未満すべてに対応）
-    st.subheader("3️⃣ 手動ピンポイント部分修復（短期足・日足未満すべてに対応）")
+# 【セクション3】手動ピンポイント一括安全修復
+    st.subheader("3️⃣ 手動ピンポイント一括安全修復")
     st.write(
-        "特定の分足や1時間足（および日足）において、データの欠損やズレが発生した場合の治療セクションです。"
-        "既存の古い蓄積データを破壊することなく、yfinanceから取得制限範囲の最大データを落とし、"
-        "**「日時スタンプ完全一致方式による重複排除マージ」**により、重なる期間だけを正確に書き換えます。"
-        "治療期間内に株式分割（Splits）を検知した場合は、古いデータに自動で比率を掛けて遡及調整します。"
+        "特定の銘柄においてデータの欠損や分割による不整合が発生した場合、既存の古い蓄積データを破壊することなく、"
+        "すべての時間足（1d, 60m, 5m, 1m）に対して一括で重複排除マージ治療を実行します。"
+        "治療期間内に40%以上の急落ギャップを検知した場合は自動で逆算調整します。"
     )
     
-    rep_col1, rep_col2, rep_col3 = st.columns([2, 1, 1])
+    # 列数を調整して、時間足選択を廃止し、代わりに比率入力欄を設置します
+    rep_col1, rep_col2, rep_col3 = st.columns([3, 2, 1])
     with rep_col1:
-        rep_ticker = st.text_input("安全修復を実行する銘柄コードを入力してください", placeholder="例: 7203 や AAPL", key="rep_ticker_box")
+        rep_ticker = st.text_input("安全一括修復を実行する銘柄コードを入力してください", placeholder="例: 1306 や AAPL", key="rep_ticker_box")
     with rep_col2:
-        rep_interval = st.selectbox("対象の時間足（修復するデータベース）", ["1m", "5m", "60m", "1d"], index=2, key="rep_interval_box")
+        rep_ratio_str = st.text_input("強制分割比率 (空欄なら自動検知)", placeholder="例: 10.0 や 5.0", key="rep_ratio_box")
     with rep_col3:
         st.write(" ")
         st.write(" ")
-        btn_repair = st.button("🔧 安全修復を実行", use_container_width=True)
+        btn_repair = st.button("🔧 安全一括修復を実行", use_container_width=True)
         
     if btn_repair:
         if not rep_ticker:
             st.error("銘柄コードが入力されていません。")
         else:
             pure_t = stock_study.sanitize_ticker(rep_ticker, is_jp=is_jp)
-            with st.spinner(f"🔧 [{pure_t}] の {rep_interval} データベースをピンポイント修復マージ中..."):
-                success = stock_study.repair_single_ticker_short_term_db(pure_t, interval=rep_interval, is_jp=is_jp)
-                if success:
-                    get_db_last_update.clear()
-                    load_unified_db.clear()
-                    st.success(f"✅ [{pure_t}] の {rep_interval} データベースの修復に成功しました！")
-                else:
-                    st.error(f"❌ [{pure_t}] の修復処理を実行できませんでした。")
-    st.divider()
+            
+            # 入力された比率文字列を float に変換
+            forced_ratio = None
+            if rep_ratio_str.strip():
+                try:
+                    forced_ratio = float(rep_ratio_str.strip())
+                except ValueError:
+                    st.error("比率は有効な数字（例: 10.0）で入力してください。")
+                    st.stop()
+            
+            with st.spinner(f"🔧 [{pure_t}] の全時間足（1d, 60m, 5m, 1m）を一括修復マージ中..."):
+                # 新しく追加した一括修復関数を呼び出し、結果（辞書型）を取得
+                results = stock_study.repair_single_ticker_all_timeframes(
+                    pure_t, 
+                    is_jp=is_jp, 
+                    forced_split_ratio=forced_ratio
+                )
+                
+                # 画面更新用にキャッシュをクリア
+                get_db_last_update.clear()
+                load_unified_db.clear()
+                
+                # 各時間足の修復結果をレポート表示
+                st.write("### 📋 修復完了レポート:")
+                for interval, msg in results.items():
+                    if "修復成功" in msg:
+                        st.success(f"**{interval}**: {msg}")
+                    else:
+                        st.warning(f"**{interval}**: {msg}")
         
     # 【セクション4】 全件一括フルダウンロード・再構築（初期化・白紙復旧用）
     st.subheader("4️⃣ 全件一括フルダウンロード・再構築（初期化・デバッグ用）")
