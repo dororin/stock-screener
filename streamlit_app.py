@@ -1041,31 +1041,67 @@ def render_sector_rotation_page():
         if selected_sectors:
             fig_rs = go.Figure()
 
-            for sname in selected_sectors:
+            # Plotlyのデフォルトカラーサイクル（トレース順に対応）
+            PLOTLY_COLORS = [
+                "#636efa", "#EF553B", "#00cc96", "#ab63fa", "#FFA15A",
+                "#19d3f3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52",
+            ]
+
+            trace_info = []  # (sname, last_pct, color) を収集してアノテーション用に使う
+
+            for i, sname in enumerate(selected_sectors):
                 series = sector_index_cache.get(sname)
                 if series is None or series.empty:
                     continue
                 try:
+                    # 0基準に変換（元データは100基準なので -100 する）
+                    y_vals = series.values - 100.0
+                    color = PLOTLY_COLORS[i % len(PLOTLY_COLORS)]
+                    last_pct = float(y_vals[-1])
+
                     fig_rs.add_trace(go.Scatter(
                         x=series.index,
-                        y=series.values,
+                        y=y_vals,
                         mode="lines",
                         name=sname,
-                        hovertemplate=f"<b>{sname}</b>: %{{y:.2f}}<extra></extra>"
+                        line=dict(color=color, width=2),
+                        hovertemplate=f"<b>{sname}</b>: %{{y:+.2f}}%<extra></extra>"
                     ))
+                    trace_info.append((sname, last_pct, color))
                 except Exception:
                     pass
 
-            # Y=100 基準線
+            # Y=0 基準線
             fig_rs.add_hline(
-                y=100,
+                y=0,
                 line_dash="dash",
                 line_color="rgba(150,150,150,0.6)",
                 line_width=1.5,
-                annotation_text="ベンチマーク基準 (100)",
-                annotation_position="bottom right",
-                annotation_font_size=11,
-                annotation_font_color="gray"
+            )
+
+            # 左上に騰落率アノテーションをまとめて表示
+            # 騰落率順（降順）で並べる
+            trace_info_sorted = sorted(trace_info, key=lambda x: x[1], reverse=True)
+            annotation_lines = []
+            for sname, pct, color in trace_info_sorted:
+                sign = "+" if pct >= 0 else ""
+                annotation_lines.append(
+                    f"<span style='color:{color}'>■</span> {sname}: <b>{sign}{pct:.2f}%</b>"
+                )
+            annotation_html = "<br>".join(annotation_lines)
+
+            fig_rs.add_annotation(
+                xref="paper", yref="paper",
+                x=0.01, y=0.99,
+                xanchor="left", yanchor="top",
+                text=annotation_html,
+                showarrow=False,
+                align="left",
+                bgcolor="rgba(255,255,255,0.85)",
+                bordercolor="rgba(180,180,180,0.6)",
+                borderwidth=1,
+                borderpad=6,
+                font=dict(size=11),
             )
 
             fig_rs.update_layout(
@@ -1083,10 +1119,13 @@ def render_sector_rotation_page():
                 ),
                 xaxis=dict(title="日付", showgrid=True, gridcolor="rgba(200,200,200,0.3)"),
                 yaxis=dict(
-                    title="相対強度（期間開始=100）",
+                    title="相対騰落率（期間開始=0%）",
+                    ticksuffix="%",
                     showgrid=True,
                     gridcolor="rgba(200,200,200,0.3)",
-                    zeroline=False
+                    zeroline=True,
+                    zerolinecolor="rgba(150,150,150,0.4)",
+                    zerolinewidth=1,
                 )
             )
 
