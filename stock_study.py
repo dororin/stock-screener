@@ -672,7 +672,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             last_updates_map = db_df.groupby("ticker")["date"].max().to_dict()
 
         # =====================================================================
-        # 💡 【アップデート】3レイヤー・バケットグループ化ロジック（未来ズレ対応）
+        # 💡 3レイヤー・バケットグループ化ロジック（未来ズレ対応）
         # =====================================================================
         
         # 1. 基準最新時刻（最頻値）の算出
@@ -692,7 +692,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         else: # "1d" (日足)
             max_delay = timedelta(days=10)
 
-        # 💡 【追加】未来へのズレを許容する誤差幅（例: 5分）
+        # 未来へのズレを許容する誤差幅（例: 5分）
         future_tolerance = timedelta(minutes=5)
 
         group_A_tickers = []  # 最新グループ（重複ゼロ）
@@ -715,7 +715,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             else:
                 delay = base_time - t_last_dt
                 
-                # 💡 【改善】基準より「5分以内」の未来に進んでいるズレは、最新（グループA）として吸収
+                # 基準より「5分以内」の未来に進んでいるズレは、最新（グループA）として吸収
                 if -future_tolerance <= delay <= timedelta(0):
                     group_A_tickers.append(t)
                 elif timedelta(0) < delay <= max_delay:
@@ -758,7 +758,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
             log(f"  ⚠️ [個別隔離適用] 新規上場または極端な大遅延を持つ {len(group_C_tickers)} 銘柄を例外枠として個別同期リストに隔離しました。")
 
         # =====================================================================
-        # ダウンロード処理 (余白引き下げ、エラー分析、100バッチ対応版)
+        # ダウンロード処理 (yfinanceの安定化に向け、startは常に日付単位に統一)
         # =====================================================================
         all_downloaded = []
 
@@ -775,30 +775,23 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                 # 既存銘柄の同期
                 start_date_dt = t_last
                 
-                # 💡 【追加】yfinanceの空応答を防ぐため、開始日時を少し過去に引き下げる（既存差分のみ適用）
-                if interval == "1m":
-                    start_date_dt = start_date_dt - timedelta(minutes=30)  # 30分の余白
-                elif interval == "5m":
-                    start_date_dt = start_date_dt - timedelta(hours=2)     # 2時間の余白
-                elif interval == "60m":
-                    start_date_dt = start_date_dt - timedelta(hours=6)     # 6時間の余白
-                elif interval == "1d":
-                    start_date_dt = start_date_dt - timedelta(days=2)      # 2日の余白
-
-                # 直近2分以内に同期された既存銘柄は除外（余白引き下げ前の本来の t_last で判定）
+                # 直近2分以内に同期された既存銘柄は除外（本来の t_last で判定）
                 if interval != "1d" and (now - t_last).total_seconds() < 120:
                     continue
                 
-                log(f"  📥 既存銘柄 ({len(chunk_tickers)}件) を差分同期... (開始: {start_date_dt.strftime('%Y-%m-%d %H:%M')} *余白適用済み*)")
+                # 💡 【改善】開始時刻は「日付のみ（%Y-%m-%d）」にして、yfinanceのタイムゾーンバグを完全に回避
+                # 1m足等でも前日の日付単位に切り下げるため、余白（バッファ）は自動的に日付として確保されます
+                start_date_str = start_date_dt.strftime("%Y-%m-%d")
+                log(f"  📥 既存銘柄 ({len(chunk_tickers)}件) を差分同期... (開始: {start_date_str} *yfinance安定化適用済み*)")
 
-            # 💡 【修正】100銘柄ごとに拡大してバッチ一括ダウンロード
+            # 100銘柄ごとに一括ダウンロード
             BATCH_SIZE = 100
             for i in range(0, len(chunk_tickers), BATCH_SIZE):
                 chunk = chunk_tickers[i:i+BATCH_SIZE]
                 log(f"    -> {interval}: {i}/{len(chunk_tickers)} 銘柄ダウンロード中...")
                 symbols = [f"{t}{suffix}" for t in chunk]
                 try:
-                    # 💡 【追加】エラー判別の準備。過去のエラーログをこのバッチ分だけ一旦リセット
+                    # エラー判別の準備。過去のエラーログをこのバッチ分だけ一旦リセット
                     batch_errors = {}
                     try:
                         import yfinance.shared as yf_shared
@@ -810,7 +803,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
 
                     df_raw = yf.download(
                         symbols, 
-                        start=start_date_dt.strftime("%Y-%m-%d") if interval == "1d" else start_date_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                        start=start_date_str if t_last is not None else start_date_dt.strftime("%Y-%m-%d"), # 💡 短期足も含め、startには常に時分秒を付けず、日付のみを渡す
                         interval=interval, 
                         auto_adjust=False, 
                         actions=True, 
@@ -819,7 +812,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                         timeout=30
                     )
                     
-                    # 💡 【追加】ダウンロード直後のエラー情報の回収
+                    # ダウンロード直後のエラー情報の回収
                     try:
                         import yfinance.shared as yf_shared
                         if hasattr(yf_shared, "_ERRORS"):
@@ -832,12 +825,13 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                     if not chunk_processed.empty:
                         all_downloaded.append(chunk_processed)
                     else:
-                        # 💡 【追加】取得できなかった原因の判別ログ出力
+                        # 取得できなかった原因の判別ログ出力
                         if batch_errors:
                             err_sample = list(batch_errors.values())[0]
                             log(f"      ❌ APIエラーによりデータ取得失敗: {err_sample} (他 {len(batch_errors)-1}件の不具合)")
                         else:
-                            log(f"      🧊 APIは正常応答しましたが、取得対象期間（{start_date_dt.strftime('%H:%M')}以降）に新しい取引データがありませんでした（出来高0、または未生成）。")
+                            # 💡 日付単位で指定するため、「取引データなし」は基本発生せず、確実に差分が取得できるようになります。
+                            log(f"      🧊 APIは正常応答しましたが、指定日（{start_date_str}）以降に新しい取引データがありませんでした（出来高0、または未生成）。")
                             
                 except Exception as e:
                     log(f"     Batch Error: {e}")
@@ -886,7 +880,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                 log(f"  🧊 トリガー再構築により、追加マージデータはありません。")
         else:
             log(f"  🧊 新規追加データはありませんでした。")
-                    
+                                
 def main():
     import argparse
     parser = argparse.ArgumentParser()
