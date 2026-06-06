@@ -1097,8 +1097,8 @@ def render_sector_rotation_page():
                 text=annotation_html,
                 showarrow=False,
                 align="left",
-                bgcolor="rgba(255,255,255,0.85)",
-                bordercolor="rgba(180,180,180,0.6)",
+                bgcolor="rgba(0,0,0,0)",
+                bordercolor="rgba(150,150,150,0.3)",
                 borderwidth=1,
                 borderpad=6,
                 font=dict(size=11),
@@ -1117,7 +1117,7 @@ def render_sector_rotation_page():
                     x=1,
                     font=dict(size=11)
                 ),
-                xaxis=dict(title="日付", showgrid=True, gridcolor="rgba(200,200,200,0.3)"),
+                xaxis=dict(title="日付", showgrid=True, gridcolor="rgba(200,200,200,0.3)", tickformat="%m/%d", dtick=7*24*60*60*1000, tickangle=-45),
                 yaxis=dict(
                     title="相対騰落率（期間開始=0%）",
                     ticksuffix="%",
