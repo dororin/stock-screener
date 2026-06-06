@@ -1004,6 +1004,98 @@ def render_sector_rotation_page():
             with rank_cols[i+3]: st.metric(f"🔴 #{len(sorted_sectors)-2+i}", sname, f"{mom:+.2f}%")
         st.divider()
 
+    # =========================================================
+    # 📊 セクター相対強度（RS）重ね合わせ比較チャート
+    # =========================================================
+    if sector_index_cache:
+        st.markdown("### 📊 セクター相対強度（RS）重ね合わせ比較（リベース表示）")
+
+        # 期間累積リターン（最終値 - 100）でセクターをランク付け
+        sector_returns = {}
+        for sname, series in sector_index_cache.items():
+            if series is not None and not series.empty and len(series) >= 1:
+                try:
+                    sector_returns[sname] = float(series.iloc[-1]) - 100.0
+                except Exception:
+                    pass
+
+        all_sector_names = list(sector_index_cache.keys())
+
+        if sector_returns:
+            sorted_by_return = sorted(sector_returns.items(), key=lambda x: x[1], reverse=True)
+            top3 = [s for s, _ in sorted_by_return[:3]]
+            bottom3 = [s for s, _ in sorted_by_return[-3:]]
+            # 重複排除（セクター数が少ない場合）
+            default_selected = list(dict.fromkeys(top3 + bottom3))
+        else:
+            default_selected = all_sector_names[:min(6, len(all_sector_names))]
+
+        selected_sectors = st.multiselect(
+            "表示するセクターを選択（初期値：上位3＋下位3）",
+            options=all_sector_names,
+            default=default_selected,
+            key="rs_overlay_multiselect",
+            help="上位3セクター（強気）と下位3セクター（弱気）が自動選出されています。自由に追加・削除できます。"
+        )
+
+        if selected_sectors:
+            fig_rs = go.Figure()
+
+            for sname in selected_sectors:
+                series = sector_index_cache.get(sname)
+                if series is None or series.empty:
+                    continue
+                try:
+                    fig_rs.add_trace(go.Scatter(
+                        x=series.index,
+                        y=series.values,
+                        mode="lines",
+                        name=sname,
+                        hovertemplate=f"<b>{sname}</b>: %{{y:.2f}}<extra></extra>"
+                    ))
+                except Exception:
+                    pass
+
+            # Y=100 基準線
+            fig_rs.add_hline(
+                y=100,
+                line_dash="dash",
+                line_color="rgba(150,150,150,0.6)",
+                line_width=1.5,
+                annotation_text="ベンチマーク基準 (100)",
+                annotation_position="bottom right",
+                annotation_font_size=11,
+                annotation_font_color="gray"
+            )
+
+            fig_rs.update_layout(
+                template="plotly_white",
+                height=450,
+                hovermode="x unified",
+                margin=dict(l=20, r=20, t=40, b=40),
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="right",
+                    x=1,
+                    font=dict(size=11)
+                ),
+                xaxis=dict(title="日付", showgrid=True, gridcolor="rgba(200,200,200,0.3)"),
+                yaxis=dict(
+                    title="相対強度（期間開始=100）",
+                    showgrid=True,
+                    gridcolor="rgba(200,200,200,0.3)",
+                    zeroline=False
+                )
+            )
+
+            st.plotly_chart(fig_rs, use_container_width=True)
+        else:
+            st.info("セクターを1つ以上選択すると、RS重ね合わせチャートが表示されます。")
+
+        st.divider()
+
     st.markdown(f"### 📈 セクターミニチャート（{period_label} / {tf_label}）")
     sector_list = list(sectors.items())
     rows_needed = (len(sector_list) + n_cols - 1) // n_cols
