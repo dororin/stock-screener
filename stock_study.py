@@ -360,123 +360,86 @@ def rebuild_single_ticker_db(ticker: str, is_jp: bool = True, interval: str = "1
         print(f"❌ [{pure_ticker}] フル再構築中にエラーが発生しました: {e}")
         return False
 
-def repair_single_ticker_short_term_db(ticker: str, interval: str, is_jp: bool = True) -> bool:
+def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_split_ratio: float = None) -> dict:
+    """
+    指定された銘柄について、全時間足（1d, 60m, 5m, 1m）のデータベースを
+    自動ギャップ検知（または手動指定比率）を適用しながら一括修復マージします。
+    """
     pure_ticker = sanitize_ticker(ticker, is_jp)
     symbol = get_download_symbol(pure_ticker, is_jp)
     now = datetime.now()
+    results = {}
     
-    # 💡 【統合仕様適用】日足(1d)が選ばれた場合は、過去365日ではなく、全期間(period="max")のフル再構築へ誘導・統合します
-    if interval == "1d":
-        return rebuild_single_ticker_db(pure_ticker, is_jp=is_jp, interval="1d")
+    # 4つの時間足をループ処理
+    for interval in ["1d", "60m", "5m", "1m"]:
+        try:
+            db_df = load_price_db(interval, is_jp=is_jp)
+        except FileNotFoundError:
+            db_df = pd.DataFrame()
+            
+        old_df = db_df[db_df["ticker"] == pure_ticker].copy() if not db_df.empty else pd.DataFrame()
         
-    try:
-        db_df = load_price_db(interval, is_jp=is_jp)
-    except FileNotFoundError:
-        db_df = pd.DataFrame()
-        
-    old_df = db_df[db_df["ticker"] == pure_ticker].copy() if not db_df.empty else pd.DataFrame()
-    
-    if interval == "1m":
-        start_date_dt = now - timedelta(days=6)
-    elif interval == "5m":
-        start_date_dt = now - timedelta(days=58)
-    elif interval == "60m":
-        start_date_dt = now - timedelta(days=718)
-    else:
-        start_date_dt = now - timedelta(days=7)
-        
-    try:
-        print(f"📥 [{pure_ticker}] {interval} 修復用の新規データを取得中 ({start_date_dt.strftime('%Y-%m-%d')} ~)...")
-        # タイムゾーンのバグを回避するため、日付のみ(時分秒なし)で取得開始
-        df_raw = yf.download(
-            symbol,
-            start=start_date_dt.strftime("%Y-%m-%d"),
-            interval=interval,
-            auto_adjust=False,
-            actions=True,
-            progress=False
-        )
-        if df_raw.empty:
-            print(f"⚠️ {symbol} の新規取得データが空です。修復を中断します。")
-            return False
+        # 各時間足の最大取得可能日数を設定
+        if interval == "1m":
+            start_date_dt = now - timedelta(days=6)
+        elif interval == "5m":
+            start_date_dt = now - timedelta(days=58)
+        elif interval == "60m":
+            start_date_dt = now - timedelta(days=718)
+        else:  # "1d"
+            # 日足は十分な長さ（2020年以降）を設定
+            start_date_dt = datetime(2020, 1, 1)
             
-        new_df = parse_yfinance_batch(df_raw, [pure_ticker], is_jp=is_jp)
-        if new_df.empty:
-            print(f"⚠️ パース処理の結果、有効なデータが確認できませんでした。")
-            return False
+        try:
+            print(f"📥 [{pure_ticker}] {interval} 修復用データ取得中 ({start_date_dt.strftime('%Y-%m-%d')} ~)...")
+            df_raw = yf.download(
+                symbol,
+                start=start_date_dt.strftime("%Y-%m-%d"),
+                interval=interval,
+                auto_adjust=False,
+                actions=True,
+                progress=False
+            )
+            if df_raw.empty:
+                results[interval] = "新規データ空（取得スキップ）"
+                continue
+                
+            new_df = parse_yfinance_batch(df_raw, [pure_ticker], is_jp=is_jp)
+            if new_df.empty:
+                results[interval] = "パース結果空（スキップ）"
+                continue
             
-        has_split = False
-        split_ratio = 1.0
-        if "stock splits" in new_df.columns:
-            splits_active = new_df["stock splits"].dropna()
-            splits_active = splits_active[(splits_active > 0) & (splits_active != 1.0)]
-            if not splits_active.empty:
-                S = splits_active.iloc[-1]
-                split_ratio = 1.0 / S
-                
-                # 💡 【二重処理ガード】既存DB(old_df)と新データ(new_df)の同一日での価格比較
-                split_row = new_df[new_df["stock splits"] > 0]
-                split_row = split_row[split_row["stock splits"] != 1.0]
-                split_date = pd.to_datetime(split_row.iloc[-1]["date"])
-                
-                # 分割日前（split_dateより過去）のデータをそれぞれ抽出
-                t_old_pre = old_df[pd.to_datetime(old_df["date"]) < split_date] if not old_df.empty else pd.DataFrame()
-                t_new_pre = new_df[pd.to_datetime(new_df["date"]) < split_date]
-                
-                apply_split = True
-                if not t_old_pre.empty:
-                    # 共通して存在する過去の同一日時を探す
-                    common_dates = t_old_pre["date"].isin(t_new_pre["date"])
-                    if common_dates.any():
-                        last_common_date = t_old_pre[common_dates]["date"].max()
-                        
-                        price_db = t_old_pre[t_old_pre["date"] == last_common_date]["close"].iloc[-1]
-                        price_new = t_new_pre[t_new_pre["date"] == last_common_date]["close"].iloc[-1]
-                        
-                        # 💡 【ガード判定】DB内がすでに調整済みであれば、二重処理を回避
-                        if price_db <= (price_new * 1.1):
-                            apply_split = False
-                            print(f"ℹ️ [{pure_ticker}] {interval} データベースの過去データはすでに調整済みであることを確認しました。二重処理をスキップします。")
-                
-                if apply_split and not old_df.empty:
-                    has_split = True
-                    print(f"⚠️ [分割検知] 修復期間中に株式分割（分割比: {S}）を検知。既存の全蓄積データに遡及適用します (R = {split_ratio:.4f})")
-                
-        if has_split and not old_df.empty:
-            price_cols = ["open", "high", "low", "close"]
-            for col in price_cols:
-                if col in old_df.columns:
-                    old_df[col] = old_df[col] * split_ratio
-            if "volume" in old_df.columns:
-                old_df["volume"] = old_df["volume"] / split_ratio
-                
-        if not old_df.empty:
-            new_dates = new_df["date"]
-            old_df_filtered = old_df[~old_df["date"].isin(new_dates)]
-            combined_ticker = pd.concat([old_df_filtered, new_df], ignore_index=True)
-        else:
-            combined_ticker = new_df
+            # 統一マージ関数を呼び出し、手動指定または40%ギャップ検知を連動
+            combined_ticker = merge_price_data(
+                old_df, 
+                new_df, 
+                interval, 
+                is_jp=is_jp, 
+                forced_split_ratio=forced_split_ratio
+            )
             
-        if not db_df.empty:
-            other_tickers_df = db_df[db_df["ticker"] != pure_ticker]
-            final_df = pd.concat([other_tickers_df, combined_ticker], ignore_index=True)
-        else:
-            final_df = combined_ticker
+            # 他の銘柄データと合流させて保存
+            if not db_df.empty:
+                other_tickers_df = db_df[db_df["ticker"] != pure_ticker]
+                final_df = pd.concat([other_tickers_df, combined_ticker], ignore_index=True)
+            else:
+                final_df = combined_ticker
+                
+            if "is_finalized" not in final_df.columns:
+                final_df["is_finalized"] = True
+            else:
+                final_df.loc[final_df["ticker"] == pure_ticker, "is_finalized"] = True
+                
+            final_df = final_df.sort_values(["ticker", "date"]).reset_index(drop=True)
+            save_price_db(final_df, interval, is_jp=is_jp)
+            results[interval] = f"修復成功 (行数: {len(combined_ticker)})"
             
-        if "is_finalized" not in final_df.columns:
-            final_df["is_finalized"] = True
-        else:
-            final_df.loc[final_df["ticker"] == pure_ticker, "is_finalized"] = True
+        except Exception as e:
+            results[interval] = f"エラー: {e}"
             
-        final_df = final_df.sort_values(["ticker", "date"]).reset_index(drop=True)
-        save_price_db(final_df, interval, is_jp=is_jp)
-        print(f"✅ [{pure_ticker}] {interval} 重複排除マージによる安全修復が完了しました。 (行数: {len(combined_ticker)})")
-        return True
-    except Exception as e:
-        print(f"❌ [{pure_ticker}] 修復処理中にエラーが発生しました: {e}")
-        return False
+    return results
 
-def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, is_jp: bool = True) -> pd.DataFrame:
+def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, is_jp: bool = True, forced_split_ratio: float = None) -> pd.DataFrame:
     if new_df is None or new_df.empty: return old_df
     if old_df.empty: return new_df
 
@@ -485,62 +448,118 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
     
     processed_parts = []
     for t in new_tickers:
-        t_new = new_df[new_df["ticker"] == t].sort_values("date")
-        t_old = old_df[old_df["ticker"] == t].sort_values("date")
+        # 時系列を確実に日付順にソートしてインデックスを振り直す
+        t_new = new_df[new_df["ticker"] == t].sort_values("date").reset_index(drop=True)
+        t_old = old_df[old_df["ticker"] == t].sort_values("date").reset_index(drop=True)
         
         if t_old.empty:
             processed_parts.append(t_new)
             continue
             
+        # 💡 [防衛1] 新規データ（t_new）の「内部」に隠れた未調整の急落（40%以上）がないか走査
+        if len(t_new) > 1:
+            pct_changes = t_new["close"].pct_change()
+            anomaly_mask = pct_changes <= -0.40  # 40%以上の急落
+            
+            if anomaly_mask.any():
+                anomaly_idx = anomaly_mask.idxmax()
+                anomaly_row = t_new.loc[anomaly_idx]
+                split_date = anomaly_row["date"]
+                
+                # yfinanceが自力で分割を適用していない（公式分割列が空）場合のみ発動
+                has_official_split = False
+                if "stock splits" in t_new.columns:
+                    has_official_split = (t_new["stock splits"] > 0).any()
+                
+                if not has_official_split:
+                    pre_close = t_new.loc[anomaly_idx - 1, "close"]
+                    post_close = anomaly_row["close"]
+                    raw_ratio = pre_close / post_close
+                    
+                    # 近い一般的な分割比率にマッピング
+                    common_ratios = [1.5, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
+                    est_ratio = min(common_ratios, key=lambda x: abs(x - raw_ratio))
+                    if abs(est_ratio - raw_ratio) / raw_ratio > 0.15:
+                        est_ratio = float(round(raw_ratio))
+                        
+                    if est_ratio >= 1.5:
+                        print(f"🚨 [データ内部の隠れ分割検知] Ticker {t}: 新規データ内部（{split_date}）に40%以上の断絶（{pre_close:.1f} -> {post_close:.1f}）を検知。推定比率 {est_ratio:.1f} で新規データ内のそれ以前の期間を自動補正します。")
+                        
+                        # 新規データ内の該当する過去期間の価格・出来高を調整してフラット化
+                        pre_mask = t_new["date"] < split_date
+                        price_cols = ["open", "high", "low", "close"]
+                        for col in price_cols:
+                            if col in t_new.columns:
+                                t_new.loc[pre_mask, col] = t_new.loc[pre_mask, col] / est_ratio
+                        if "volume" in t_new.columns:
+                            t_new.loc[pre_mask, "volume"] = t_new.loc[pre_mask, "volume"] * est_ratio
+
         has_split = False
         split_ratio = 1.0
-        if "stock splits" in t_new.columns:
-            splits_active = t_new["stock splits"].dropna()
-            splits_active = splits_active[(splits_active > 0) & (splits_active != 1.0)]
-            if not splits_active.empty:
-                S = splits_active.iloc[-1]
-                split_ratio = 1.0 / S
+        
+        # --- 株式分割判定 (優先順位1: 手動指定、優先順位2: yfinance公式、優先順位3: 結合境界の40%超急落検知) ---
+        if forced_split_ratio is not None and forced_split_ratio > 0:
+            split_ratio = 1.0 / forced_split_ratio
+            has_split = True
+            print(f"⚠️ [手動分割適用] Ticker {t}: 指定された比率 {forced_split_ratio:.1f} に基づき過去データを調整します。")
+        else:
+            official_split_val = 1.0
+            if "stock splits" in t_new.columns:
+                splits_active = t_new["stock splits"].dropna()
+                splits_active = splits_active[(splits_active > 0) & (splits_active != 1.0)]
+                if not splits_active.empty:
+                    official_split_val = splits_active.iloc[-1]
+            
+            if official_split_val != 1.0:
+                split_ratio = 1.0 / official_split_val
+                has_split = True
+                print(f"⚠️ [公式分割検知] Ticker {t}: 株式分割（{official_split_val}）を検知しました。 (R = {split_ratio:.4f})")
+            else:
+                # 💡 [防衛2] 結合の境界（既存データ末尾と新データ先頭）を比較
+                old_last_close = t_old.iloc[-1]["close"]
+                new_first_close = t_new.iloc[0]["close"]
                 
-                # 💡 【二重処理ガード】分割日前における、既存DB(t_old)と新データ(t_new)の同一日での価格比較
-                split_row = t_new[t_new["stock splits"] > 0]
-                split_row = split_row[split_row["stock splits"] != 1.0]
-                split_date = pd.to_datetime(split_row.iloc[-1]["date"])
-                
-                # 分割日前（split_dateより過去）のデータをそれぞれ抽出
-                t_old_pre = t_old[pd.to_datetime(t_old["date"]) < split_date]
-                t_new_pre = t_new[pd.to_datetime(t_new["date"]) < split_date]
-                
-                # 共通して存在する過去の同一日時スタンプを探す
+                if old_last_close > 0 and new_first_close > 0:
+                    if new_first_close <= (old_last_close * 0.60):
+                        raw_ratio = old_last_close / new_first_close
+                        common_ratios = [1.5, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
+                        est_ratio = min(common_ratios, key=lambda x: abs(x - raw_ratio))
+                        if abs(est_ratio - raw_ratio) / raw_ratio > 0.15:
+                            est_ratio = float(round(raw_ratio))
+                        
+                        if est_ratio >= 1.5:
+                            split_ratio = 1.0 / est_ratio
+                            has_split = True
+                            print(f"🚨 [データ境界の隠れ分割検知] Ticker {t}: 40%以上の異常価格ギャップ（{old_last_close:.1f} -> {new_first_close:.1f}）を検知。推定比率 {est_ratio:.1f} で過去データを自動調整します。")
+
+        if has_split:
+            # 既存データ（old_df）の二重分割防止ガード
+            split_date = pd.to_datetime(t_new.iloc[0]["date"])
+            t_old_pre = t_old[pd.to_datetime(t_old["date"]) < split_date]
+            t_new_pre = t_new[pd.to_datetime(t_new["date"]) < split_date]
+            
+            apply_split = True
+            if not t_old_pre.empty:
                 common_dates = t_old_pre["date"].isin(t_new_pre["date"])
-                
-                apply_split = True
                 if common_dates.any():
-                    # 最も分割日に近い共通の過去日時を取得
                     last_common_date = t_old_pre[common_dates]["date"].max()
-                    
                     price_db = t_old_pre[t_old_pre["date"] == last_common_date]["close"].iloc[-1]
                     price_new = t_new_pre[t_new_pre["date"] == last_common_date]["close"].iloc[-1]
-                    
-                    # 💡 【ガード判定】ローカル価格が新価格(調整後)とほぼ同じなら、すでに調整済みとみなす
                     if price_db <= (price_new * 1.1):
                         apply_split = False
                         print(f"ℹ️ [{t}] {interval} データベースの過去データはすでに調整済みであることを確認しました。二重処理をスキップします。")
-                
-                if apply_split:
-                    has_split = True
-                    print(f"⚠️ [分割検知] Ticker {t}: 株式分割（{S}）が確認されました。過去データ全体に数学的自己調整を適用します (R = {split_ratio:.4f})")
-                
-        if has_split:
-            price_cols = ["open", "high", "low", "close"]
-            for col in price_cols:
-                if col in t_old.columns:
-                    t_old[col] = t_old[col] * split_ratio
-            if "volume" in t_old.columns:
-                t_old["volume"] = t_old["volume"] / split_ratio
+            
+            if apply_split:
+                price_cols = ["open", "high", "low", "close"]
+                for col in price_cols:
+                    if col in t_old.columns:
+                        t_old[col] = t_old[col] * split_ratio
+                if "volume" in t_old.columns:
+                    t_old["volume"] = t_old["volume"] / split_ratio
+                print(f"  -> [{t}] 過去データへの遡及調整を適用しました。")
                 
         new_dates = t_new["date"]
         t_old_filtered = t_old[~t_old["date"].isin(new_dates)]
-        
         t_combined = pd.concat([t_old_filtered, t_new], ignore_index=True)
         processed_parts.append(t_combined)
         
