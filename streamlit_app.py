@@ -1523,68 +1523,87 @@ def render_sector_rotation_page():
 
             st.divider()
 
-            # 3. 親子構造による17業種ドリルダウン表示（前回の親子レイアウト）
+            # 3. 5大マクロ・コア ミニチャート（展開ボタンで子セクターを横並び表示）
             st.markdown(f"### 📂 5大マクロ・コア別 17業種ドリルダウン（{period_label} / {tf_label}）")
+
+            # --- session_state の展開フラグを初期化 ---
+            for _cn in TOPIX17_ETF_MAPPING:
+                _fk = f"expand_core_{_cn}"
+                if _fk not in st.session_state:
+                    st.session_state[_fk] = False
+
+            # 5つのマクロ・コアを 2 列グリッドで並べる
             core_rows = st.columns(2)
-            
+
             for idx, (core_name, etf_codes) in enumerate(TOPIX17_ETF_MAPPING.items()):
                 col_idx = idx % 2
+                flag_key = f"expand_core_{core_name}"
+
                 with core_rows[col_idx]:
                     with st.container(border=True):
                         mom = momentum_scores.get(core_name, 0.0)
                         badge = "🟢" if mom >= 0 else "🔴"
                         color_theme = "#26a69a" if mom >= 0 else "#ef5350"
-                        
-                        st.markdown(
+
+                        # ── ヘッダー行：タイトル ＋ 展開ボタン ──
+                        h_col, btn_col = st.columns([7, 1])
+                        h_col.markdown(
                             f"<span style='font-size:1.15rem; font-weight:bold; color:{color_theme}'>"
-                            f"{badge} {core_name}</span>", 
+                            f"{badge} {core_name}</span>",
                             unsafe_allow_html=True
                         )
-                        
+                        btn_label = "▲ 閉じる" if st.session_state[flag_key] else f"▼ {len(etf_codes)}業種"
+                        if btn_col.button(btn_label, key=f"btn_{flag_key}", use_container_width=True):
+                            st.session_state[flag_key] = not st.session_state[flag_key]
+
+                        # ── 親ミニチャート ──
                         core_series = macro_cores[core_name]
                         if not core_series.empty:
                             sma75 = core_series.rolling(window=75).mean() if len(core_series) >= 75 else None
                             sma200 = core_series.rolling(window=200).mean() if len(core_series) >= 200 else None
-                            
-                            st.caption("📈 コア合成トレンド（ベース100）")
                             render_lwc_sector_mini(
                                 core_series, sma_fast=sma75, sma_slow=sma200,
                                 key=f"macro_core_parent_mini_{core_name}", height=180
                             )
-                        
-                        with st.expander(f"🔍 構成する子セクター ({len(etf_codes)}業種) を表示する", expanded=False):
-                            st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-                            for code in etf_codes:
+
+                        # ── 子チャート群（展開時のみ表示）──
+                        if st.session_state[flag_key]:
+                            st.markdown(
+                                "<hr style='margin: 0.6rem 0 !important; opacity:0.2;'>",
+                                unsafe_allow_html=True
+                            )
+                            child_cols = st.columns(len(etf_codes))
+                            for ci, code in enumerate(etf_codes):
                                 name = TOPIX17_NAMES.get(code, f"業種 {code}")
-                                
+
                                 single_series = compute_sector_index_from_df(db_df, [code], period_days, resample_weekly)
                                 single_series = relativize_series(single_series, bm_series)
                                 mom_single = get_sector_momentum(single_series, days=min(5, period_days)) if not single_series.empty else 0.0
                                 s_badge = "🟢" if mom_single >= 3.0 else "🔴" if mom_single <= -3.0 else "⚪"
                                 s_color = "#26a69a" if mom_single >= 3.0 else "#ef5350" if mom_single <= -3.0 else "#9e9e9e"
-                                
-                                st.markdown(
-                                    f"<span style='font-weight:600; color:{s_color}'>"
-                                    f"{s_badge} {code} {name}</span> "
-                                    f"<span style='font-size:0.85rem; color:#9e9e9e;'>(直近: {mom_single:+.2f}%)</span>", 
-                                    unsafe_allow_html=True
-                                )
-                                
-                                try:
-                                    sec_abs, sma75_c, sma200_c, is_wvf_lit_c, trading_val_c = compute_sector_absolute_data(db_df, [code], period_days, resample_weekly)
-                                except Exception:
-                                    sec_abs = pd.Series()
-                                    
-                                if not sec_abs.empty:
-                                    render_lwc_sector_mini(
-                                        sec_abs, sma_fast=sma75_c, sma_slow=sma200_c,
-                                        wvf_lit=is_wvf_lit_c, volume_series=trading_val_c,
-                                        key=f"topix17_mini_drill_{code}", height=140
+
+                                with child_cols[ci]:
+                                    st.markdown(
+                                        f"<div style='font-size:0.78rem; font-weight:600; color:{s_color}; "
+                                        f"margin-bottom:2px;'>{s_badge} {name}</div>"
+                                        f"<div style='font-size:0.75rem; color:#9e9e9e;'>{mom_single:+.2f}%</div>",
+                                        unsafe_allow_html=True
                                     )
-                                else:
-                                    st.caption("データ未検出（DB更新を実行してください）")
-                                    
-                                st.markdown("<hr style='margin: 0.5rem 0 !important; opacity:0.15;'>", unsafe_allow_html=True)
+                                    try:
+                                        sec_abs, sma75_c, sma200_c, is_wvf_lit_c, trading_val_c = compute_sector_absolute_data(
+                                            db_df, [code], period_days, resample_weekly
+                                        )
+                                    except Exception:
+                                        sec_abs = pd.Series(dtype=float)
+
+                                    if not sec_abs.empty:
+                                        render_lwc_sector_mini(
+                                            sec_abs, sma_fast=sma75_c, sma_slow=sma200_c,
+                                            wvf_lit=is_wvf_lit_c, volume_series=trading_val_c,
+                                            key=f"topix17_mini_drill_{code}", height=140
+                                        )
+                                    else:
+                                        st.caption("データなし")
 
     # =========================================================================
     # 🇺🇸 米国株モード（従来のGICS / スプレッドシート読み込み）
