@@ -422,7 +422,7 @@ def run_fast_screening(db_df: pd.DataFrame) -> pd.DataFrame:
 # =====================================================================
 
 def _lwc_base_options(height=160, right_offset=5):
-    """LWC共通レイアウトオプション"""
+    """LWC共通レイアウトオプション（ドラッグスクロール＆ホイールズーム有効版）"""
     return {
         "height": height,
         "layout": {
@@ -438,10 +438,113 @@ def _lwc_base_options(height=160, right_offset=5):
         "rightPriceScale": {"borderColor": "rgba(128,128,128,0.3)", "scaleMargins": {"top": 0.08, "bottom": 0.05}},
         "timeScale": {"borderColor": "rgba(128,128,128,0.3)", "rightOffset": right_offset, "timeVisible": True, "secondsVisible": False},
         
-        # === 🛠️ 以下の2つを True に変更します ===
-        "handleScroll": True,  # ドラッグによる左右スクロールを有効化
-        "handleScale": True,   # マウスホイールやピンチによるズーム、価格軸ドラッグを有効化
+        # 移動・拡大縮小の操作を有効化
+        "handleScroll": True,
+        "handleScale": True,
     }
+
+
+def build_lwc_rs_overlay_chart(sector_index_cache: dict, selected_sectors: list, height: int = 450) -> Optional[dict]:
+    """
+    複数セクターの相対強度（RS）データを重ね合わせたLWC（折れ線マルチ）チャートの定義を生成する。
+    """
+    if not sector_index_cache or not selected_sectors:
+        return None
+
+    # 各ラインを識別するためのカラーサイクル
+    PLOTLY_COLORS = [
+        "#636efa", "#EF553B", "#00cc96", "#ab63fa", "#FFA15A",
+        "#19d3f3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52"
+    ]
+
+    series_list = []
+
+    for i, sname in enumerate(selected_sectors):
+        series = sector_index_cache.get(sname)
+        if series is None or series.empty:
+            continue
+        
+        times = _to_lwc_time(series.index)
+        
+        # 100基準から0基準（騰落率%）にリベースしてデータを構築
+        line_data = [
+            {"time": t, "value": round(float(v) - 100.0, 2)}
+            for t, v in zip(times, series.values) if not pd.isna(v)
+        ]
+
+        color = PLOTLY_COLORS[i % len(PLOTLY_COLORS)]
+
+        series_list.append({
+            "type": "Line",
+            "data": line_data,
+            "options": {
+                "color": color,
+                "lineWidth": 2,
+                "title": sname,  # ツールチップ部分に表示されるセクター名
+                "priceLineVisible": False,
+                "lastValueVisible": True,
+                "crosshairMarkerVisible": True,
+            }
+        })
+
+    if not series_list:
+        return None
+
+    # ベースとなるチャート全体のオプションを設定
+    chart_options = _lwc_base_options(height=height, right_offset=10)
+    
+    # 重ね合わせ用に見やすくするため、Y軸の上下余白をさらに広めに確保
+    chart_options["rightPriceScale"] = {
+        "borderColor": "rgba(128,128,128,0.3)",
+        "scaleMargins": {"top": 0.15, "bottom": 0.15},
+    }
+
+    return {"chart": chart_options, "series": series_list}
+
+
+def render_lwc_rs_overlay(sector_index_cache: dict, selected_sectors: list, height: int = 450, key: str = "rs_overlay"):
+    """
+    セクターRS重ね合わせ比較チャート（LWC版）をStreamlit画面上にレンダリングする。
+    上部にインタラクティブなカラー凡例（現在の騰落率付き）をレイアウトします。
+    """
+    if not sector_index_cache or not selected_sectors:
+        st.info("セクターを1つ以上選択すると、RS重ね合わせチャートが表示されます。")
+        return
+
+    # 1. チャート定義を生成
+    chart_def = build_lwc_rs_overlay_chart(sector_index_cache, selected_sectors, height=height)
+    if not chart_def:
+        st.caption("表示可能なデータがありません。")
+        return
+
+    # 2. カスタムHTMLで「カラー凡例 ＋ 直近騰落率」の表示部を上部に構築
+    PLOTLY_COLORS = [
+        "#636efa", "#EF553B", "#00cc96", "#ab63fa", "#FFA15A",
+        "#19d3f3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52"
+    ]
+    legend_items = []
+    
+    for i, sname in enumerate(selected_sectors):
+        series = sector_index_cache.get(sname)
+        if series is not None and not series.empty:
+            pct = float(series.iloc[-1]) - 100.0
+            sign = "+" if pct >= 0 else ""
+            color = PLOTLY_COLORS[i % len(PLOTLY_COLORS)]
+            legend_items.append(
+                f"<span style='display: inline-block; width: 11px; height: 11px; background-color: {color}; "
+                f"margin-right: 4px; vertical-align: middle; border-radius: 2px;'></span>"
+                f"<span style='font-size: 0.85rem; margin-right: 15px; color: #9e9e9e;'>{sname}: "
+                f"<b style='color: {'#26a69a' if pct >= 0 else '#ef5350'}'>{sign}{pct:.2f}%</b></span>"
+            )
+            
+    legend_html = f"<div style='margin-bottom: 15px; padding: 10px; background-color: rgba(255,255,255,0.03); border-radius: 4px; line-height: 1.6;'>{''.join(legend_items)}</div>"
+    st.markdown(legend_html, unsafe_allow_html=True)
+
+    # 3. チャートのレンダリング
+    try:
+        renderLightweightCharts([chart_def], key=key)
+    except Exception as e:
+        st.caption(f"LWC重ね合わせ描画エラー: {e}")
 
 def _to_lwc_time(dt_index):
     """DatetimeIndexをLWCのtime文字列（YYYY-MM-DD）リストに変換"""
@@ -1172,7 +1275,7 @@ def render_sector_rotation_page():
         st.divider()
 
     # =========================================================
-    # 📊 セクター相対強度（RS）重ね合わせ比較チャート
+    # 📊 セクター相対強度（RS）重ね合わせ比較チャート（LWC版へ統合）
     # =========================================================
     if sector_index_cache:
         st.markdown("### 📊 セクター相対強度（RS）重ね合わせ比較（リベース表示）")
@@ -1205,100 +1308,13 @@ def render_sector_rotation_page():
             help="上位3セクター（強気）と下位3セクター（弱気）が自動選出されています。自由に追加・削除できます。"
         )
 
-        if selected_sectors:
-            fig_rs = go.Figure()
-
-            # Plotlyのデフォルトカラーサイクル（トレース順に対応）
-            PLOTLY_COLORS = [
-                "#636efa", "#EF553B", "#00cc96", "#ab63fa", "#FFA15A",
-                "#19d3f3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52",
-            ]
-
-            trace_info = []  # (sname, last_pct, color) を収集してアノテーション用に使う
-
-            for i, sname in enumerate(selected_sectors):
-                series = sector_index_cache.get(sname)
-                if series is None or series.empty:
-                    continue
-                try:
-                    # 0基準に変換（元データは100基準なので -100 する）
-                    y_vals = series.values - 100.0
-                    color = PLOTLY_COLORS[i % len(PLOTLY_COLORS)]
-                    last_pct = float(y_vals[-1])
-
-                    fig_rs.add_trace(go.Scatter(
-                        x=series.index,
-                        y=y_vals,
-                        mode="lines",
-                        name=sname,
-                        line=dict(color=color, width=2),
-                        hovertemplate=f"<b>{sname}</b>: %{{y:+.2f}}%<extra></extra>"
-                    ))
-                    trace_info.append((sname, last_pct, color))
-                except Exception:
-                    pass
-
-            # Y=0 基準線
-            fig_rs.add_hline(
-                y=0,
-                line_dash="dash",
-                line_color="rgba(150,150,150,0.6)",
-                line_width=1.5,
-            )
-
-            # 左上に騰落率アノテーションをまとめて表示
-            # 騰落率順（降順）で並べる
-            trace_info_sorted = sorted(trace_info, key=lambda x: x[1], reverse=True)
-            annotation_lines = []
-            for sname, pct, color in trace_info_sorted:
-                sign = "+" if pct >= 0 else ""
-                annotation_lines.append(
-                    f"<span style='color:{color}'>■</span> {sname}: <b>{sign}{pct:.2f}%</b>"
-                )
-            annotation_html = "<br>".join(annotation_lines)
-
-            fig_rs.add_annotation(
-                xref="paper", yref="paper",
-                x=0.01, y=0.99,
-                xanchor="left", yanchor="top",
-                text=annotation_html,
-                showarrow=False,
-                align="left",
-                bgcolor="rgba(0,0,0,0)",
-                bordercolor="rgba(150,150,150,0.3)",
-                borderwidth=1,
-                borderpad=6,
-                font=dict(size=11),
-            )
-
-            fig_rs.update_layout(
-                template="plotly_white",
-                height=450,
-                hovermode="x unified",
-                margin=dict(l=20, r=20, t=40, b=40),
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1,
-                    font=dict(size=11)
-                ),
-                xaxis=dict(title="日付", showgrid=True, gridcolor="rgba(200,200,200,0.3)", tickformat="%m/%d", dtick=7*24*60*60*1000, tickangle=-45),
-                yaxis=dict(
-                    title="相対騰落率（期間開始=0%）",
-                    ticksuffix="%",
-                    showgrid=True,
-                    gridcolor="rgba(200,200,200,0.3)",
-                    zeroline=True,
-                    zerolinecolor="rgba(150,150,150,0.4)",
-                    zerolinewidth=1,
-                )
-            )
-
-            st.plotly_chart(fig_rs, use_container_width=True)
-        else:
-            st.info("セクターを1つ以上選択すると、RS重ね合わせチャートが表示されます。")
+        # LWC重ね合わせ表示関数を呼び出し
+        render_lwc_rs_overlay(
+            sector_index_cache=sector_index_cache,
+            selected_sectors=selected_sectors,
+            height=450,
+            key="rs_overlay_lwc"
+        )
 
         st.divider()
 
@@ -1395,7 +1411,6 @@ def render_sector_rotation_page():
         sel_idx = sector_index_cache.get(sel_name)
         if sel_idx is not None:
             st.plotly_chart(plot_sector_detail_chart(sel_idx, bm_series, sel_name, bm_label), use_container_width=True)
-
 
 # --- スコア測定ヘルパー ---
 def compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly):
