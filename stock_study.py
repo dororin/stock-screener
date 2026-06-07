@@ -383,16 +383,30 @@ def repair_single_ticker_all_timeframes(
                 except FileNotFoundError:
                     db_df = pd.DataFrame()
 
-                # 対象銘柄を完全削除
-                if not db_df.empty:
-                    db_df = db_df[
-                        db_df["ticker"] != pure_ticker
-                    ]
+# 既存データを完全に消去せず、分割調整エンジンを適用するために退避
+                old_df = (
+                    db_df[db_df["ticker"] == pure_ticker].copy()
+                    if not db_df.empty
+                    else pd.DataFrame()
+                )
 
                 new_df["is_finalized"] = True
 
+                # 日足に対しても、手動比率や自動検知を反映してマージ・調整を実行
+                merged_df = merge_price_data(
+                    old_df,
+                    new_df,
+                    "1d",
+                    is_jp=is_jp,
+                    forced_split_ratio=forced_split_ratio
+                )
+
+                # データベースから対象銘柄の古いデータを削除して、調整済みのデータを結合
+                if not db_df.empty:
+                    db_df = db_df[db_df["ticker"] != pure_ticker]
+
                 db_df = pd.concat(
-                    [db_df, new_df],
+                    [db_df, merged_df],
                     ignore_index=True
                 )
 
@@ -513,68 +527,93 @@ def repair_single_ticker_all_timeframes(
 
 def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, is_jp: bool = True, forced_split_ratio: float = None) -> pd.DataFrame:
     if new_df is None or new_df.empty: return old_df
-    if old_df.empty: return new_df
+    # 💡 old_df が空の場合でも、新規データ自体に分割調整をかけるために早期リターンを廃止（直後の個別ループ内で空対応します）
 
     new_tickers = new_df["ticker"].unique()
-    old_untouched = old_df[~old_df["ticker"].isin(new_tickers)].copy()
+    # old_df が空の場合のハンドリング
+    if not old_df.empty:
+        old_untouched = old_df[~old_df["ticker"].isin(new_tickers)].copy()
+    else:
+        old_untouched = pd.DataFrame()
     
     processed_parts = []
     for t in new_tickers:
-        # 時系列を確実に日付順にソートしてインデックスを振り直す
         t_new = new_df[new_df["ticker"] == t].sort_values("date").reset_index(drop=True)
-        t_old = old_df[old_df["ticker"] == t].sort_values("date").reset_index(drop=True)
+        t_old = (
+            old_df[old_df["ticker"] == t].sort_values("date").reset_index(drop=True)
+            if not old_df.empty
+            else pd.DataFrame()
+        )
         
-        if t_old.empty:
-            processed_parts.append(t_new)
-            continue
-            
-        # 💡 [防衛1] 新規データ（t_new）の「内部」に隠れた未調整の急落（40%以上）がないか走査
-        if len(t_new) > 1:
-            pct_changes = t_new["close"].pct_change()
-            anomaly_mask = pct_changes <= -0.40  # 40%以上の急落
-            
-            if anomaly_mask.any():
-                anomaly_idx = anomaly_mask.idxmax()
-                anomaly_row = t_new.loc[anomaly_idx]
-                split_date = anomaly_row["date"]
-                
-                # yfinanceが自力で分割を適用していない（公式分割列が空）場合のみ発動
-                has_official_split = False
-                if "stock splits" in t_new.columns:
-                    has_official_split = (t_new["stock splits"] > 0).any()
-                
-                if not has_official_split:
-                    pre_close = t_new.loc[anomaly_idx - 1, "close"]
-                    post_close = anomaly_row["close"]
-                    raw_ratio = pre_close / post_close
-                    
-                    # 近い一般的な分割比率にマッピング
-                    common_ratios = [1.5, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
-                    est_ratio = min(common_ratios, key=lambda x: abs(x - raw_ratio))
-                    if abs(est_ratio - raw_ratio) / raw_ratio > 0.15:
-                        est_ratio = float(round(raw_ratio))
-                        
-                    if est_ratio >= 1.5:
-                        print(f"🚨 [データ内部の隠れ分割検知] Ticker {t}: 新規データ内部（{split_date}）に40%以上の断絶（{pre_close:.1f} -> {post_close:.1f}）を検知。推定比率 {est_ratio:.1f} で新規データ内のそれ以前の期間を自動補正します。")
-                        
-                        # 新規データ内の該当する過去期間の価格・出来高を調整してフラット化
-                        pre_mask = t_new["date"] < split_date
-                        price_cols = ["open", "high", "low", "close"]
-                        for col in price_cols:
-                            if col in t_new.columns:
-                                t_new.loc[pre_mask, col] = t_new.loc[pre_mask, col] / est_ratio
-                        if "volume" in t_new.columns:
-                            t_new.loc[pre_mask, "volume"] = t_new.loc[pre_mask, "volume"] * est_ratio
+        # 💡 old_dfが空でもt_new単体に対する調整を実行するため、ここでは早期追加をせず下部の調整処理へ進めます
 
         has_split = False
         split_ratio = 1.0
         
-        # --- 株式分割判定 (優先順位1: 手動指定、優先順位2: yfinance公式、優先順位3: 結合境界の40%超急落検知) ---
+        # --- 1. 手動分割指定がある場合、最優先で適用 ---
         if forced_split_ratio is not None and forced_split_ratio > 0:
             split_ratio = 1.0 / forced_split_ratio
             has_split = True
-            print(f"⚠️ [手動分割適用] Ticker {t}: 指定された比率 {forced_split_ratio:.1f} に基づき過去データを調整します。")
+            print(f"⚠️ [手動分割適用] Ticker {t}: 指定された比率 {forced_split_ratio:.1f} に基づき、新規および過去データを調整します。")
+            
+            # 新規データ(t_new)の内部に断絶がある場合、その断絶日より前の部分を手動比率で調整
+            if len(t_new) > 1:
+                pct_changes = t_new["close"].pct_change()
+                anomaly_mask = pct_changes <= -0.40
+                if anomaly_mask.any():
+                    anomaly_idx = anomaly_mask.idxmax()
+                    split_date = t_new.loc[anomaly_idx, "date"]
+                    pre_mask = t_new["date"] < split_date
+                    price_cols = ["open", "high", "low", "close"]
+                    for col in price_cols:
+                        if col in t_new.columns:
+                            t_new.loc[pre_mask, col] = t_new.loc[pre_mask, col] / forced_split_ratio
+                    if "volume" in t_new.columns:
+                        t_new.loc[pre_mask, "volume"] = t_new.loc[pre_mask, "volume"] * forced_split_ratio
+
+        # --- 2. 手動指定がない場合の自動判定 ---
         else:
+            # 💡 [防衛1] 新規データ（t_new）の「内部」に隠れた未調整の急落（40%以上）がないか走査
+            if len(t_new) > 1:
+                pct_changes = t_new["close"].pct_change()
+                anomaly_mask = pct_changes <= -0.40  # 40%以上の急落
+                
+                if anomaly_mask.any():
+                    anomaly_idx = anomaly_mask.idxmax()
+                    anomaly_row = t_new.loc[anomaly_idx]
+                    split_date = anomaly_row["date"]
+                    
+                    has_official_split = False
+                    if "stock splits" in t_new.columns:
+                        has_official_split = (t_new["stock splits"] > 0).any()
+                    
+                    if not has_official_split:
+                        pre_close = t_new.loc[anomaly_idx - 1, "close"]
+                        post_close = anomaly_row["close"]
+                        raw_ratio = pre_close / post_close
+                        
+                        common_ratios = [1.5, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
+                        est_ratio = min(common_ratios, key=lambda x: abs(x - raw_ratio))
+                        if abs(est_ratio - raw_ratio) / raw_ratio > 0.15:
+                            est_ratio = float(round(raw_ratio))
+                            
+                        if est_ratio >= 1.5:
+                            print(f"🚨 [データ内部の隠れ分割検知] Ticker {t}: 新規データ内部（{split_date}）に40%以上の断絶を検知。比率 {est_ratio:.1f} で調整します。")
+                            
+                            # 新規データ内の該当する過去期間の価格・出来高を調整
+                            pre_mask = t_new["date"] < split_date
+                            price_cols = ["open", "high", "low", "close"]
+                            for col in price_cols:
+                                if col in t_new.columns:
+                                    t_new.loc[pre_mask, col] = t_new.loc[pre_mask, col] / est_ratio
+                            if "volume" in t_new.columns:
+                                t_new.loc[pre_mask, "volume"] = t_new.loc[pre_mask, "volume"] * est_ratio
+                            
+                            # 💡 【連動修正】t_old に対する遡及調整用のフラグと比率をセット
+                            split_ratio = 1.0 / est_ratio
+                            has_split = True
+
+            # 公式分割データの検証
             official_split_val = 1.0
             if "stock splits" in t_new.columns:
                 splits_active = t_new["stock splits"].dropna()
@@ -586,7 +625,7 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
                 split_ratio = 1.0 / official_split_val
                 has_split = True
                 print(f"⚠️ [公式分割検知] Ticker {t}: 株式分割（{official_split_val}）を検知しました。 (R = {split_ratio:.4f})")
-            else:
+            elif not has_split and not t_old.empty:  # 防衛1で検知されておらず、かつ既存データがある場合
                 # 💡 [防衛2] 結合の境界（既存データ末尾と新データ先頭）を比較
                 old_last_close = t_old.iloc[-1]["close"]
                 new_first_close = t_new.iloc[0]["close"]
@@ -602,10 +641,11 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
                         if est_ratio >= 1.5:
                             split_ratio = 1.0 / est_ratio
                             has_split = True
-                            print(f"🚨 [データ境界の隠れ分割検知] Ticker {t}: 40%以上の異常価格ギャップ（{old_last_close:.1f} -> {new_first_close:.1f}）を検知。推定比率 {est_ratio:.1f} で過去データを自動調整します。")
+                            print(f"🚨 [データ境界の隠れ分割検知] Ticker {t}: 異常価格ギャップを検知。比率 {est_ratio:.1f} で過去データを調整します。")
 
-        if has_split:
-            # 既存データ（old_df）の二重分割防止ガード
+        # 既存データベース側のさらに古い過去データ（t_old）への調整適用
+        if has_split and not t_old.empty:
+            # 二重調整防止用の安全ガード
             split_date = pd.to_datetime(t_new.iloc[0]["date"])
             t_old_pre = t_old[pd.to_datetime(t_old["date"]) < split_date]
             t_new_pre = t_new[pd.to_datetime(t_new["date"]) < split_date]
@@ -619,7 +659,7 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
                     price_new = t_new_pre[t_new_pre["date"] == last_common_date]["close"].iloc[-1]
                     if price_db <= (price_new * 1.1):
                         apply_split = False
-                        print(f"ℹ️ [{t}] {interval} データベースの過去データはすでに調整済みであることを確認しました。二重処理をスキップします。")
+                        print(f"ℹ️ [{t}] {interval} データベースはすでに調整済みであることを確認したため二重処理を回避します。")
             
             if apply_split:
                 price_cols = ["open", "high", "low", "close"]
@@ -628,17 +668,21 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
                         t_old[col] = t_old[col] * split_ratio
                 if "volume" in t_old.columns:
                     t_old["volume"] = t_old["volume"] / split_ratio
-                print(f"  -> [{t}] 過去データへの遡及調整を適用しました。")
+                print(f"  -> [{t}] 既存データへの遡及調整を適用しました。")
                 
-        new_dates = t_new["date"]
-        t_old_filtered = t_old[~t_old["date"].isin(new_dates)]
-        t_combined = pd.concat([t_old_filtered, t_new], ignore_index=True)
+        if not t_old.empty:
+            new_dates = t_new["date"]
+            t_old_filtered = t_old[~t_old["date"].isin(new_dates)]
+            t_combined = pd.concat([t_old_filtered, t_new], ignore_index=True)
+        else:
+            t_combined = t_new
+            
         processed_parts.append(t_combined)
         
     combined = pd.concat([old_untouched] + processed_parts, ignore_index=True)
     combined = combined.drop_duplicates(subset=["date", "ticker"], keep="last")
     return combined.sort_values(["ticker", "date"]).reset_index(drop=True)
-
+    
 def parse_yfinance_batch(df_raw, chunk_tickers, is_jp: bool = True):
     if df_raw.empty: return pd.DataFrame()
     all_rows = []
