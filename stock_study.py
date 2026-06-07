@@ -682,7 +682,7 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
     combined = pd.concat([old_untouched] + processed_parts, ignore_index=True)
     combined = combined.drop_duplicates(subset=["date", "ticker"], keep="last")
     return combined.sort_values(["ticker", "date"]).reset_index(drop=True)
-    
+
 def parse_yfinance_batch(df_raw, chunk_tickers, is_jp: bool = True):
     if df_raw.empty: return pd.DataFrame()
     all_rows = []
@@ -1260,3 +1260,121 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
             pass
         except Exception as e:
             _log(f"  ⚠️ [{ticker}] {interval} への分割波及処理中にエラーが発生しました: {e}")
+
+def run_database_health_scan(is_jp: bool) -> list:
+    """
+    全時間足(1d, 60m, 5m, 1m)のParquetファイルを巡回し、
+    ハイブリッド（2段階）スキャンで不具合を高速検出して統合リストとして返す。
+    数百万行のデータがあっても、ベクトル演算によりフリーズせず数秒で処理を完了します。
+    """
+    import re
+    import pandas as pd
+    import stock_study
+
+    anomalies = []
+    
+    # タイムフレーム（時間足）ごとにスキャン
+    for interval in ["1d", "60m", "5m", "1m"]:
+        try:
+            df = stock_study.load_price_db(interval, is_jp=is_jp)
+            if df.empty:
+                continue
+            
+            # 日付順に確実にソート
+            df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+            
+            # 💡 【第1段階：ベクトル走査】全件比を一括計算し、崖の入り口を一瞬で特定
+            df["pct"] = df.groupby("ticker")["close"].pct_change()
+            
+            # -40%以下の急落、または +50%以上の急騰が起きた「行番号」を取得
+            anomaly_indices = df[(df["pct"] <= -0.40) | (df["pct"] >= 0.50)].index.tolist()
+            
+            # 💡 【第2段階：ピンポイント走査】崖の周辺だけを最新データに向けてループ確認
+            for i in anomaly_indices:
+                row = df.loc[i]
+                ticker = row["ticker"]
+                curr_p = row["close"]
+                pct_val = row["pct"]
+                
+                # 異常発生地点より後ろのデータのみを抽出
+                ticker_df = df[(df["ticker"] == ticker) & (df.index >= i)].copy()
+                dates = ticker_df["date"].tolist()
+                close_vals = ticker_df["close"].tolist()
+                n = len(ticker_df)
+                
+                if n < 2:
+                    continue
+                    
+                # 崖が起きる直前の適正価格を逆算
+                pre_p = curr_p / (1.0 + pct_val)
+                
+                # ── A. 下落方向の検証 ──
+                if pct_val <= -0.40:
+                    found_recovery = False
+                    recovery_idx = -1
+                    # データの末尾まで走査して、価格が元の価格（pre_pの±15%）に戻る日があるか
+                    for j in range(1, n):
+                        post_p = close_vals[j]
+                        if (pre_p * 0.85) <= post_p <= (pre_p * 1.15):
+                            found_recovery = True
+                            recovery_idx = j
+                            break
+                    
+                    if found_recovery:
+                        # クレーターバグ（復帰した前日を不具合の終端とする）
+                        bug_end_date = dates[recovery_idx - 1]
+                        anomalies.append({
+                            "時間足": interval,
+                            "コード": ticker,
+                            "不具合種類": "🚨 クレーターバグ（一時的価格陥没）",
+                            "発生日/時刻": f"{str(dates[0])[:16]} 〜 {str(bug_end_date)[:16]}",
+                            "異常値": f"{curr_p:.2f}",
+                            "前後価格": f"{pre_p:.2f} ➔ {close_vals[recovery_idx]:.2f}"
+                        })
+                    else:
+                        # 階段段差型（最新データまで一度も戻らなかったパターン）
+                        anomalies.append({
+                            "時間足": interval,
+                            "コード": ticker,
+                            "不具合種類": "📉 階段段差（未調整分割/下落）の疑い",
+                            "発生日/時刻": f"{str(dates[0])[:16]} 〜 最新（復帰なし）",
+                            "異常値": f"前日: {pre_p:.1f} ➔ 当日: {curr_p:.1f}",
+                            "前後価格": f"{pre_p:.2f} ➔ {curr_p:.2f}"
+                        })
+                        
+                # ── B. 上昇方向の検証 ──
+                elif pct_val >= 0.50:
+                    found_recovery = False
+                    recovery_idx = -1
+                    for j in range(1, n):
+                        post_p = close_vals[j]
+                        if (pre_p * 0.85) <= post_p <= (pre_p * 1.15):
+                            found_recovery = True
+                            recovery_idx = j
+                            break
+                    
+                    if found_recovery:
+                        # タワーバグ
+                        bug_end_date = dates[recovery_idx - 1]
+                        anomalies.append({
+                            "時間足": interval,
+                            "コード": ticker,
+                            "不具合種類": "📈 タワーバグ（一時的価格異常高騰）",
+                            "発生日/時刻": f"{str(dates[0])[:16]} 〜 {str(bug_end_date)[:16]}",
+                            "異常値": f"{curr_p:.2f}",
+                            "前後価格": f"{pre_p:.2f} ➔ {close_vals[recovery_idx]:.2f}"
+                        })
+                    else:
+                        # 階段段差型（最新データまで一度も戻らなかったパターン）
+                        anomalies.append({
+                            "時間足": interval,
+                            "コード": ticker,
+                            "不具合種類": "📈 階段段差（未調整併合/上昇）の疑い",
+                            "発生日/時刻": f"{str(dates[0])[:16]} 〜 最新（復帰なし）",
+                            "異常値": f"前日: {pre_p:.1f} ➔ 当日: {curr_p:.1f}",
+                            "前後価格": f"{pre_p:.2f} ➔ {curr_p:.2f}"
+                        })
+        except Exception:
+            pass
+            
+    return anomalies
