@@ -1149,60 +1149,86 @@ def get_jpx_full_list():
 
 CUSTOM_SECTOR_KEY = "custom_sector_tickers"
 
-@st.fragment
-def _extra_tickers_ui():
-    st.divider()
-    st.subheader("⚙️ 収集対象ETF設定")
-    st.caption("データベースに収集する追加ティッカーを管理します")
-
+def render_etf_manager():
+    """
+    データ管理・保守画面内に配置する、収集対象ETFの管理UI
+    """
     df = load_extra_tickers_from_sheets()
+    count = len(df) if not df.empty else 0
 
-    q = st.text_input(
-        "銘柄コード・名前で検索",
-        placeholder="例: 1306 / TOPIX / 半導体",
-        key="extra_search_input"
-    ).strip()
+    # 1. 登録件数をタイトルに含んだ折りたたみ（初期状態は閉じる）
+    with st.expander(f"📁 収集対象ETF設定（{count}件）", expanded=False):
+        st.caption("データベースに収集する追加ティッカーを管理します")
 
-    if len(q) >= 2:
-        jpx_df = get_jpx_full_list()
-        if not jpx_df.empty:
-            mask = (
-                jpx_df["name"].str.contains(q, na=False, case=False) |
-                jpx_df["symbol"].str.contains(q, na=False)
-            )
-            found = jpx_df[mask].head(8)
-            if not found.empty:
-                for _, row in found.iterrows():
-                    code_str = str(row["symbol"])
-                    name_str = str(row["name"])
-                    already = code_str in df["code"].values if not df.empty else False
-                    label = f"✅ {code_str}　{name_str}" if already else f"➕ {code_str}　{name_str}"
-                    if st.button(label, key=f"extra_btn_{code_str}", use_container_width=True, disabled=already):
-                        new_row = pd.DataFrame([{"code": code_str, "name": name_str, "memo": ""}])
-                        df = pd.concat([df, new_row], ignore_index=True)
-                        save_extra_tickers_to_sheets(df)
-                        sync_extra_tickers_to_local()
-                        st.rerun(scope="app")
-            else:
-                st.caption(f"「{q}」の候補なし")
+        # --- ETF追加 UI ---
+        q = st.text_input(
+            "銘柄コード・名前で検索",
+            placeholder="例: 1306 / TOPIX / 半導体",
+            key="etf_manager_search_input"
+        ).strip()
+
+        if len(q) >= 2:
+            jpx_df = get_jpx_full_list()
+            if not jpx_df.empty:
+                mask = (
+                    jpx_df["name"].str.contains(q, na=False, case=False) |
+                    jpx_df["symbol"].str.contains(q, na=False)
+                )
+                found = jpx_df[mask].head(8)
+                if not found.empty:
+                    st.markdown("**検索結果**")
+                    for _, row in found.iterrows():
+                        code_str = str(row["symbol"])
+                        name_str = str(row["name"])
+                        already = code_str in df["code"].values if not df.empty else False
+                        
+                        # 検索結果と追加ボタンの横並びレイアウト
+                        col_add_left, col_add_right = st.columns([4, 1])
+                        col_add_left.write(f"{code_str}　{name_str}")
+                        if already:
+                            col_add_right.button("✅ 登録済", key=f"etf_add_btn_{code_str}", disabled=True, use_container_width=True)
+                        else:
+                            if col_add_right.button("追加", key=f"etf_add_btn_{code_str}", use_container_width=True):
+                                new_row = pd.DataFrame([{"code": code_str, "name": name_str, "memo": ""}])
+                                df = pd.concat([df, new_row], ignore_index=True)
+                                save_extra_tickers_to_sheets(df)
+                                sync_extra_tickers_to_local()
+                                st.success(f"{code_str} を追加しました。")
+                                time.sleep(0.5)
+                                st.rerun()
+                else:
+                    st.caption(f"「{q}」の候補なし")
         elif len(q) == 1:
             st.caption("もう1文字以上入力すると候補が表示されます")
 
-    if not df.empty:
-        st.caption(f"登録済み: {len(df)}件")
-        to_delete = []
-        for _, row in df.iterrows():
-            ca, cb = st.columns([4, 1])
-            ca.markdown(f"**{row['code']}** {row['name']}")
-            if cb.button("🗑️", key=f"extra_del_{row['code']}", help=f"{row['code']}を削除"):
-                to_delete.append(row["code"])
-        if to_delete:
-            df = df[~df["code"].isin(to_delete)].reset_index(drop=True)
-            save_extra_tickers_to_sheets(df)
-            sync_extra_tickers_to_local()
-            st.rerun(scope="app")
-    else:
-        st.caption("まだ登録されていません")
+        st.divider()
+
+        # --- ETF一覧表示・削除 UI ---
+        if not df.empty:
+            # テーブルヘッダーの描画
+            col_h1, col_h2, col_h3 = st.columns([2, 5, 1])
+            col_h1.markdown("**コード**")
+            col_h2.markdown("**名称**")
+            col_h3.markdown("**削除**")
+            st.markdown("<hr style='margin: 0.2rem 0 !important;'>", unsafe_allow_html=True)
+            
+            to_delete = []
+            for _, row in df.iterrows():
+                col_c1, col_c2, col_c3 = st.columns([2, 5, 1])
+                col_c1.write(row['code'])
+                col_c2.write(row['name'])
+                if col_c3.button("🗑️", key=f"etf_del_{row['code']}", help=f"{row['code']}を削除"):
+                    to_delete.append(row["code"])
+                    
+            if to_delete:
+                df = df[~df["code"].isin(to_delete)].reset_index(drop=True)
+                save_extra_tickers_to_sheets(df)
+                sync_extra_tickers_to_local()
+                st.success("削除しました。")
+                time.sleep(0.5)
+                st.rerun()
+        else:
+            st.caption("登録されている追加ETFはありません。")
 
 @st.fragment
 def _watchlist_ui():
@@ -1311,7 +1337,6 @@ def render_sector_rotation_page():
         n_cols = st.slider("グリッド列数", 2, 4, 3)
 
         _watchlist_ui()
-        _extra_tickers_ui()
 
     with st.spinner("セクター構成をスプレッドシートから読み込み中..."):
         sectors = load_sector_master_from_sheets(is_jp)
@@ -1765,6 +1790,11 @@ if selected_page == "データ管理・保守":
         
     st.divider()
     
+    # 💡 移設先の「収集対象ETF設定」管理UIをここに配置します
+    render_etf_manager()
+    
+    st.divider()
+
     # 【セクション1】 全体差分ダウンロード（自動権利落ち防衛）
     st.subheader("1️⃣ 全体差分ダウンロード（自動権利落ち防衛）")
     st.write(
