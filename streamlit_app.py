@@ -2074,6 +2074,276 @@ def plot_sector_detail_chart(index_series, benchmark_series, sector_name, benchm
     fig.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified", template="plotly_white", legend=dict(orientation="h", y=1.05))
     return fig
 
+def run_database_health_scan(is_jp: bool) -> list:
+    """
+    全時間足(1d, 60m, 5m, 1m)のParquetファイルを巡回し、
+    ハイブリッド（2段階）スキャンで不具合を高速検出して統合リストとして返す。
+    数百万行のデータがあっても、ベクトル演算によりフリーズせず数秒で処理を完了します。
+    """
+    import re
+    import pandas as pd
+    import stock_study
+
+    anomalies = []
+    
+    # タイムフレーム（時間足）ごとにスキャン
+    for interval in ["1d", "60m", "5m", "1m"]:
+        try:
+            df = stock_study.load_price_db(interval, is_jp=is_jp)
+            if df.empty:
+                continue
+            
+            # 日付順に確実にソート
+            df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+            
+            # 💡 【第1段階：ベクトル走査】全件比を一括計算し、崖の入り口を一瞬で特定
+            df["pct"] = df.groupby("ticker")["close"].pct_change()
+            
+            # -40%以下の急落、または +50%以上の急騰が起きた「行番号」を取得
+            anomaly_indices = df[(df["pct"] <= -0.40) | (df["pct"] >= 0.50)].index.tolist()
+            
+            # 💡 【第2段階：ピンポイント走査】崖の周辺だけを最新データに向けてループ確認
+            for i in anomaly_indices:
+                row = df.loc[i]
+                ticker = row["ticker"]
+                curr_p = row["close"]
+                pct_val = row["pct"]
+                
+                # 異常発生地点より後ろのデータのみを抽出
+                ticker_df = df[(df["ticker"] == ticker) & (df.index >= i)].copy()
+                dates = ticker_df["date"].tolist()
+                close_vals = ticker_df["close"].tolist()
+                n = len(ticker_df)
+                
+                if n < 2:
+                    continue
+                    
+                # 崖が起きる直前の適正価格を逆算
+                pre_p = curr_p / (1.0 + pct_val)
+                
+                # ── A. 下落方向の検証 ──
+                if pct_val <= -0.40:
+                    found_recovery = False
+                    recovery_idx = -1
+                    # データの末尾まで走査して、価格が元の価格（pre_pの±15%）に戻る日があるか
+                    for j in range(1, n):
+                        post_p = close_vals[j]
+                        if (pre_p * 0.85) <= post_p <= (pre_p * 1.15):
+                            found_recovery = True
+                            recovery_idx = j
+                            break
+                    
+                    if found_recovery:
+                        # クレーターバグ（復帰した前日を不具合の終端とする）
+                        bug_end_date = dates[recovery_idx - 1]
+                        anomalies.append({
+                            "時間足": interval,
+                            "コード": ticker,
+                            "不具合種類": "🚨 クレーターバグ（一時的価格陥没）",
+                            "発生日/時刻": f"{str(dates[0])[:16]} 〜 {str(bug_end_date)[:16]}",
+                            "異常値": f"{curr_p:.2f}",
+                            "前後価格": f"{pre_p:.2f} ➔ {close_vals[recovery_idx]:.2f}"
+                        })
+                    else:
+                        # 階段段差型（最新データまで一度も戻らなかったパターン）
+                        anomalies.append({
+                            "時間足": interval,
+                            "コード": ticker,
+                            "不具合種類": "📉 階段段差（未調整分割/下落）の疑い",
+                            "発生日/時刻": f"{str(dates[0])[:16]} 〜 最新（復帰なし）",
+                            "異常値": f"前日: {pre_p:.1f} ➔ 当日: {curr_p:.1f}",
+                            "前後価格": f"{pre_p:.2f} ➔ {curr_p:.2f}"
+                        })
+                        
+                # ── B. 上昇方向の検証 ──
+                elif pct_val >= 0.50:
+                    found_recovery = False
+                    recovery_idx = -1
+                    for j in range(1, n):
+                        post_p = close_vals[j]
+                        if (pre_p * 0.85) <= post_p <= (pre_p * 1.15):
+                            found_recovery = True
+                            recovery_idx = j
+                            break
+                    
+                    if found_recovery:
+                        # タワーバグ
+                        bug_end_date = dates[recovery_idx - 1]
+                        anomalies.append({
+                            "時間足": interval,
+                            "コード": ticker,
+                            "不具合種類": "📈 タワーバグ（一時的価格異常高騰）",
+                            "発生日/時刻": f"{str(dates[0])[:16]} 〜 {str(bug_end_date)[:16]}",
+                            "異常値": f"{curr_p:.2f}",
+                            "前後価格": f"{pre_p:.2f} ➔ {close_vals[recovery_idx]:.2f}"
+                        })
+                    else:
+                        # 階段段差型（最新データまで一度も戻らなかったパターン）
+                        anomalies.append({
+                            "時間足": interval,
+                            "コード": ticker,
+                            "不具合種類": "📈 階段段差（未調整併合/上昇）の疑い",
+                            "発生日/時刻": f"{str(dates[0])[:16]} 〜 最新（復帰なし）",
+                            "異常値": f"前日: {pre_p:.1f} ➔ 当日: {curr_p:.1f}",
+                            "前後価格": f"{pre_p:.2f} ➔ {curr_p:.2f}"
+                        })
+        except Exception:
+            pass
+            
+    return anomalies
+
+def render_database_diagnostics_ui(is_jp: bool):
+    """
+    Streamlit画面上に「健康診断」と「崖の周辺ピンポイントビュワー」を描画する。
+    長期間のクレーター（200日など）にも対応し、修復時に手動治療ツールに
+    入力すべき値を自動でアシスト表示します。
+    """
+    import re
+    import pandas as pd
+    import streamlit as st
+    import stock_study
+
+    st.divider()
+    st.subheader("📊 データベース健康診断 (段差・不具合検出)")
+    st.write("各時間足(1d, 60m, 5m, 1m)を巡回し、価格データの断絶や一時的な配信バグを高速スキャンします。")
+    
+    # スキャン実行
+    if st.button("🔍 データベース健康診断を実行", key="btn_run_health_check", type="primary"):
+        with st.spinner("データベースの整合性をフルスキャン中..."):
+            st.session_state.detected_anomalies = run_database_health_scan(is_jp)
+            st.success("健康診断が完了しました。")
+
+    # 検出結果の表示
+    if "detected_anomalies" in st.session_state:
+        anom_list = st.session_state.detected_anomalies
+        
+        if not anom_list:
+            st.success("✅ 素晴らしい！データベース内に未調整の不整合（崖・バグ）は1件も検出されませんでした。")
+            return
+            
+        st.warning(f"⚠️ データベースの整合性に不審な点がある箇所が {len(anom_list)} 件検出されました。")
+        
+        # 不具合をドロップダウンで選択
+        options = [
+            f"【{a['不具合種類']}】{a['コード']} ({a['時間足']}) - 発生: {a['発生日/時刻']}" 
+            for a in anom_list
+        ]
+        selected_idx = st.selectbox(
+            "詳細を確認・治療する不具合を選択してください", 
+            range(len(options)), 
+            format_func=lambda x: options[x],
+            key="sel_anomaly_view"
+        )
+        
+        target_anom = anom_list[selected_idx]
+        ticker = target_anom["コード"]
+        interval = target_anom["時間足"]
+        anomaly_type = target_anom["不具合種類"]
+        
+        # 発生日の抽出
+        detected_dates = re.findall(r"\d{4}-\d{2}-\d{2}", target_anom["発生日/時刻"])
+        if not detected_dates:
+            st.error("発生日の取得に失敗しました。")
+            return
+            
+        base_date = pd.to_datetime(detected_dates[0])
+        
+        # 該当銘柄の該当タイムフレームデータを読み込む
+        try:
+            df_full = stock_study.load_price_db(interval, is_jp=is_jp)
+            df_ticker = df_full[df_full["ticker"] == ticker].copy()
+            df_ticker["date"] = pd.to_datetime(df_ticker["date"])
+            df_ticker = df_ticker.sort_values("date").reset_index(drop=True)
+        except Exception as e:
+            st.error(f"データのロード中にエラーが発生しました: {e}")
+            return
+            
+        st.write("---")
+        st.markdown(f"### 🔍 **{ticker} ({interval})** 崖の周辺データ確認")
+        
+        # 💡 【自動判定】クレーターの期間が長期（30日以上）にわたる場合は分割表示、それ以外は単一テーブルで表示
+        if len(detected_dates) == 2:
+            start_date = pd.to_datetime(detected_dates[0])
+            end_date = pd.to_datetime(detected_dates[1])
+            duration = (end_date - start_date).days
+            
+            if duration > 30:
+                st.info(f"📊 クレーター期間が長期（{duration}日間）にわたるため、変化の瞬間（下落時・復帰時）を切り出して左右に並べて表示します。")
+                col_in, col_out = st.columns(2)
+                
+                with col_in:
+                    st.markdown(f"📉 **崖の入り口（下落が始まったポイント）**")
+                    df_in = df_ticker[
+                        (df_ticker["date"] >= start_date - pd.Timedelta(days=10)) & 
+                        (df_ticker["date"] <= start_date + pd.Timedelta(days=10))
+                    ]
+                    st.dataframe(
+                        df_in[["date", "open", "high", "low", "close", "volume"]], 
+                        use_container_width=True, hide_index=True
+                    )
+                    
+                with col_out:
+                    st.markdown(f"📈 **崖の出口（正常に戻ったポイント）**")
+                    df_out = df_ticker[
+                        (df_ticker["date"] >= end_date - pd.Timedelta(days=10)) & 
+                        (df_ticker["date"] <= end_date + pd.Timedelta(days=10))
+                    ]
+                    st.dataframe(
+                        df_out[["date", "open", "high", "low", "close", "volume"]], 
+                        use_container_width=True, hide_index=True
+                    )
+            else:
+                # 短期クレーターの場合は、全体を1枚のテーブルで表示
+                st.markdown(f"📊 **不具合の全貌（前後10日間のマージン付き）**")
+                df_view = df_ticker[
+                    (df_ticker["date"] >= start_date - pd.Timedelta(days=10)) & 
+                    (df_ticker["date"] <= end_date + pd.Timedelta(days=10))
+                ]
+                st.dataframe(
+                    df_view[["date", "open", "high", "low", "close", "volume"]], 
+                    use_container_width=True, hide_index=True
+                )
+                
+        elif len(detected_dates) == 1:
+            # 📉 階段段差型（最新まで戻りがない場合）
+            start_date = pd.to_datetime(detected_dates[0])
+            st.info("📉 最新データまで元の水域に戻っていない「永続的な段差」です。崖の前後15日間のデータを表示します。")
+            
+            df_view = df_ticker[
+                (df_ticker["date"] >= start_date - pd.Timedelta(days=15)) & 
+                (df_ticker["date"] <= start_date + pd.Timedelta(days=15))
+            ]
+            st.dataframe(
+                df_view[["date", "open", "high", "low", "close", "volume"]], 
+                use_container_width=True, hide_index=True
+            )
+            
+        # 💡 【パッチ適用ガイド】手動パッチ（セクション3）にコピペすべき内容の自動生成
+        st.divider()
+        st.markdown("#### 🛠️ **推奨される手動治療パッチの設定**")
+        st.write("上記のデータを確認し、治療ツール（セクション3）に以下のように数値を入力して治療を適用してください。")
+        
+        if "階段段差" in anomaly_type:
+            # 階段段差の場合
+            suggested_end = (base_date - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            st.code(
+                f"① 銘柄コード         : {ticker}\n"
+                f"② 開始日（省略可）   : (空欄にする)\n"
+                f"③ 終了日（省略可）   : {suggested_end}\n"
+                f"④ 修復/分割比率     : (上の崖の落差に応じて、1306.Tなら 0.1 を入力)", 
+                language="text"
+            )
+        else:
+            # 一時的バグの場合
+            start_str = start_date.strftime("%Y-%m-%d")
+            end_str = end_date.strftime("%Y-%m-%d")
+            st.code(
+                f"① 銘柄コード         : {ticker}\n"
+                f"② 開始日（省略可）   : {start_str}\n"
+                f"③ 終了日（省略可）   : {end_str}\n"
+                f"④ 修復/分割比率     : (元の適正価格/潰れた価格の比率。1629.Tなら 500.0 を入力)", 
+                language="text"
+            )
 
 # =====================================================================
 # メイン画面ルーティング
@@ -2282,7 +2552,7 @@ if selected_page == "データ管理・保守":
                 st.error(f"再構築中に予期せぬエラーが発生しました: {e}")
             
     render_database_diagnostics_ui(is_jp=is_jp)
-    
+
     st.stop()                    
 
 
@@ -2451,155 +2721,3 @@ if selected_page == "スクリーニング":
         else:
             st.info("左サイドバーの「🚀 スクリーニング開始」ボタンを押してください。データベースから超高速判定を行います。")
 
-def render_database_diagnostics_ui(is_jp: bool):
-    """
-    Streamlit画面上に「健康診断」と「崖の周辺ピンポイントビュワー」を描画する。
-    長期間のクレーター（200日など）にも対応し、修復時に手動治療ツールに
-    入力すべき値を自動でアシスト表示します。
-    """
-    import re
-    import pandas as pd
-    import streamlit as st
-    import stock_study
-
-    st.divider()
-    st.subheader("📊 データベース健康診断 (段差・不具合検出)")
-    st.write("各時間足(1d, 60m, 5m, 1m)を巡回し、価格データの断絶や一時的な配信バグを高速スキャンします。")
-    
-    # スキャン実行
-    if st.button("🔍 データベース健康診断を実行", key="btn_run_health_check", type="primary"):
-        with st.spinner("データベースの整合性をフルスキャン中..."):
-            st.session_state.detected_anomalies = run_database_health_scan(is_jp)
-            st.success("健康診断が完了しました。")
-
-    # 検出結果の表示
-    if "detected_anomalies" in st.session_state:
-        anom_list = st.session_state.detected_anomalies
-        
-        if not anom_list:
-            st.success("✅ 素晴らしい！データベース内に未調整の不整合（崖・バグ）は1件も検出されませんでした。")
-            return
-            
-        st.warning(f"⚠️ データベースの整合性に不審な点がある箇所が {len(anom_list)} 件検出されました。")
-        
-        # 不具合をドロップダウンで選択
-        options = [
-            f"【{a['不具合種類']}】{a['コード']} ({a['時間足']}) - 発生: {a['発生日/時刻']}" 
-            for a in anom_list
-        ]
-        selected_idx = st.selectbox(
-            "詳細を確認・治療する不具合を選択してください", 
-            range(len(options)), 
-            format_func=lambda x: options[x],
-            key="sel_anomaly_view"
-        )
-        
-        target_anom = anom_list[selected_idx]
-        ticker = target_anom["コード"]
-        interval = target_anom["時間足"]
-        anomaly_type = target_anom["不具合種類"]
-        
-        # 発生日の抽出
-        detected_dates = re.findall(r"\d{4}-\d{2}-\d{2}", target_anom["発生日/時刻"])
-        if not detected_dates:
-            st.error("発生日の取得に失敗しました。")
-            return
-            
-        base_date = pd.to_datetime(detected_dates[0])
-        
-        # 該当銘柄の該当タイムフレームデータを読み込む
-        try:
-            df_full = stock_study.load_price_db(interval, is_jp=is_jp)
-            df_ticker = df_full[df_full["ticker"] == ticker].copy()
-            df_ticker["date"] = pd.to_datetime(df_ticker["date"])
-            df_ticker = df_ticker.sort_values("date").reset_index(drop=True)
-        except Exception as e:
-            st.error(f"データのロード中にエラーが発生しました: {e}")
-            return
-            
-        st.write("---")
-        st.markdown(f"### 🔍 **{ticker} ({interval})** 崖の周辺データ確認")
-        
-        # 💡 【自動判定】クレーターの期間が長期（30日以上）にわたる場合は分割表示、それ以外は単一テーブルで表示
-        if len(detected_dates) == 2:
-            start_date = pd.to_datetime(detected_dates[0])
-            end_date = pd.to_datetime(detected_dates[1])
-            duration = (end_date - start_date).days
-            
-            if duration > 30:
-                st.info(f"📊 クレーター期間が長期（{duration}日間）にわたるため、変化の瞬間（下落時・復帰時）を切り出して左右に並べて表示します。")
-                col_in, col_out = st.columns(2)
-                
-                with col_in:
-                    st.markdown(f"📉 **崖の入り口（下落が始まったポイント）**")
-                    df_in = df_ticker[
-                        (df_ticker["date"] >= start_date - pd.Timedelta(days=10)) & 
-                        (df_ticker["date"] <= start_date + pd.Timedelta(days=10))
-                    ]
-                    st.dataframe(
-                        df_in[["date", "open", "high", "low", "close", "volume"]], 
-                        use_container_width=True, hide_index=True
-                    )
-                    
-                with col_out:
-                    st.markdown(f"📈 **崖の出口（正常に戻ったポイント）**")
-                    df_out = df_ticker[
-                        (df_ticker["date"] >= end_date - pd.Timedelta(days=10)) & 
-                        (df_ticker["date"] <= end_date + pd.Timedelta(days=10))
-                    ]
-                    st.dataframe(
-                        df_out[["date", "open", "high", "low", "close", "volume"]], 
-                        use_container_width=True, hide_index=True
-                    )
-            else:
-                # 短期クレーターの場合は、全体を1枚のテーブルで表示
-                st.markdown(f"📊 **不具合の全貌（前後10日間のマージン付き）**")
-                df_view = df_ticker[
-                    (df_ticker["date"] >= start_date - pd.Timedelta(days=10)) & 
-                    (df_ticker["date"] <= end_date + pd.Timedelta(days=10))
-                ]
-                st.dataframe(
-                    df_view[["date", "open", "high", "low", "close", "volume"]], 
-                    use_container_width=True, hide_index=True
-                )
-                
-        elif len(detected_dates) == 1:
-            # 📉 階段段差型（最新まで戻りがない場合）
-            start_date = pd.to_datetime(detected_dates[0])
-            st.info("📉 最新データまで元の水域に戻っていない「永続的な段差」です。崖の前後15日間のデータを表示します。")
-            
-            df_view = df_ticker[
-                (df_ticker["date"] >= start_date - pd.Timedelta(days=15)) & 
-                (df_ticker["date"] <= start_date + pd.Timedelta(days=15))
-            ]
-            st.dataframe(
-                df_view[["date", "open", "high", "low", "close", "volume"]], 
-                use_container_width=True, hide_index=True
-            )
-            
-        # 💡 【パッチ適用ガイド】手動パッチ（セクション3）にコピペすべき内容の自動生成
-        st.divider()
-        st.markdown("#### 🛠️ **推奨される手動治療パッチの設定**")
-        st.write("上記のデータを確認し、治療ツール（セクション3）に以下のように数値を入力して治療を適用してください。")
-        
-        if "階段段差" in anomaly_type:
-            # 階段段差の場合
-            suggested_end = (base_date - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            st.code(
-                f"① 銘柄コード         : {ticker}\n"
-                f"② 開始日（省略可）   : (空欄にする)\n"
-                f"③ 終了日（省略可）   : {suggested_end}\n"
-                f"④ 修復/分割比率     : (上の崖の落差に応じて、1306.Tなら 0.1 を入力)", 
-                language="text"
-            )
-        else:
-            # 一時的バグの場合
-            start_str = start_date.strftime("%Y-%m-%d")
-            end_str = end_date.strftime("%Y-%m-%d")
-            st.code(
-                f"① 銘柄コード         : {ticker}\n"
-                f"② 開始日（省略可）   : {start_str}\n"
-                f"③ 終了日（省略可）   : {end_str}\n"
-                f"④ 修復/分割比率     : (元の適正価格/潰れた価格の比率。1629.Tなら 500.0 を入力)", 
-                language="text"
-            )
