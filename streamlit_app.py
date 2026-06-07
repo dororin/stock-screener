@@ -1485,7 +1485,7 @@ def render_sector_rotation_page():
         sel_idx = sector_index_cache.get(sel_name)
         if sel_idx is not None:
             st.plotly_chart(plot_sector_detail_chart(sel_idx, bm_series, sel_name, bm_label), use_container_width=True)
-            
+
 # --- スコア測定ヘルパー ---
 def compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly):
     if db_df.empty: return pd.Series(dtype=float)
@@ -1820,43 +1820,6 @@ if selected_page == "データ管理・保守":
                 except Exception as e:
                     status_box.update(label="❌ エラーが発生しました", state="error")
                     st.error(f"データベースの更新処理中に例外エラーが発生しました: {e}")
-                    
-    st.divider()
-    
-    # 【セクション2】手動フル再取得・再構築（日足長期足専用）
-    st.subheader("2️⃣ 手動フル再取得・再構築（日足長期足専用）")
-    st.markdown(
-        """<div style="background-color:#ffebe9; border-left: 6px solid #ff3b30; padding:15px; border-radius:4px; margin-bottom:15px;">
-        <span style="font-weight:700; color:#ff3b30; font-size:1.0rem;">⚠️ 警告（必ずご確認ください）</span><br/>
-        本処理は <strong>日足（1d）のデータベースファイルのみに適用されます</strong>。
-        既存の過去データを一度全クリアしたうえで、yfinanceから全期間の調整後（auto_adjust=True）データをフルダウンロードして再構築します。<br/>
-        分足や1時間足（60m）などの短期足データベースに対して本処理を実行すると、yfinanceの過去データ提供期間制限（1m: 7日、5m: 60日、60m: 730日）により、
-        <strong>制限範囲より古いすべての蓄積データが永久に消失します</strong>。
-        短期足の修復や調整には、以下の【短期足修復】機能を使用してください。
-        </div>""", unsafe_allow_html=True
-    )
-    
-    r_col1, r_col2 = st.columns([3, 1])
-    with r_col1:
-        rebuild_ticker = st.text_input("フル再構築を実行する銘柄コードを入力してください", placeholder="例: 7203 や AAPL", key="rebuild_ticker_box")
-    with r_col2:
-        st.write(" ")
-        st.write(" ")
-        btn_rebuild = st.button("🚀 フル再構築を実行", use_container_width=True, type="secondary")
-        
-    if btn_rebuild:
-        if not rebuild_ticker:
-            st.error("銘柄コードが正しく入力されていません。")
-        else:
-            pure_t = stock_study.sanitize_ticker(rebuild_ticker, is_jp=is_jp)
-            with st.spinner(f"🔄 [{pure_t}] の全期間調整後データを取得し、1dデータベースを再構築しています..."):
-                success = stock_study.rebuild_single_ticker_db(pure_t, is_jp=is_jp, interval="1d")
-                if success:
-                    get_db_last_update.clear()
-                    load_unified_db.clear()
-                    st.success(f"✅ [{pure_t}] の日足(1d)データベースの再構築が正常に完了しました。")
-                else:
-                    st.error(f"❌ [{pure_t}] の再構築処理に失敗しました。ティッカー名が有効かご確認ください。")
                     
     st.divider()
     

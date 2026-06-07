@@ -319,79 +319,131 @@ def get_download_symbol(ticker: str, is_jp: bool = True) -> str:
 
 # --- データベース統合更新エンジン・個別修復・再構築 ---
 
-def rebuild_single_ticker_db(ticker: str, is_jp: bool = True, interval: str = "1d") -> bool:
-    if interval != "1d":
-        msg = f"❌ 【ガード発動】短期足（{interval}）に対するフル再構築は、データ永久消失リスクを回避するため実行できません。"
-        print(msg)
-        if HAS_STREAMLIT:
-            st.error(msg)
-        return False
-        
-    pure_ticker = sanitize_ticker(ticker, is_jp)
-    symbol = get_download_symbol(pure_ticker, is_jp)
-    
-    print(f"🔄 [{pure_ticker}] 1d データベースをフル再構築します...")
-    try:
-        db_df = load_price_db("1d", is_jp=is_jp)
-    except FileNotFoundError:
-        db_df = pd.DataFrame()
-        
-    if not db_df.empty:
-        db_df = db_df[db_df["ticker"] != pure_ticker]
-        
-    try:
-        df_raw = yf.download(symbol, period="max", interval="1d", auto_adjust=True, actions=True, progress=False)
-        if df_raw.empty:
-            print(f"⚠️ {symbol} のデータが取得できませんでした。")
-            return False
-            
-        df_clean = parse_yfinance_batch(df_raw, [pure_ticker], is_jp=is_jp)
-        if not df_clean.empty:
-            df_clean["is_finalized"] = True
-            db_df = pd.concat([db_df, df_clean], ignore_index=True)
-            db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
-            save_price_db(db_df, "1d", is_jp=is_jp)
-            print(f"✅ [{pure_ticker}] 1d フル再構築が完了しました。 (行数: {len(df_clean)})")
-            return True
-        else:
-            print(f"⚠️ [{pure_ticker}] パース結果が空です。")
-            return False
-    except Exception as e:
-        print(f"❌ [{pure_ticker}] フル再構築中にエラーが発生しました: {e}")
-        return False
+def repair_single_ticker_all_timeframes(
+    ticker: str,
+    is_jp: bool = True,
+    forced_split_ratio: float = None
+) -> dict:
+    """
+    指定銘柄の全時間足を修復する。
 
-def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_split_ratio: float = None) -> dict:
+    1d:
+        Yahooの全履歴(period=max)を取得し、
+        対象銘柄の日足DBを完全置換する。
+
+    60m/5m/1m:
+        従来通り安全マージ修復を実施する。
     """
-    指定された銘柄について、全時間足（1d, 60m, 5m, 1m）のデータベースを
-    自動ギャップ検知（または手動指定比率）を適用しながら一括修復マージします。
-    """
+
     pure_ticker = sanitize_ticker(ticker, is_jp)
     symbol = get_download_symbol(pure_ticker, is_jp)
+
     now = datetime.now()
     results = {}
-    
-    # 4つの時間足をループ処理
+
     for interval in ["1d", "60m", "5m", "1m"]:
+
         try:
-            db_df = load_price_db(interval, is_jp=is_jp)
-        except FileNotFoundError:
-            db_df = pd.DataFrame()
-            
-        old_df = db_df[db_df["ticker"] == pure_ticker].copy() if not db_df.empty else pd.DataFrame()
-        
-        # 各時間足の最大取得可能日数を設定
-        if interval == "1m":
-            start_date_dt = now - timedelta(days=6)
-        elif interval == "5m":
-            start_date_dt = now - timedelta(days=58)
-        elif interval == "60m":
-            start_date_dt = now - timedelta(days=718)
-        else:  # "1d"
-            # 日足は十分な長さ（2020年以降）を設定
-            start_date_dt = datetime(2020, 1, 1)
-            
-        try:
-            print(f"📥 [{pure_ticker}] {interval} 修復用データ取得中 ({start_date_dt.strftime('%Y-%m-%d')} ~)...")
+
+            # ==================================================
+            # 日足（完全再構築モード）
+            # ==================================================
+            if interval == "1d":
+
+                print(f"📥 [{pure_ticker}] 1d 全履歴取得中(period=max)")
+
+                df_raw = yf.download(
+                    symbol,
+                    period="max",
+                    interval="1d",
+                    auto_adjust=True,
+                    actions=True,
+                    progress=False
+                )
+
+                if df_raw.empty:
+                    results["1d"] = "データ取得失敗"
+                    continue
+
+                new_df = parse_yfinance_batch(
+                    df_raw,
+                    [pure_ticker],
+                    is_jp=is_jp
+                )
+
+                if new_df.empty:
+                    results["1d"] = "パース結果空"
+                    continue
+
+                try:
+                    db_df = load_price_db(
+                        "1d",
+                        is_jp=is_jp
+                    )
+                except FileNotFoundError:
+                    db_df = pd.DataFrame()
+
+                # 対象銘柄を完全削除
+                if not db_df.empty:
+                    db_df = db_df[
+                        db_df["ticker"] != pure_ticker
+                    ]
+
+                new_df["is_finalized"] = True
+
+                db_df = pd.concat(
+                    [db_df, new_df],
+                    ignore_index=True
+                )
+
+                db_df = db_df.sort_values(
+                    ["ticker", "date"]
+                ).reset_index(drop=True)
+
+                save_price_db(
+                    db_df,
+                    "1d",
+                    is_jp=is_jp
+                )
+
+                results["1d"] = (
+                    f"完全再構築成功 "
+                    f"({len(new_df):,}件)"
+                )
+
+                continue
+
+            # ==================================================
+            # 短期足（従来の安全修復）
+            # ==================================================
+            try:
+                db_df = load_price_db(
+                    interval,
+                    is_jp=is_jp
+                )
+            except FileNotFoundError:
+                db_df = pd.DataFrame()
+
+            old_df = (
+                db_df[db_df["ticker"] == pure_ticker].copy()
+                if not db_df.empty
+                else pd.DataFrame()
+            )
+
+            if interval == "1m":
+                start_date_dt = now - timedelta(days=6)
+
+            elif interval == "5m":
+                start_date_dt = now - timedelta(days=58)
+
+            elif interval == "60m":
+                start_date_dt = now - timedelta(days=718)
+
+            print(
+                f"📥 [{pure_ticker}] "
+                f"{interval} 修復データ取得中"
+            )
+
             df_raw = yf.download(
                 symbol,
                 start=start_date_dt.strftime("%Y-%m-%d"),
@@ -400,43 +452,63 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
                 actions=True,
                 progress=False
             )
+
             if df_raw.empty:
-                results[interval] = "新規データ空（取得スキップ）"
+                results[interval] = "新規データ空"
                 continue
-                
-            new_df = parse_yfinance_batch(df_raw, [pure_ticker], is_jp=is_jp)
+
+            new_df = parse_yfinance_batch(
+                df_raw,
+                [pure_ticker],
+                is_jp=is_jp
+            )
+
             if new_df.empty:
-                results[interval] = "パース結果空（スキップ）"
+                results[interval] = "パース結果空"
                 continue
-            
-            # 統一マージ関数を呼び出し、手動指定または40%ギャップ検知を連動
-            combined_ticker = merge_price_data(
-                old_df, 
-                new_df, 
-                interval, 
-                is_jp=is_jp, 
+
+            merged_df = merge_price_data(
+                old_df,
+                new_df,
+                interval,
                 forced_split_ratio=forced_split_ratio
             )
-            
-            # 他の銘柄データと合流させて保存
+
             if not db_df.empty:
-                other_tickers_df = db_df[db_df["ticker"] != pure_ticker]
-                final_df = pd.concat([other_tickers_df, combined_ticker], ignore_index=True)
-            else:
-                final_df = combined_ticker
-                
-            if "is_finalized" not in final_df.columns:
-                final_df["is_finalized"] = True
-            else:
-                final_df.loc[final_df["ticker"] == pure_ticker, "is_finalized"] = True
-                
-            final_df = final_df.sort_values(["ticker", "date"]).reset_index(drop=True)
-            save_price_db(final_df, interval, is_jp=is_jp)
-            results[interval] = f"修復成功 (行数: {len(combined_ticker)})"
-            
+                db_df = db_df[
+                    db_df["ticker"] != pure_ticker
+                ]
+
+            db_df = pd.concat(
+                [db_df, merged_df],
+                ignore_index=True
+            )
+
+            db_df = db_df.sort_values(
+                ["ticker", "date"]
+            ).reset_index(drop=True)
+
+            save_price_db(
+                db_df,
+                interval,
+                is_jp=is_jp
+            )
+
+            results[interval] = (
+                f"修復成功 ({len(merged_df):,}件)"
+            )
+
         except Exception as e:
-            results[interval] = f"エラー: {e}"
-            
+
+            results[interval] = (
+                f"エラー: {str(e)}"
+            )
+
+            print(
+                f"❌ [{pure_ticker}] "
+                f"{interval} 修復失敗: {e}"
+            )
+
     return results
 
 def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, is_jp: bool = True, forced_split_ratio: float = None) -> pd.DataFrame:
