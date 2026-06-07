@@ -393,7 +393,7 @@ def run_fast_screening(db_df: pd.DataFrame) -> pd.DataFrame:
             if is_uptrend and is_wvf_lit and latest['wvf'] >= 5.0:
                 ext_price = min(max(latest['highest_close'] * (1 - latest['wvf_upper'] / 100), latest['highest_close'] * (1 - latest['range_high'] / 100)), latest['highest_close'] * (1 - 5.0 / 100))
                 results.append({
-                    'チャート': df.tail(60)[['date','open','high','low','close','sma50','sma200']].to_json(orient='records', date_format='iso'),
+                    'チャート': df.tail(60)[['date','open','high','low','close','sma50','sma200','volume']].to_json(orient='records', date_format='iso'),
                     'シグナル日': latest["date"].strftime('%Y-%m-%d'),
                     'コード': ticker,
                     '銘柄': name_map.get(ticker, "-"),
@@ -422,7 +422,7 @@ def run_fast_screening(db_df: pd.DataFrame) -> pd.DataFrame:
 # =====================================================================
 
 def _lwc_base_options(height=160, right_offset=5):
-    """LWC共通レイアウトオプション（ドラッグスクロール＆ホイールズーム有効版）"""
+    """LWC共通レイアウトオプション（ドラッグスクロール＆ホイールズーム有効 ＋ 出来高オーバーレイ設定）"""
     return {
         "height": height,
         "layout": {
@@ -435,14 +435,23 @@ def _lwc_base_options(height=160, right_offset=5):
             "horzLines": {"color": "rgba(128,128,128,0.15)"},
         },
         "crosshair": {"mode": 1},
-        "rightPriceScale": {"borderColor": "rgba(128,128,128,0.3)", "scaleMargins": {"top": 0.08, "bottom": 0.05}},
+        "rightPriceScale": {
+            "borderColor": "rgba(128,128,128,0.3)", 
+            "scaleMargins": {
+                "top": 0.08, 
+                "bottom": 0.25  # 出来高を重ねるため、最下部25%のエリアを確保
+            }
+        },
+        "overlayPriceScales": {
+            "scaleMargins": {
+                "top": 0.75,   # 出来高をチャートの最下部25%に閉じ込める (上部75%を空ける)
+                "bottom": 0,
+            }
+        },
         "timeScale": {"borderColor": "rgba(128,128,128,0.3)", "rightOffset": right_offset, "timeVisible": True, "secondsVisible": False},
-        
-        # 移動・拡大縮小の操作を有効化
         "handleScroll": True,
         "handleScale": True,
     }
-
 
 def build_lwc_rs_overlay_chart(sector_index_cache: dict, selected_sectors: list, height: int = 450) -> Optional[dict]:
     """
@@ -551,12 +560,10 @@ def _to_lwc_time(dt_index):
     return [str(d)[:10] for d in dt_index]
 
 
-def build_lwc_candle_chart(df, sma_fast=None, sma_slow=None, height=200, wvf_lit=None):
+def build_lwc_candle_chart(df, sma_fast=None, sma_slow=None, height=200):
     """
-    ローソク足＋SMA2本＋WVF背景帯のLWCチャート定義を生成する。
-    df: open/high/low/close/date カラムを持つDataFrame（直近N件をそのまま渡す）
-    sma_fast, sma_slow: pd.Series（任意）
-    wvf_lit: bool Series（任意）
+    ローソク足＋SMA2本＋WVF背景帯＋下部重ね合わせ出来高のLWCチャート定義を生成する。
+    df: open/high/low/close/date/volume カラムを持つDataFrame（直近N件）
     """
     if df is None or df.empty:
         return None
@@ -609,13 +616,39 @@ def build_lwc_candle_chart(df, sma_fast=None, sma_slow=None, height=200, wvf_lit
             "options": {"color": "#ef5350", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
         })
 
+    # 出来高（Histogram）の重ね合わせ追加
+    if "volume" in df.columns:
+        vol_data = []
+        for t, row in zip(times, df.itertuples()):
+            o, c, v = row.open, row.close, row.volume
+            if pd.isna(v):
+                continue
+            # 陽線なら緑（半透明）、陰線なら赤（半透明）
+            color = "rgba(38, 166, 154, 0.25)" if (pd.isna(o) or pd.isna(c) or c >= o) else "rgba(239, 83, 80, 0.25)"
+            vol_data.append({
+                "time": t,
+                "value": float(v),
+                "color": color
+            })
+            
+        series.append({
+            "type": "Histogram",
+            "data": vol_data,
+            "options": {
+                "priceFormat": {"type": "volume"},
+                "priceScaleId": "",  # 空文字列に設定することでoverlayPriceScalesをターゲットにする
+                "priceLineVisible": False,
+                "lastValueVisible": False,
+            }
+        })
+
     return {"chart": _lwc_base_options(height=height), "series": series}
 
-
-def build_lwc_line_chart(price_series, sma_fast=None, sma_slow=None, wvf_lit=None, height=160):
+def build_lwc_line_chart(price_series, sma_fast=None, sma_slow=None, wvf_lit=None, volume_series=None, height=160):
     """
-    折れ線（絶対価格）＋SMA2本＋WVF背景帯のLWCチャート定義を生成する。
+    折れ線（絶対価格）＋SMA2本＋WVF背景帯＋下部重ね合わせ出来高のLWCチャート定義を生成する。
     price_series: pd.Series（index=DatetimeIndex, values=float）
+    volume_series: pd.Series（index=DatetimeIndex, values=float）※セクター合算売買代金
     """
     if price_series is None or price_series.empty:
         return None
@@ -658,12 +691,48 @@ def build_lwc_line_chart(price_series, sma_fast=None, sma_slow=None, wvf_lit=Non
             "options": {"color": "#ef5350", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
         })
 
+    # 合算売買代金（出来高）の重ね合わせ追加
+    if volume_series is not None and not volume_series.empty:
+        vol_times = _to_lwc_time(volume_series.index)
+        
+        # 色分け判定（前日比プラスなら緑、マイナスなら赤）
+        price_diff = price_series.diff()
+        
+        vol_data = []
+        for t, val, diff in zip(vol_times, volume_series.values, price_diff.values):
+            if pd.isna(val):
+                continue
+            color = "rgba(38, 166, 154, 0.25)" if (pd.isna(diff) or diff >= 0) else "rgba(239, 83, 80, 0.25)"
+            vol_data.append({
+                "time": t,
+                "value": float(val),
+                "color": color
+            })
+            
+        series.append({
+            "type": "Histogram",
+            "data": vol_data,
+            "options": {
+                "priceFormat": {"type": "volume"},
+                "priceScaleId": "",  # overlayPriceScalesをターゲット
+                "priceLineVisible": False,
+                "lastValueVisible": False,
+            }
+        })
+
     return {"chart": _lwc_base_options(height=height), "series": series}
 
 
-def render_lwc_sector_mini(price_series, sma_fast=None, sma_slow=None, wvf_lit=None, key="lwc", height=160):
-    """セクターミニチャートをLWCでレンダリング"""
-    chart_def = build_lwc_line_chart(price_series, sma_fast=sma_fast, sma_slow=sma_slow, wvf_lit=wvf_lit, height=height)
+def render_lwc_sector_mini(price_series, sma_fast=None, sma_slow=None, wvf_lit=None, volume_series=None, key="lwc", height=160):
+    """セクターミニチャートをLWCでレンダリング（出来高対応版）"""
+    chart_def = build_lwc_line_chart(
+        price_series, 
+        sma_fast=sma_fast, 
+        sma_slow=sma_slow, 
+        wvf_lit=wvf_lit, 
+        volume_series=volume_series, 
+        height=height
+    )
     if chart_def is None:
         st.caption("データなし")
         return
@@ -1334,12 +1403,12 @@ def render_sector_rotation_page():
             badge = "🟢" if mom >= 3.0 else "🔴" if mom <= -3.0 else "⚪"
             color_theme = "#26a69a" if mom >= 3.0 else "#ef5350" if mom <= -3.0 else "#9e9e9e"
 
-            # 絶対値チャート用データを算出
+            # 絶対値チャート用データを算出（5番目の戻り値 trading_val をアンパックして受け取る）
             try:
-                sec_abs, sma75, sma200, is_wvf_lit = compute_sector_absolute_data(db_df, tickers, period_days, resample_weekly)
+                sec_abs, sma75, sma200, is_wvf_lit, trading_val = compute_sector_absolute_data(db_df, tickers, period_days, resample_weekly)
                 wvf_active = bool(is_wvf_lit.iloc[-1]) if (is_wvf_lit is not None and not is_wvf_lit.empty) else False
             except Exception:
-                sec_abs, sma75, sma200, is_wvf_lit = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool)
+                sec_abs, sma75, sma200, is_wvf_lit, trading_val = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
                 wvf_active = False
 
             with cols[col_i]:
@@ -1353,9 +1422,11 @@ def render_sector_rotation_page():
                     hc2.metric("", f"{mom:+.2f}%", label_visibility="collapsed")
 
                     if not sec_abs.empty:
+                        # volume_series 引数に売買代金データを渡す
                         render_lwc_sector_mini(
                             sec_abs, sma_fast=sma75, sma_slow=sma200,
-                            wvf_lit=is_wvf_lit, key=f"mini_{sname}", height=160
+                            wvf_lit=is_wvf_lit, volume_series=trading_val,
+                            key=f"mini_{sname}", height=160
                         )
                         st.caption(f"構成: {', '.join(tickers[:3])}...")
                     if st.button("詳細表示", key=f"detail_{sname}", use_container_width=True):
@@ -1392,14 +1463,17 @@ def render_sector_rotation_page():
                             del st.session_state[CUSTOM_SECTOR_KEY][code]
                             st.rerun()
 
+                        # ウォッチリストも同様に5つの戻り値をアンパックして受け取る
                         try:
-                            w_abs, w_sma75, w_sma200, w_wvf_lit = compute_sector_absolute_data(db_df, [code], period_days, resample_weekly)
+                            w_abs, w_sma75, w_sma200, w_wvf_lit, w_trading_val = compute_sector_absolute_data(db_df, [code], period_days, resample_weekly)
                         except Exception:
-                            w_abs, w_sma75, w_sma200, w_wvf_lit = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool)
+                            w_abs, w_sma75, w_sma200, w_wvf_lit, w_trading_val = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
                         if not w_abs.empty:
+                            # volume_series 引数に売買代金データを渡す
                             render_lwc_sector_mini(
                                 w_abs, sma_fast=w_sma75, sma_slow=w_sma200,
-                                wvf_lit=w_wvf_lit, key=f"watch_mini_{code}", height=160
+                                wvf_lit=w_wvf_lit, volume_series=w_trading_val,
+                                key=f"watch_mini_{code}", height=160
                             )
                         else:
                             st.caption("データなし")
@@ -1411,7 +1485,7 @@ def render_sector_rotation_page():
         sel_idx = sector_index_cache.get(sel_name)
         if sel_idx is not None:
             st.plotly_chart(plot_sector_detail_chart(sel_idx, bm_series, sel_name, bm_label), use_container_width=True)
-
+            
 # --- スコア測定ヘルパー ---
 def compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly):
     if db_df.empty: return pd.Series(dtype=float)
@@ -1537,23 +1611,29 @@ def plot_sector_mini_chart(index_series, sector_name, momentum_pct):
 
 
 def compute_sector_absolute_data(db_df, tickers, period_days, resample_weekly):
-    """セクター絶対価格・75SMA・200SMA・WVFシグナルを一括算出して返す"""
+    """セクター絶対価格・75SMA・200SMA・WVFシグナル・合算売買代金を一括算出して返す"""
     if db_df.empty:
-        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool)
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
     db_df = db_df.copy()
     db_df["date"] = pd.to_datetime(db_df["date"]).dt.tz_localize(None)
     end_date = db_df["date"].max()
     fetch_start = end_date - timedelta(days=period_days + 365)
     target_df = db_df[(db_df["date"] >= fetch_start) & (db_df["ticker"].isin(tickers))].copy()
     if target_df.empty:
-        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool)
-
-    if resample_weekly:
-        target_df = target_df.set_index("date")
-        target_df = target_df.groupby("ticker").resample("W-FRI").agg({"close": "last"}).reset_index()
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
 
     close_pivot = target_df.pivot_table(index="date", columns="ticker", values="close").sort_index()
+    volume_pivot = target_df.pivot_table(index="date", columns="ticker", values="volume").sort_index()
+
+    if resample_weekly:
+        close_pivot = close_pivot.resample("W-FRI").last()
+        volume_pivot = volume_pivot.resample("W-FRI").sum()
+
+    # セクター合成絶対価格（終値の平均）
     sector_abs = close_pivot.mean(axis=1)
+
+    # セクター合算売買代金（株価 * 出来高 の総和）
+    trading_val = (close_pivot * volume_pivot).sum(axis=1)
 
     sma75  = sector_abs.rolling(window=75).mean()
     sma200 = sector_abs.rolling(window=200).mean()
@@ -1571,9 +1651,9 @@ def compute_sector_absolute_data(db_df, tickers, period_days, resample_weekly):
     sma75      = sma75[sma75.index           >= display_start]
     sma200     = sma200[sma200.index         >= display_start]
     is_wvf_lit = is_wvf_lit[is_wvf_lit.index >= display_start]
+    trading_val = trading_val[trading_val.index >= display_start]
 
-    return sector_abs, sma75, sma200, is_wvf_lit
-
+    return sector_abs, sma75, sma200, is_wvf_lit, trading_val
 
 def plot_sector_absolute_mini_chart(sector_abs, sma75, sma200, is_wvf_lit, sector_name):
     """絶対値ミニチャート（75SMA・200SMA・WVF背景帯付き）"""
