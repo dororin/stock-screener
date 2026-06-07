@@ -1307,7 +1307,91 @@ def _watchlist_ui():
     else:
         st.caption("まだ銘柄が登録されていません")
 
+# =====================================================================
+# 📊 TOPIX-17 ETF マッピングとマクロ・コア（Layer 1）計算関数 (新規追加)
+# =====================================================================
 
+# 5大マクロ・コアへのTOPIX-17 ETF（1617〜1633）の定義
+TOPIX17_ETF_MAPPING = {
+    "① 金融・金利敏感": ["1631", "1632", "1633"],         # 銀行, 金融除く銀行, 不動産
+    "② ディフェンシブ": ["1617", "1621", "1627", "1628", "1630"], # 食品, 医薬品, 電気・ガス, 運輸・物流, 小売
+    "③ 景気敏感バリュー": ["1618", "1619", "1620", "1623", "1629"], # エネルギー資源, 建設, 素材・化学, 鉄鋼・非鉄, 商社
+    "④ グローバル製造業": ["1622", "1624"],                 # 自動車・輸送機, 機械
+    "⑤ 情報通信・グロース": ["1625", "1626"]               # 電機・精密, 情報通信・サービス他
+}
+
+# TOPIX-17の各コードと日本語名称の対応
+TOPIX17_NAMES = {
+    "1617": "食品", "1618": "エネルギー資源", "1619": "建設・資材", "1620": "素材・化学",
+    "1621": "医薬品", "1622": "自動車・輸送機", "1623": "鉄鋼・非鉄", "1624": "機械",
+    "1625": "電機・精密", "1626": "情報通信・サービス他", "1627": "電気・ガス",
+    "1628": "運輸・物流", "1629": "商社・卸売", "1630": "小売", "1631": "銀行",
+    "1632": "金融（除く銀行）", "1633": "不動産"
+}
+
+def compute_macro_cores_from_db(db_df: pd.DataFrame, period_days: int, resample_weekly: bool = False) -> dict:
+    """
+    Parquetデータベース(db_df)からTOPIX-17 ETF (1617〜1633)のデータを抽出し、
+    5つのマクロ・コア（Layer 1）の累積リターン指数（ベース100）を動的に合成して返します。
+    """
+    all_etfs = [t for etfs in TOPIX17_ETF_MAPPING.values() for t in etfs]
+    
+    etf_df = pd.DataFrame()
+    # 1. データベース内から17業種ETFのデータを切り出し
+    if not db_df.empty:
+        db_df = db_df.copy()
+        db_df["date"] = pd.to_datetime(db_df["date"]).dt.tz_localize(None)
+        end_date = db_df["date"].max()
+        # 計算開始用のバッファ（+30日）を足して切り出す
+        start_date = end_date - timedelta(days=period_days + 30)
+        etf_df = db_df[(db_df["date"] >= start_date) & (db_df["ticker"].isin(all_etfs))].copy()
+        
+    # 2. 万が一データベースに17業種ETFが存在しない場合、yfinanceから自動フォールバックでダウンロード
+    if etf_df.empty or len(etf_df["ticker"].unique()) < 10:
+        symbols = [f"{t}.T" for t in all_etfs]
+        end = datetime.now()
+        start = end - timedelta(days=period_days + 30)
+        try:
+            df_raw = yf.download(symbols, start=start.strftime("%Y-%m-%d"), progress=False)
+            if not df_raw.empty:
+                df_raw = df_raw.xs("Close", axis=1, level=0) if isinstance(df_raw.columns, pd.MultiIndex) else df_raw
+                df_raw = df_raw.reset_index()
+                rows = []
+                for _, row in df_raw.iterrows():
+                    dt = row["Date"]
+                    for sym in symbols:
+                        val = row[sym]
+                        if not pd.isna(val):
+                            rows.append({"date": dt, "ticker": sym.replace(".T", ""), "close": val})
+                etf_df = pd.DataFrame(rows)
+        except Exception:
+            pass
+
+    if etf_df.empty:
+        return {}
+        
+    # 3. ピボットテーブルにして、指定された期間にフィルタリング
+    close_pivot = etf_df.pivot_table(index="date", columns="ticker", values="close").sort_index()
+    if resample_weekly:
+        close_pivot = close_pivot.resample("W-FRI").last()
+        
+    display_start = close_pivot.index.max() - timedelta(days=period_days)
+    close_pivot = close_pivot[close_pivot.index >= display_start]
+    
+    # 4. 各ETFの騰落率から、大セクター（5つのコア）の合成累積リターンを計算
+    returns_df = close_pivot.pct_change()
+    macro_cores = {}
+    for core_name, tickers in TOPIX17_ETF_MAPPING.items():
+        existing_tickers = [t for t in tickers if t in returns_df.columns]
+        if not existing_tickers:
+            continue
+        core_return = returns_df[existing_tickers].mean(axis=1)
+        core_index = (1 + core_return).cumprod() * 100
+        if len(core_index) > 0:
+            core_index.iloc[0] = 100.0
+        macro_cores[core_name] = core_index
+        
+    return macro_cores
 
 def render_sector_rotation_page():
     st.title("🔄 セクターローテーション分析（統合版）")
@@ -1315,6 +1399,7 @@ def render_sector_rotation_page():
     if CUSTOM_SECTOR_KEY not in st.session_state:
         loaded = load_watchlist_from_sheets()
         st.session_state[CUSTOM_SECTOR_KEY] = loaded
+
     with st.sidebar:
         st.subheader("⚙️ 表示設定")
         market_mode = st.radio("マーケット", ["日本株 🇯🇵", "米国株 🇺🇸"], horizontal=True)
@@ -1338,125 +1423,176 @@ def render_sector_rotation_page():
 
         _watchlist_ui()
 
-    with st.spinner("セクター構成をスプレッドシートから読み込み中..."):
-        sectors = load_sector_master_from_sheets(is_jp)
-
     db_df = load_unified_db(interval, is_jp=is_jp)
-
     if db_df.empty:
         st.info("💡 データベースがまだ作成されていません。「データ管理・保守」画面で差分ダウンロードを実行してください。")
         return
 
     bm_series = get_benchmark_data(bm_ticker, period_days, interval) if bm_ticker else None
 
-    sector_index_cache = {}
-    momentum_scores = {}
-    for sname, tickers in sectors.items():
-        idx_series = compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly)
-        if not idx_series.empty:
-            plot_series = relativize_series(idx_series, bm_series)
-            sector_index_cache[sname] = plot_series
-            momentum_scores[sname] = get_sector_momentum(plot_series, days=min(5, period_days))
+    # =========================================================================
+    # 🇯🇵 日本株モード（Layer 1: 5大マクロ・コア ⇄ 17業種ドリルダウン）
+    # =========================================================================
+    if is_jp:
+        with st.spinner("TOPIX-17 ETFデータから5大マクロ・コア指数を計算中..."):
+            macro_cores = compute_macro_cores_from_db(db_df, period_days, resample_weekly)
 
-    if momentum_scores:
-        sorted_sectors = sorted(momentum_scores.items(), key=lambda x: x[1], reverse=True)
-        st.markdown("### 📊 モメンタムランキング（直近5日）")
-        rank_cols = st.columns(6)
-        for i, (sname, mom) in enumerate(sorted_sectors[:3]):
-            with rank_cols[i]: st.metric(f"🟢 #{i+1}", sname, f"{mom:+.2f}%")
-        for i, (sname, mom) in enumerate(sorted_sectors[-3:]):
-            with rank_cols[i+3]: st.metric(f"🔴 #{len(sorted_sectors)-2+i}", sname, f"{mom:+.2f}%")
-        st.divider()
+        if macro_cores:
+            # 1. 5大コアのモメンタム表示
+            momentum_scores = {}
+            for core_name, series in macro_cores.items():
+                if not series.empty:
+                    momentum_scores[core_name] = get_sector_momentum(series, days=min(5, period_days))
+            
+            st.markdown("### 📊 Layer 1: 5大マクロ・コア モメンタム（直近5日）")
+            core_cols = st.columns(5)
+            for i, (core_name, mom) in enumerate(momentum_scores.items()):
+                badge = "🟢" if mom >= 0 else "🔴"
+                with core_cols[i]:
+                    st.metric(f"{badge} {core_name[2:]}", f"{mom:+.2f}%") # "① "などのインデックスを省いて表示
 
-    # =========================================================
-    # 📊 セクター相対強度（RS）重ね合わせ比較チャート（LWC版へ統合）
-    # =========================================================
-    if sector_index_cache:
-        st.markdown("### 📊 セクター相対強度（RS）重ね合わせ比較（リベース表示）")
+            st.divider()
 
-        # 期間累積リターン（最終値 - 100）でセクターをランク付け
-        sector_returns = {}
-        for sname, series in sector_index_cache.items():
-            if series is not None and not series.empty and len(series) >= 1:
+            # 2. 相対強度重ね合わせチャート（LWC版）
+            st.markdown("### 📈 5大マクロ・コア 相対強度（RS）重ね合わせ比較")
+            
+            # 各大セクターに対する相対強度（リベース）の適用
+            rel_macro_cores = {}
+            for core_name, series in macro_cores.items():
+                rel_macro_cores[core_name] = relativize_series(series, bm_series)
+
+            render_lwc_rs_overlay(
+                sector_index_cache=rel_macro_cores,
+                selected_sectors=list(rel_macro_cores.keys()),
+                height=450,
+                key="macro_cores_lwc"
+            )
+
+            st.divider()
+
+            # 3. 親子構造による17業種ドリルダウン表示
+            st.markdown(f"### 📂 5大マクロ・コア別 17業種ドリルダウン（{period_label} / {tf_label}）")
+            for core_name, etf_codes in TOPIX17_ETF_MAPPING.items():
+                with st.expander(f"📁 {core_name} ({len(etf_codes)}業種を展開)", expanded=True):
+                    etf_cols = st.columns(n_cols)
+                    for idx, code in enumerate(etf_codes):
+                        col_idx = idx % n_cols
+                        name = TOPIX17_NAMES.get(code, f"業種 {code}")
+
+                        # 17業種それぞれのモメンタム算出
+                        single_series = compute_sector_index_from_df(db_df, [code], period_days, resample_weekly)
+                        single_series = relativize_series(single_series, bm_series)
+                        mom_single = get_sector_momentum(single_series, days=min(5, period_days)) if not single_series.empty else 0.0
+                        badge = "🟢" if mom_single >= 3.0 else "🔴" if mom_single <= -3.0 else "⚪"
+                        color_theme = "#26a69a" if mom_single >= 3.0 else "#ef5350" if mom_single <= -3.0 else "#9e9e9e"
+
+                        # 17業種の絶対価格、移動平均、WVF、売買代金の算出
+                        try:
+                            sec_abs, sma75, sma200, is_wvf_lit, trading_val = compute_sector_absolute_data(db_df, [code], period_days, resample_weekly)
+                            wvf_active = bool(is_wvf_lit.iloc[-1]) if (is_wvf_lit is not None and not is_wvf_lit.empty) else False
+                        except Exception:
+                            sec_abs, sma75, sma200, is_wvf_lit, trading_val = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
+                            wvf_active = False
+
+                        with etf_cols[col_idx]:
+                            with st.container(border=True):
+                                hc1, hc2 = st.columns([3, 1])
+                                wvf_badge = " <span style='color:#ef5350;font-weight:bold;'>🔥 押し目</span>" if wvf_active else ""
+                                hc1.markdown(f"<span style='font-weight:600;color:{color_theme}'>{badge} {code} {name}</span>{wvf_badge}", unsafe_allow_html=True)
+                                hc2.metric("", f"{mom_single:+.2f}%", label_visibility="collapsed")
+
+                                if not sec_abs.empty:
+                                    render_lwc_sector_mini(
+                                        sec_abs, sma_fast=sma75, sma_slow=sma200,
+                                        wvf_lit=is_wvf_lit, volume_series=trading_val,
+                                        key=f"topix17_mini_{code}", height=160
+                                    )
+                                else:
+                                    st.caption("データ未検出（DB更新を実行してください）")
+
+    # =========================================================================
+    # 🇺🇸 米国株モード（従来のGICS / スプレッドシート読み込み）
+    # =========================================================================
+    else:
+        with st.spinner("セクター構成をスプレッドシートから読み込み中..."):
+            sectors = load_sector_master_from_sheets(is_jp)
+
+        sector_index_cache = {}
+        momentum_scores = {}
+        for sname, tickers in sectors.items():
+            idx_series = compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly)
+            if not idx_series.empty:
+                plot_series = relativize_series(idx_series, bm_series)
+                sector_index_cache[sname] = plot_series
+                momentum_scores[sname] = get_sector_momentum(plot_series, days=min(5, period_days))
+
+        if momentum_scores:
+            sorted_sectors = sorted(momentum_scores.items(), key=lambda x: x[1], reverse=True)
+            st.markdown("### 📊 モメンタムランキング（直近5日）")
+            rank_cols = st.columns(6)
+            for i, (sname, mom) in enumerate(sorted_sectors[:3]):
+                with rank_cols[i]: st.metric(f"🟢 #{i+1}", sname, f"{mom:+.2f}%")
+            for i, (sname, mom) in enumerate(sorted_sectors[-3:]):
+                with rank_cols[i+3]: st.metric(f"🔴 #{len(sorted_sectors)-2+i}", sname, f"{mom:+.2f}%")
+            st.divider()
+
+        if sector_index_cache:
+            st.markdown("### 📊 セクター相対強度（RS）重ね合わせ比較（リベース表示）")
+            all_sector_names = list(sector_index_cache.keys())
+            selected_sectors = st.multiselect(
+                "表示するセクターを選択",
+                options=all_sector_names,
+                default=all_sector_names[:min(6, len(all_sector_names))],
+                key="rs_overlay_multiselect"
+            )
+            render_lwc_rs_overlay(
+                sector_index_cache=sector_index_cache,
+                selected_sectors=selected_sectors,
+                height=450,
+                key="rs_overlay_lwc"
+            )
+            st.divider()
+
+        st.markdown(f"### 📈 セクターミニチャート（{period_label} / {tf_label}）")
+        sector_list = list(sectors.items())
+        rows_needed = (len(sector_list) + n_cols - 1) // n_cols
+
+        for row_i in range(rows_needed):
+            cols = st.columns(n_cols)
+            for col_i in range(n_cols):
+                idx = row_i * n_cols + col_i
+                if idx >= len(sector_list): break
+                sname, tickers = sector_list[idx]
+                mom = momentum_scores.get(sname, 0.0)
+                badge = "🟢" if mom >= 3.0 else "🔴" if mom <= -3.0 else "⚪"
+                color_theme = "#26a69a" if mom >= 3.0 else "#ef5350" if mom <= -3.0 else "#9e9e9e"
+
                 try:
-                    sector_returns[sname] = float(series.iloc[-1]) - 100.0
+                    sec_abs, sma75, sma200, is_wvf_lit, trading_val = compute_sector_absolute_data(db_df, tickers, period_days, resample_weekly)
+                    wvf_active = bool(is_wvf_lit.iloc[-1]) if (is_wvf_lit is not None and not is_wvf_lit.empty) else False
                 except Exception:
-                    pass
+                    sec_abs, sma75, sma200, is_wvf_lit, trading_val = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
+                    wvf_active = False
 
-        all_sector_names = list(sector_index_cache.keys())
+                with cols[col_i]:
+                    with st.container(border=True):
+                        hc1, hc2 = st.columns([3, 1])
+                        wvf_badge = " <span style='color:#ef5350;font-weight:bold;'>🔥 押し目</span>" if wvf_active else ""
+                        hc1.markdown(f"<span style='font-weight:600;color:{color_theme}'>{badge} {sname}</span>{wvf_badge}", unsafe_allow_html=True)
+                        hc2.metric("", f"{mom:+.2f}%", label_visibility="collapsed")
 
-        if sector_returns:
-            sorted_by_return = sorted(sector_returns.items(), key=lambda x: x[1], reverse=True)
-            top3 = [s for s, _ in sorted_by_return[:3]]
-            bottom3 = [s for s, _ in sorted_by_return[-3:]]
-            # 重複排除（セクター数が少ない場合）
-            default_selected = list(dict.fromkeys(top3 + bottom3))
-        else:
-            default_selected = all_sector_names[:min(6, len(all_sector_names))]
+                        if not sec_abs.empty:
+                            render_lwc_sector_mini(
+                                sec_abs, sma_fast=sma75, sma_slow=sma200,
+                                wvf_lit=is_wvf_lit, volume_series=trading_val,
+                                key=f"mini_{sname}", height=160
+                            )
+                        else:
+                            st.caption("データなし")
 
-        selected_sectors = st.multiselect(
-            "表示するセクターを選択（初期値：上位3＋下位3）",
-            options=all_sector_names,
-            default=default_selected,
-            key="rs_overlay_multiselect",
-            help="上位3セクター（強気）と下位3セクター（弱気）が自動選出されています。自由に追加・削除できます。"
-        )
-
-        # LWC重ね合わせ表示関数を呼び出し
-        render_lwc_rs_overlay(
-            sector_index_cache=sector_index_cache,
-            selected_sectors=selected_sectors,
-            height=450,
-            key="rs_overlay_lwc"
-        )
-
-        st.divider()
-
-    st.markdown(f"### 📈 セクターミニチャート（{period_label} / {tf_label}）")
-    sector_list = list(sectors.items())
-    rows_needed = (len(sector_list) + n_cols - 1) // n_cols
-
-    if "selected_sector" not in st.session_state: st.session_state.selected_sector = None
-
-    for row_i in range(rows_needed):
-        cols = st.columns(n_cols)
-        for col_i in range(n_cols):
-            idx = row_i * n_cols + col_i
-            if idx >= len(sector_list): break
-            sname, tickers = sector_list[idx]
-            mom = momentum_scores.get(sname, 0.0)
-            badge = "🟢" if mom >= 3.0 else "🔴" if mom <= -3.0 else "⚪"
-            color_theme = "#26a69a" if mom >= 3.0 else "#ef5350" if mom <= -3.0 else "#9e9e9e"
-
-            # 絶対値チャート用データを算出（5番目の戻り値 trading_val をアンパックして受け取る）
-            try:
-                sec_abs, sma75, sma200, is_wvf_lit, trading_val = compute_sector_absolute_data(db_df, tickers, period_days, resample_weekly)
-                wvf_active = bool(is_wvf_lit.iloc[-1]) if (is_wvf_lit is not None and not is_wvf_lit.empty) else False
-            except Exception:
-                sec_abs, sma75, sma200, is_wvf_lit, trading_val = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
-                wvf_active = False
-
-            with cols[col_i]:
-                with st.container(border=True):
-                    hc1, hc2 = st.columns([3, 1])
-                    wvf_badge = " <span style='color:#ef5350;font-weight:bold;'>🔥 押し目検出</span>" if wvf_active else ""
-                    hc1.markdown(
-                        f"<span style='font-weight:600;color:{color_theme}'>{badge} {sname}</span>{wvf_badge}",
-                        unsafe_allow_html=True
-                    )
-                    hc2.metric("", f"{mom:+.2f}%", label_visibility="collapsed")
-
-                    if not sec_abs.empty:
-                        # volume_series 引数に売買代金データを渡す
-                        render_lwc_sector_mini(
-                            sec_abs, sma_fast=sma75, sma_slow=sma200,
-                            wvf_lit=is_wvf_lit, volume_series=trading_val,
-                            key=f"mini_{sname}", height=160
-                        )
-                        st.caption(f"構成: {', '.join(tickers[:3])}...")
-                    if st.button("詳細表示", key=f"detail_{sname}", use_container_width=True):
-                        st.session_state.selected_sector = sname
-
+    # =========================================================================
+    # 📌 共通ウォッチリスト（個別銘柄）
+    # =========================================================================
     custom_tickers = st.session_state.get(CUSTOM_SECTOR_KEY, {})
     if custom_tickers:
         st.divider()
@@ -1486,15 +1622,15 @@ def render_sector_rotation_page():
                         hc2.metric("", f"{mom_single:+.2f}%", label_visibility="collapsed")
                         if hc3.button("🗑️", key=f"watchlist_del_{code}", help=f"{code}を削除"):
                             del st.session_state[CUSTOM_SECTOR_KEY][code]
+                            st.write("") # 画面の再描画を誘発
                             st.rerun()
 
-                        # ウォッチリストも同様に5つの戻り値をアンパックして受け取る
                         try:
                             w_abs, w_sma75, w_sma200, w_wvf_lit, w_trading_val = compute_sector_absolute_data(db_df, [code], period_days, resample_weekly)
                         except Exception:
                             w_abs, w_sma75, w_sma200, w_wvf_lit, w_trading_val = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
+                        
                         if not w_abs.empty:
-                            # volume_series 引数に売買代金データを渡す
                             render_lwc_sector_mini(
                                 w_abs, sma_fast=w_sma75, sma_slow=w_sma200,
                                 wvf_lit=w_wvf_lit, volume_series=w_trading_val,
@@ -1502,14 +1638,6 @@ def render_sector_rotation_page():
                             )
                         else:
                             st.caption("データなし")
-
-    if st.session_state.selected_sector and st.session_state.selected_sector in sectors:
-        st.divider()
-        sel_name = st.session_state.selected_sector
-        st.markdown(f"### 🔍 詳細分析: {sel_name}")
-        sel_idx = sector_index_cache.get(sel_name)
-        if sel_idx is not None:
-            st.plotly_chart(plot_sector_detail_chart(sel_idx, bm_series, sel_name, bm_label), use_container_width=True)
 
 # --- スコア測定ヘルパー ---
 def compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly):
