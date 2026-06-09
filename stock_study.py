@@ -1436,7 +1436,7 @@ def scan_all_anomalies(
 
     print(f"⚠️ {len(result)}件の異常箇所を検出しました（{result['ticker'].nunique()}銘柄）")
     return result
-    
+
 # ==============================================================================
 # [修正4] apply_scale_repair_with_intraday_propagation()
 #         日足修正 → 分足DBへの自動波及
