@@ -1273,85 +1273,32 @@ def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
     df = df.sort_values("date").reset_index(drop=True)
     price_cols = [c for c in ["open", "high", "low", "close"] if c in df.columns]
     repairs = []
-    processed_idxs = set()
 
     ticker_label = df["ticker"].iloc[0] if "ticker" in df.columns else ""
 
-    # ==================================================================
-    # 【追加防衛策】検出②に進む前に、残っているマイナス価格を一律で絶対値に事前変換する
-    # ==================================================================
-    if (df["close"] < 0).any():
-        print(f"  ℹ️ [{ticker_label}] 未処理の負の株価を検出。安全のため全データを絶対値に変換します。")
-        for col in price_cols:
-            df[col] = df[col].abs()
-
     # ------------------------------------------------------------------
-    # 検出①：負の株価を直接検出
-    # 崖位置 = 負の株価ブロックの「直後の正常値行」
-    # 例: ..., 負, 負, 負, [正] ← ここが崖（idxはこの行）
+    # 処理①：負の値を一律で絶対値に変換する（正負切り替わりの有無に関わらず安全に対処）
     # ------------------------------------------------------------------
     negative_mask = df["close"] < 0
     if negative_mask.any():
-        # 負→正に切り替わる行（崖の「後」側 = 正常値の先頭）を特定
-        neg_to_pos = (~negative_mask) & (negative_mask.shift(1, fill_value=False))
-        cliff_idxs_neg = df[neg_to_pos].index.tolist()
-
-        for idx in sorted(cliff_idxs_neg, reverse=True):
-            if idx == 0:
-                continue
-
-            # 崖の「後」側（正常値）と「前」側（負値ブロックの最後）
-            after_price = df.loc[idx, "close"]
-            # 負値ブロック全体を対象にするため idx-1 から遡って負値の開始点を探す
-            neg_start = idx - 1
-            while neg_start > 0 and df.loc[neg_start, "close"] < 0:
-                neg_start -= 1
-
-            before_price = after_price  # 負値ブロック全体を正常値に合わせる
-            cliff_date = df.loc[idx, "date"]
-
-            # 負値ブロック全体（neg_start〜idx-1）を正常値の絶対値で置き換える
-            # 負値の場合は単純な乗算では直らないため絶対値変換で対応
-            neg_block_mask = (df.index >= neg_start) & (df.index < idx) & (df["close"] < 0)
-            if neg_block_mask.any():
-                # 負値の絶対値をそのまま正常値として使う（符号を反転）
-                for col in price_cols:
-                    df.loc[neg_block_mask, col] = df.loc[neg_block_mask, col].abs()
-
-                # neg_startより古いデータへの倍率は「負値ブロック直前の正常値」で計算
-                if neg_start > 0:
-                    pre_normal_price = df.loc[neg_start, "close"]
-                    # neg_startの価格がafter_priceと大きく乖離していれば遡及調整
-                    if pre_normal_price > 0 and abs(pre_normal_price / after_price - 1) > threshold:
-                        multiplier = after_price / pre_normal_price
-                        for col in price_cols:
-                            df.loc[:neg_start - 1, col] = df.loc[:neg_start - 1, col] * multiplier
-                        if "volume" in df.columns:
-                            df.loc[:neg_start - 1, "volume"] = df.loc[:neg_start - 1, "volume"] / multiplier
-                    else:
-                        multiplier = 1.0
-                else:
-                    multiplier = 1.0
-
-                processed_idxs.add(idx)
-                repairs.append({
-                    "cliff_date": cliff_date,
-                    "multiplier": multiplier,
-                    "before_close": round(float(df.loc[idx - 1, "close"]), 3),
-                    "after_close": round(float(after_price), 3),
-                })
-                print(f"  🔧 [{ticker_label}] 負の株価修正: {cliff_date} | "
-                      f"負値ブロック({neg_block_mask.sum()}行)を絶対値変換 | multiplier={multiplier:.6f}")
+        print(f"  🔧 [{ticker_label}] 負の株価を検出。安全のため全データを絶対値に変換します。")
+        for col in price_cols:
+            df[col] = df[col].abs()
+        
+        # 変換ログを記録
+        repairs.append({
+            "cliff_date": df.loc[negative_mask, "date"].iloc[0],
+            "multiplier": 1.0,
+            "before_close": "負の数",
+            "after_close": "絶対値変換",
+        })
 
     # ------------------------------------------------------------------
-    # 検出②：pct_changeによる急変検出
-    # valid_maskによる除外なし・絶対値で判定
+    # 処理②：絶対値変換されたデータに対して、変化率で崖を検出・修正する
     # ------------------------------------------------------------------
     pct_changes = df["close"].pct_change()
     cliff_mask = pct_changes.abs() >= threshold
     cliffs = pct_changes[cliff_mask].index.tolist()
-    # 検出①で処理済みの行は除外
-    cliffs = [i for i in cliffs if i not in processed_idxs]
 
     cliffs.sort(reverse=True)
 
@@ -1363,9 +1310,6 @@ def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
         before_price = df.loc[idx - 1, "close"]
 
         if before_price == 0 or after_price == 0:
-            continue
-        # 負の株価が残っている場合はスキップ（検出①で対処済みのはず）
-        if before_price < 0 or after_price < 0:
             continue
 
         multiplier = after_price / before_price
@@ -1388,7 +1332,6 @@ def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
 
     return df, repairs
 
-
 # ==============================================================================
 # [修正3] scan_all_anomalies() - 全銘柄ベクトル走査による異常検出
 # ==============================================================================
@@ -1398,20 +1341,6 @@ def scan_all_anomalies(
     interval: str = "1d",
     threshold: float = 0.35
 ) -> pd.DataFrame:
-    """
-    指定時間足のDBを全銘柄ベクトル走査して異常箇所を検出する。
-    ダウンロード時ではなく後工程での一括チェックに使用する。
-
-    検出ロジック：
-    1. 負の株価を最優先で直接検出（pct_change不要・確実）
-    2. pct_changeによる急変検出（valid_maskによる除外はしない）
-       ※負値同士のpct_changeは符号が反転するため絶対値で判定
-
-    Returns
-    -------
-    pd.DataFrame: 異常が検出された銘柄・日付の一覧
-        列: ticker, cliff_date, before_close, after_close, pct_change, anomaly_type
-    """
     try:
         db_df = load_price_db(interval, is_jp=is_jp)
     except FileNotFoundError as e:
@@ -1423,37 +1352,35 @@ def scan_all_anomalies(
         return pd.DataFrame()
 
     db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
-
     result_rows = []
 
     # ------------------------------------------------------------------
-    # 検出①：負の株価を直接検出（最優先・最確実）
-    # 負値は変化率計算に依存しないため出来高ゼロでも確実に検出できる
+    # 検出①：負の株価の「境界線（入り口と出口）」だけを検出（何百行も並ぶのを防ぐ）
     # ------------------------------------------------------------------
     negative_mask = db_df["close"] < 0
-    if negative_mask.any():
-        neg_rows = db_df[negative_mask].copy()
-        neg_rows["before_close"] = db_df["close"].shift(1)[negative_mask].values
-        neg_rows["after_close"] = neg_rows["close"]
-        neg_rows["pct_change"] = float("nan")  # 負値は変化率が意味をなさない
-        neg_rows["anomaly_type"] = "負の株価"
-        result_rows.append(neg_rows[["ticker", "date", "before_close", "after_close", "pct_change", "anomaly_type"]])
+    
+    # 正常→負への切り替わり（入り口）
+    pos_to_neg = negative_mask & (~negative_mask.shift(1, fill_value=False))
+    # 負→正常への切り替わり（出口）
+    neg_to_pos = (~negative_mask) & (negative_mask.shift(1, fill_value=False))
+    
+    boundary_mask = pos_to_neg | neg_to_pos
+    
+    if boundary_mask.any():
+        boundary_rows = db_df[boundary_mask].copy()
+        boundary_rows["before_close"] = db_df["close"].shift(1)[boundary_mask].values
+        boundary_rows["after_close"] = boundary_rows["close"]
+        boundary_rows["pct_change"] = float("nan")
+        boundary_rows["anomaly_type"] = "負の株価（切り替え境界）"
+        result_rows.append(boundary_rows[["ticker", "date", "before_close", "after_close", "pct_change", "anomaly_type"]])
 
     # ------------------------------------------------------------------
-    # 検出②：pct_changeによる急変検出
-    # valid_maskによる除外はしない（出来高ゼロ行を除外すると崖位置がずれる）
-    # 負値同士のpct_changeは符号が反転するためabs()で絶対値判定
+    # 検出②：株価の絶対値ベースによる急変（崖）検出（マイナスであっても崖を検知可能に）
     # ------------------------------------------------------------------
-    pct = (
-        db_df["close"]
-        .groupby(db_df["ticker"])
-        .pct_change()
-    )
+    abs_close = db_df["close"].abs()
+    pct = abs_close.groupby(db_df["ticker"]).pct_change()
 
-    # 絶対値で閾値判定（負値時の符号反転対策）
     cliff_mask = pct.abs() >= threshold
-    # すでに検出済みの負の株価行は重複除けで除外
-    cliff_mask = cliff_mask & ~negative_mask
 
     if cliff_mask.any():
         cliff_rows = db_df[cliff_mask].copy()
@@ -1469,15 +1396,10 @@ def scan_all_anomalies(
 
     result = pd.concat(result_rows, ignore_index=True)
     result = result.rename(columns={"date": "cliff_date"})
-    # 負の株価を先頭に、次いでpct_changeの絶対値が大きい順に表示
-    result = result.sort_values(
-        ["anomaly_type", "pct_change"],
-        ascending=[True, True]
-    ).reset_index(drop=True)
+    result = result.sort_values(["ticker", "cliff_date"]).reset_index(drop=True)
 
     print(f"⚠️ {len(result)}件の異常箇所を検出しました（{result['ticker'].nunique()}銘柄）")
     return result
-
 
 # ==============================================================================
 # [修正4] apply_scale_repair_with_intraday_propagation()
