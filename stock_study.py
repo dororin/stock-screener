@@ -1141,7 +1141,7 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d") -> bool:
     else:  # "1d" (日足)
         # スクリーニングに必要な移動平均期間（200日以上）を十分に満たし、
         # ダウンロード負荷を現実的に抑えるため「2020年以降(約6年間)」をデフォルトに設定
-        start_date_dt = datetime(2020, 1, 1)
+        start_date_dt = datetime(2000, 1, 1)
         
     print(f"🚨 [全体一括再構築] {market_name} ({interval}) をゼロから新規作成します。 (開始日: {start_date_dt.strftime('%Y-%m-%d')})")
     
