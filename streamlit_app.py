@@ -228,6 +228,73 @@ def save_watchlist_to_sheets(watchlist: dict):
 
 
 # =====================================================================
+# 🔧 修復ログ管理（Google Sheets: repair_log シート）
+# =====================================================================
+REPAIR_LOG_SHEET_NAME = "repair_log"
+
+REPAIR_LOG_COLUMNS = [
+    "executed_at",   # 実行日時
+    "ticker",        # 銘柄コード
+    "market",        # JP / US
+    "cliff_date",    # 崖日付
+    "interval",      # 適用時間足
+    "before_close",  # 崖直前の終値
+    "after_close",   # 崖直後の終値
+    "multiplier",    # 適用倍率
+    "memo",          # 備考
+]
+
+def save_repair_log_to_sheets(log_rows: list) -> bool:
+    """修復ログをGoogle Sheetsのrepair_logシートに追記する。"""
+    if not log_rows:
+        return False
+    sh = get_sector_spreadsheet()
+    if sh is None:
+        return False
+    try:
+        try:
+            ws = sh.worksheet(REPAIR_LOG_SHEET_NAME)
+        except Exception:
+            ws = sh.add_worksheet(title=REPAIR_LOG_SHEET_NAME, rows=1000, cols=len(REPAIR_LOG_COLUMNS))
+            ws.update([REPAIR_LOG_COLUMNS], "A1")
+
+        existing = ws.get_all_values()
+        next_row = len(existing) + 1
+        rows_to_append = [
+            [str(row.get(col, "")) for col in REPAIR_LOG_COLUMNS]
+            for row in log_rows
+        ]
+        ws.update(rows_to_append, f"A{next_row}")
+        return True
+    except Exception as e:
+        print(f"⚠️ 修復ログ保存エラー: {e}")
+        return False
+
+
+def load_repair_log_from_sheets() -> pd.DataFrame:
+    """Google SheetsのrepairログシートからログをDataFrameで返す。"""
+    sh = get_sector_spreadsheet()
+    if sh is None:
+        return pd.DataFrame(columns=REPAIR_LOG_COLUMNS)
+    try:
+        ws = sh.worksheet(REPAIR_LOG_SHEET_NAME)
+        records = ws.get_all_records()
+        if not records:
+            return pd.DataFrame(columns=REPAIR_LOG_COLUMNS)
+        df = pd.DataFrame(records)
+        if "executed_at" in df.columns:
+            df["executed_at"] = pd.to_datetime(df["executed_at"], errors="coerce")
+        if "cliff_date" in df.columns:
+            df["cliff_date"] = pd.to_datetime(df["cliff_date"], errors="coerce")
+        for col in ["before_close", "after_close", "multiplier"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df.sort_values("executed_at", ascending=False).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=REPAIR_LOG_COLUMNS)
+
+
+# =====================================================================
 # 📂 データベースアクセス関数
 # =====================================================================
 @st.cache_data(ttl=300)
@@ -2447,10 +2514,31 @@ if selected_page == "データ管理・保守":
     st.write(
         "特定の銘柄においてデータの欠損や分割による不整合が発生した場合、既存の古い蓄積データを破壊することなく、"
         "すべての時間足（1d, 60m, 5m, 1m）に対して一括で重複排除マージ治療を実行します。"
-        "治療期間内に40%以上の急落ギャップを検知した場合は自動で逆算調整します。"
+        "治療期間内に35%以上の急落ギャップを検知した場合は自動で逆算調整します。"
     )
-    
-    # 列数を調整して、時間足選択を廃止し、代わりに比率入力欄を設置します
+
+    # --- 【追加】異常スキャン ---
+    with st.expander("🔍 異常データスキャン（修復対象の特定）", expanded=False):
+        st.caption("全銘柄の日足DBをスキャンして35%以上の急変箇所を検出します。修復が必要な銘柄コードを特定してから下の修復フォームで実行してください。")
+        if st.button("🔍 異常スキャン実行", key="btn_anomaly_scan"):
+            with st.spinner("全銘柄をスキャン中... しばらくお待ちください"):
+                anomalies = stock_study.scan_all_anomalies(is_jp=is_jp, interval="1d")
+            if anomalies.empty:
+                st.success("✅ 異常箇所は検出されませんでした。")
+            else:
+                st.warning(f"⚠️ {len(anomalies)}件の異常箇所を検出（{anomalies['ticker'].nunique()}銘柄）")
+                display_df = anomalies.copy()
+                if "cliff_date" in display_df.columns:
+                    display_df["cliff_date"] = pd.to_datetime(display_df["cliff_date"]).dt.strftime("%Y-%m-%d")
+                if "pct_change" in display_df.columns:
+                    display_df["pct_change"] = (display_df["pct_change"] * 100).round(1).astype(str) + "%"
+                display_df.columns = ["銘柄", "崖日付", "前日終値", "当日終値", "変化率"]
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+                st.caption("↑ 銘柄コードを下の修復フォームに入力して修復を実行できます")
+
+    st.divider()
+
+    # --- 修復フォーム ---
     rep_col1, rep_col2, rep_col3 = st.columns([3, 2, 1])
     with rep_col1:
         rep_ticker = st.text_input("安全一括修復を実行する銘柄コードを入力してください", placeholder="例: 1306 や AAPL", key="rep_ticker_box")
@@ -2460,14 +2548,14 @@ if selected_page == "データ管理・保守":
         st.write(" ")
         st.write(" ")
         btn_repair = st.button("🔧 安全一括修復を実行", use_container_width=True)
-        
+
     if btn_repair:
         if not rep_ticker:
             st.error("銘柄コードが入力されていません。")
         else:
             pure_t = stock_study.sanitize_ticker(rep_ticker, is_jp=is_jp)
-            
-            # 入力された比率文字列を float に変換
+            market_str = "JP" if is_jp else "US"
+
             forced_ratio = None
             if rep_ratio_str.strip():
                 try:
@@ -2475,26 +2563,110 @@ if selected_page == "データ管理・保守":
                 except ValueError:
                     st.error("比率は有効な数字（例: 10.0）で入力してください。")
                     st.stop()
-            
-            with st.spinner(f"🔧 [{pure_t}] の全時間足（1d, 60m, 5m, 1m）を一括修復マージ中..."):
-                # 新しく追加した一括修復関数を呼び出し、結果（辞書型）を取得
-                results = stock_study.repair_single_ticker_all_timeframes(
-                    pure_t, 
-                    is_jp=is_jp, 
+
+            with st.spinner(f"🔧 [{pure_t}] の全時間足（1d, 60m, 5m, 1m）を一括修復中..."):
+
+                # ① 既存の repair_single_ticker_all_timeframes による通常修復
+                results_legacy = stock_study.repair_single_ticker_all_timeframes(
+                    pure_t,
+                    is_jp=is_jp,
                     forced_split_ratio=forced_ratio
                 )
-                
-                # 画面更新用にキャッシュをクリア
+
+                # ② backward_scale_repair による異常値修復（日足+分足波及）
+                results_scale = stock_study.apply_scale_repair_with_intraday_propagation(
+                    pure_t,
+                    is_jp=is_jp,
+                    threshold=0.35,
+                    dry_run=False
+                )
+
                 get_db_last_update.clear()
                 load_unified_db.clear()
-                
-                # 各時間足の修復結果をレポート表示
+
+                # --- 修復結果レポート表示 ---
                 st.write("### 📋 修復完了レポート:")
-                for interval, msg in results.items():
-                    if "修復成功" in msg:
-                        st.success(f"**{interval}**: {msg}")
+                for interval, msg in results_legacy.items():
+                    icon = "✅" if "修復成功" in msg else "⚠️"
+                    st.write(f"{icon} **{interval}** (通常修復): {msg}")
+
+                repair_details = results_scale.pop("repair_details", [])
+                results_scale.pop("ticker", None)
+                for interval, msg in results_scale.items():
+                    icon = "✅" if "修正" in msg or "波及" in msg else "ℹ️"
+                    st.write(f"{icon} **{interval}** (崖修復): {msg}")
+
+                # --- Google Sheets にログ保存 ---
+                executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if repair_details:
+                    log_rows = [
+                        {
+                            "executed_at": executed_at,
+                            "ticker": pure_t,
+                            "market": market_str,
+                            "cliff_date": r["cliff_date"].strftime("%Y-%m-%d") if hasattr(r["cliff_date"], "strftime") else str(r["cliff_date"]),
+                            "interval": "1d→all",
+                            "before_close": r.get("before_close", ""),
+                            "after_close": r.get("after_close", ""),
+                            "multiplier": r.get("multiplier", ""),
+                            "memo": "backward_scale_repair 閾値35%",
+                        }
+                        for r in repair_details
+                    ]
+                    saved = save_repair_log_to_sheets(log_rows)
+                    if saved:
+                        st.success(f"✅ 修復ログをGoogle Sheetsに保存しました（{len(log_rows)}件）")
                     else:
-                        st.warning(f"**{interval}**: {msg}")
+                        st.warning("⚠️ ログのGoogle Sheets保存に失敗しました（修復処理自体は完了しています）")
+                else:
+                    # 崖なし（通常修復のみ）も記録
+                    save_repair_log_to_sheets([{
+                        "executed_at": executed_at,
+                        "ticker": pure_t,
+                        "market": market_str,
+                        "cliff_date": "",
+                        "interval": "all",
+                        "before_close": "",
+                        "after_close": "",
+                        "multiplier": "",
+                        "memo": "通常修復のみ（崖なし）",
+                    }])
+
+    st.divider()
+
+    # --- 【追加】修復ログ一覧 ---
+    with st.expander("📋 修復ログ一覧", expanded=False):
+        st.caption("Google Sheetsに保存された過去の修復履歴を表示します")
+        log_col1, log_col2 = st.columns([1, 1])
+        with log_col1:
+            log_ticker_filter = st.text_input("銘柄コードで絞り込み", placeholder="例: 1629（空欄で全件）", key="log_filter_ticker")
+        with log_col2:
+            st.write(" ")
+            btn_load_log = st.button("🔄 ログを読み込む", key="btn_load_log", use_container_width=True)
+
+        if btn_load_log:
+            with st.spinner("ログを読み込み中..."):
+                log_df = load_repair_log_from_sheets()
+
+            if log_df.empty:
+                st.info("修復ログがまだありません。")
+            else:
+                if log_ticker_filter.strip():
+                    log_df = log_df[log_df["ticker"].astype(str).str.contains(log_ticker_filter.strip(), case=False, na=False)]
+
+                if log_df.empty:
+                    st.info(f"「{log_ticker_filter}」のログはありません。")
+                else:
+                    disp = log_df.copy()
+                    if "executed_at" in disp.columns:
+                        disp["executed_at"] = pd.to_datetime(disp["executed_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+                    if "cliff_date" in disp.columns:
+                        disp["cliff_date"] = pd.to_datetime(disp["cliff_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                    if "multiplier" in disp.columns:
+                        disp["multiplier"] = pd.to_numeric(disp["multiplier"], errors="coerce").round(6)
+                    disp.columns = ["実行日時", "銘柄", "市場", "崖日付", "適用時間足", "修正前終値", "修正後終値", "倍率", "備考"]
+                    st.dataframe(disp, use_container_width=True, hide_index=True)
+                    st.caption(f"合計 {len(disp)} 件")
         
     # 【セクション4】 全件一括フルダウンロード・再構築（初期化・白紙復旧用）
     st.subheader("4️⃣ 全件一括フルダウンロード・再構築（初期化・デバッグ用）")

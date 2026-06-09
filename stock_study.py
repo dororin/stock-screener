@@ -356,7 +356,7 @@ def repair_single_ticker_all_timeframes(
                     symbol,
                     period="max",
                     interval="1d",
-                    auto_adjust=True,
+                    auto_adjust=False,  # 分割調整のみ・配当調整なし（TVとの整合性を優先）
                     actions=True,
                     progress=False
                 )
@@ -1156,7 +1156,7 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d") -> bool:
                 symbols,
                 start=start_date_dt.strftime("%Y-%m-%d"),
                 interval=interval,
-                auto_adjust=(interval == "1d"), # 日足は自動調整、短期足は未調整で配当なども残す
+                auto_adjust=False,  # 分割調整のみ・配当調整なし（TVとの整合性を優先）
                 actions=True,
                 progress=False,
                 threads=True,
@@ -1199,7 +1199,7 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
     
     # 💡 [二重処理ガード用] yfinanceから最新の正しい日足（調整後）を5日分だけ取得
     try:
-        df_check = yf.download(ticker_symbol, period="5d", interval="1d", auto_adjust=True, progress=False)
+        df_check = yf.download(ticker_symbol, period="5d", interval="1d", auto_adjust=False, progress=False)
         if df_check.empty:
             _log(f"  ⚠️ [{ticker}] 調整確認用の基準日足データを取得できませんでした。波及処理を中止します。")
             return
@@ -1260,3 +1260,285 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
             pass
         except Exception as e:
             _log(f"  ⚠️ [{ticker}] {interval} への分割波及処理中にエラーが発生しました: {e}")
+
+
+# ==============================================================================
+# [修正2] backward_scale_repair() - yfinanceバグデータの崖修正
+# ==============================================================================
+
+def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
+    """
+    日足データの崖（急落/急騰バグ）を検出し、崖より古い全データを倍率修正する。
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        単一銘柄の日足データ（date, open, high, low, close, volume列を含む）
+    threshold : float
+        崖とみなす変化率の絶対値（デフォルト0.35 = 35%）
+        日本株はストップ制限により正常値の上限が約33%のため35%で安全に検出可能
+
+    Returns
+    -------
+    df_fixed : pd.DataFrame
+        修正済みデータ
+    repairs : list[dict]
+        適用した修正のログ（崖日付・multiplier・修正前後終値）。分足への流用に使用する。
+    """
+    if df.empty:
+        return df, []
+
+    df = df.sort_values("date").reset_index(drop=True)
+    price_cols = [c for c in ["open", "high", "low", "close"] if c in df.columns]
+    repairs = []
+
+    # 出来高ゼロ行を崖判定から除外（ストップ安の約定なし日を誤検知しない）
+    valid_mask = df["volume"] > 0 if "volume" in df.columns else pd.Series(True, index=df.index)
+    close_valid = df["close"].where(valid_mask)
+    pct_changes = close_valid.pct_change()
+
+    # 閾値以上の急落 or 急騰を崖として抽出
+    cliff_mask = (pct_changes <= -threshold) | (pct_changes >= threshold)
+    cliffs = pct_changes[cliff_mask].index.tolist()
+
+    if not cliffs:
+        return df, []
+
+    # 新しい崖から古い崖へ降順で処理（累積誤差防止）
+    cliffs.sort(reverse=True)
+
+    for idx in cliffs:
+        if idx == 0:
+            continue
+
+        after_price = df.loc[idx, "close"]
+        before_price = df.loc[idx - 1, "close"]
+
+        if before_price == 0 or after_price == 0:
+            continue
+
+        # 「古い側」を「新しい側」に合わせるための倍率
+        multiplier = after_price / before_price
+        cliff_date = df.loc[idx, "date"]
+
+        for col in price_cols:
+            df.loc[:idx - 1, col] = df.loc[:idx - 1, col] * multiplier
+
+        if "volume" in df.columns:
+            df.loc[:idx - 1, "volume"] = df.loc[:idx - 1, "volume"] / multiplier
+
+        repairs.append({
+            "cliff_date": cliff_date,
+            "multiplier": multiplier,
+            "before_close": round(float(before_price), 3),
+            "after_close": round(float(after_price), 3),
+        })
+
+        ticker_label = df["ticker"].iloc[0] if "ticker" in df.columns else ""
+        print(f"  🔧 [{ticker_label}] 崖修正: {cliff_date} | "
+              f"before={before_price:.3f} → after={after_price:.3f} | multiplier={multiplier:.6f}")
+
+    return df, repairs
+
+
+# ==============================================================================
+# [修正3] scan_all_anomalies() - 全銘柄ベクトル走査による異常検出
+# ==============================================================================
+
+def scan_all_anomalies(
+    is_jp: bool = True,
+    interval: str = "1d",
+    threshold: float = 0.35
+) -> pd.DataFrame:
+    """
+    指定時間足のDBを全銘柄ベクトル走査して異常箇所を検出する。
+    ダウンロード時ではなく後工程での一括チェックに使用する。
+
+    Returns
+    -------
+    pd.DataFrame: 異常が検出された銘柄・日付の一覧
+        列: ticker, cliff_date, before_close, after_close, pct_change
+    """
+    try:
+        db_df = load_price_db(interval, is_jp=is_jp)
+    except FileNotFoundError as e:
+        print(f"❌ DBファイルが見つかりません: {e}")
+        return pd.DataFrame()
+
+    if db_df.empty:
+        print("⚠️ DBが空です。")
+        return pd.DataFrame()
+
+    db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    # 出来高ゼロ行を除外
+    if "volume" in db_df.columns:
+        valid_mask = db_df["volume"] > 0
+    else:
+        valid_mask = pd.Series(True, index=db_df.index)
+
+    # 銘柄ごとのpct_change（銘柄境界をまたがない）
+    pct = (
+        db_df["close"]
+        .where(valid_mask)
+        .groupby(db_df["ticker"])
+        .pct_change()
+    )
+
+    cliff_mask = (pct <= -threshold) | (pct >= threshold)
+    cliff_rows = db_df[cliff_mask].copy()
+
+    if cliff_rows.empty:
+        print(f"✅ 異常箇所は検出されませんでした（閾値: {threshold*100:.0f}%）")
+        return pd.DataFrame()
+
+    cliff_rows = cliff_rows.copy()
+    cliff_rows["before_close"] = db_df["close"].shift(1)[cliff_mask].values
+    cliff_rows["after_close"] = cliff_rows["close"]
+    cliff_rows["pct_change"] = pct[cliff_mask].values
+
+    result = cliff_rows[["ticker", "date", "before_close", "after_close", "pct_change"]].copy()
+    result = result.rename(columns={"date": "cliff_date"})
+    result = result.sort_values("pct_change").reset_index(drop=True)
+
+    print(f"⚠️ {len(result)}件の異常箇所を検出しました（{result['ticker'].nunique()}銘柄）")
+    return result
+
+
+# ==============================================================================
+# [修正4] apply_scale_repair_with_intraday_propagation()
+#         日足修正 → 分足DBへの自動波及
+# ==============================================================================
+
+def apply_scale_repair_with_intraday_propagation(
+    ticker: str,
+    is_jp: bool = True,
+    threshold: float = 0.35,
+    dry_run: bool = False
+) -> dict:
+    """
+    日足の異常データを修正し、同じ倍率を分足DBにも波及させる。
+
+    Parameters
+    ----------
+    ticker : str
+        修正対象の銘柄コード（例: "1629"）
+    is_jp : bool
+    threshold : float
+        崖判定の閾値（デフォルト0.35 = 35%）
+    dry_run : bool
+        Trueのとき修正内容を表示するだけでDBへの書き込みを行わない
+
+    Returns
+    -------
+    dict
+        各時間足の処理結果サマリー。
+        "repair_details" キーに崖ごとの詳細情報（ログ保存用）を含む。
+    """
+    pure_ticker = sanitize_ticker(ticker, is_jp)
+    results = {}
+
+    # ------------------------------------------------------------------
+    # Step 1: 日足DBから対象銘柄を取得してbackward_scale_repairを適用
+    # ------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print(f"[{pure_ticker}] 日足 異常修正スキャン開始")
+    print(f"{'='*60}")
+
+    try:
+        db_1d = load_price_db("1d", is_jp=is_jp)
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+
+    ticker_1d = db_1d[db_1d["ticker"] == pure_ticker].copy()
+
+    if ticker_1d.empty:
+        print(f"⚠️ [{pure_ticker}] 日足DBにデータが見つかりません。")
+        return {"1d": "データなし", "repair_details": []}
+
+    fixed_1d, repairs = backward_scale_repair(ticker_1d, threshold=threshold)
+
+    if not repairs:
+        print(f"✅ [{pure_ticker}] 日足に異常箇所は検出されませんでした。")
+        return {"1d": "異常なし", "repair_details": []}
+
+    results["1d"] = f"{len(repairs)}箇所修正"
+
+    if not dry_run:
+        db_1d = db_1d[db_1d["ticker"] != pure_ticker]
+        db_1d = pd.concat([db_1d, fixed_1d], ignore_index=True)
+        db_1d = db_1d.sort_values(["ticker", "date"]).reset_index(drop=True)
+        save_price_db(db_1d, "1d", is_jp=is_jp)
+        print(f"✅ [{pure_ticker}] 日足DB更新完了")
+    else:
+        print(f"[DRY RUN] [{pure_ticker}] 日足: {len(repairs)}箇所の修正が必要（書き込みスキップ）")
+
+    # ------------------------------------------------------------------
+    # Step 2: 日足の崖情報（cliff_date, multiplier）を分足DBに波及
+    # ------------------------------------------------------------------
+    short_intervals = ["60m", "5m", "1m"]
+
+    for interval in short_intervals:
+        print(f"\n[{pure_ticker}] {interval} への波及処理...")
+
+        try:
+            db_intra = load_price_db(interval, is_jp=is_jp)
+        except FileNotFoundError:
+            results[interval] = "DBなし（スキップ）"
+            print(f"  ⚠️ [{pure_ticker}] {interval} DBが見つかりません。スキップします。")
+            continue
+
+        ticker_intra = db_intra[db_intra["ticker"] == pure_ticker].copy()
+
+        if ticker_intra.empty:
+            results[interval] = "データなし（スキップ）"
+            continue
+
+        ticker_intra = ticker_intra.sort_values("date").reset_index(drop=True)
+        price_cols = [c for c in ["open", "high", "low", "close"] if c in ticker_intra.columns]
+
+        # 新しい崖から古い崖へ降順で適用
+        repairs_sorted = sorted(repairs, key=lambda x: x["cliff_date"], reverse=True)
+
+        applied_count = 0
+        for repair in repairs_sorted:
+            cliff_date = pd.to_datetime(repair["cliff_date"])
+            multiplier = repair["multiplier"]
+
+            pre_mask = pd.to_datetime(ticker_intra["date"]) < cliff_date
+
+            if not pre_mask.any():
+                continue
+
+            if not dry_run:
+                for col in price_cols:
+                    ticker_intra.loc[pre_mask, col] = ticker_intra.loc[pre_mask, col] * multiplier
+                if "volume" in ticker_intra.columns:
+                    ticker_intra.loc[pre_mask, "volume"] = ticker_intra.loc[pre_mask, "volume"] / multiplier
+
+            applied_count += 1
+            print(f"  🔄 [{pure_ticker}] {interval}: {cliff_date.date()} 以前を "
+                  f"multiplier={multiplier:.6f} で{'[DRY RUN] ' if dry_run else ''}修正")
+
+        if applied_count == 0:
+            results[interval] = "該当期間のデータなし"
+            continue
+
+        if not dry_run:
+            db_intra = db_intra[db_intra["ticker"] != pure_ticker]
+            db_intra = pd.concat([db_intra, ticker_intra], ignore_index=True)
+            db_intra = db_intra.sort_values(["ticker", "date"]).reset_index(drop=True)
+            save_price_db(db_intra, interval, is_jp=is_jp)
+            print(f"  ✅ [{pure_ticker}] {interval} DB更新完了")
+            results[interval] = f"{applied_count}崖分を波及適用"
+        else:
+            results[interval] = f"[DRY RUN] {applied_count}崖分の波及が必要"
+
+    # ログ保存用の詳細情報を結果に含める
+    results["repair_details"] = repairs
+    results["ticker"] = pure_ticker
+
+    print(f"\n{'='*60}")
+    print(f"[{pure_ticker}] 修正完了: {results}")
+    print(f"{'='*60}")
+    return results
