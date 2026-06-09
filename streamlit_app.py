@@ -147,13 +147,17 @@ def get_gspread_client():
         return None
 
 def get_sector_spreadsheet():
+    """Google Sheetsへの接続を確立する（接続不可時は詳細をエラー出力）"""
     gc = get_gspread_client()
-    if gc is None: return None
+    if gc is None:
+        print("❌ [get_sector_spreadsheet] gspreadクライアントの認証に失敗しました。secretsの設定を確認してください。")
+        return None
     try:
         cfg = st.secrets["connections"]["gsheets"]
         url = cfg.get("sector_spreadsheet", cfg.get("spreadsheet"))
         return gc.open_by_url(url)
-    except Exception:
+    except Exception as e:
+        print(f"❌ [get_sector_spreadsheet] スプレッドシートのURLオープンに失敗しました。URLまたは権限を確認してください: {e}")
         return None
 
 def load_sector_master_from_sheets(is_jp: bool) -> dict:
@@ -1174,15 +1178,26 @@ def save_extra_tickers_to_sheets(df: pd.DataFrame):
         pass
 
 def sync_extra_tickers_to_local():
+    """スプレッドシートから追加ETFを取得し、ローカルJSONに同期する（エラー検知対応）"""
     try:
         df = load_extra_tickers_from_sheets()
-        codes = df["code"].tolist() if not df.empty else []
+        if df.empty:
+            raise ValueError("スプレッドシートから取得した追加ティッカーが0件、またはシートに接続できませんでした。")
+            
+        codes = df["code"].tolist()
         cache_path = os.path.join(stock_study.WORK_DIR, "extra_tickers.json")
-        with open(cache_path, "w") as f:
+        
+        # 保存先フォルダが存在することを確認
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        
+        with open(cache_path, "w", encoding="utf-8") as f:
             json.dump({"codes": codes, "updated": datetime.now().strftime("%Y-%m-%d")}, f)
-        return codes
-    except Exception:
-        return []
+            
+        print(f"✅ [sync_extra_tickers_to_local] JSONファイルの同期成功: {cache_path}")
+        return codes, None  # (取得したコードリスト, エラーなし)
+    except Exception as e:
+        print(f"❌ [sync_extra_tickers_to_local] 同期エラー: {e}")
+        return [], str(e)  # (空リスト, エラーメッセージ)
 
 # =====================================================================
 # 🔄 セクターローテーション: ページ描画
@@ -2703,37 +2718,30 @@ if selected_page == "データ管理・保守":
         with status_box:
             
             # =========================================================================
-            # 🔍 【追加：JSON存在確認および登録件数確認のUIログ】
+            # 🔄 【修正：一括ダウンロードの直前にスプレッドシートからの強制同期を実行】
             # =========================================================================
-            st.write("🔍 **【調査ステップ1：JSONおよび追加ETFデータの状態確認】**")
-            try:
-                # 1. 物理的な探索フォルダ・パスを表示
-                cache_path = os.path.join(stock_study.WORK_DIR, "extra_tickers.json")
-                st.write(f"  * 📁 システムが参照しようとしているJSONファイルパス:  \n    `{cache_path}`")
-                
-                # 2. ファイルの実在チェック
-                if os.path.exists(cache_path):
-                    st.write("  * ✅ `extra_tickers.json` が物理的に存在することを確認しました。")
-                    
-                    # 3. 直接JSONを読み出して中身をUIに書き出し
-                    with open(cache_path, "r", encoding="utf-8") as f:
-                        js_data = json.load(f)
-                    
-                    codes_in_json = js_data.get("codes", [])
-                    st.write(f"  * 📄 JSON内の `'codes'` キーに登録されているコード数: `{len(codes_in_json)}` 件")
-                    if codes_in_json:
-                        st.write(f"  * 📄 登録コード一覧: `{', '.join(codes_in_json)}`")
-                    else:
-                        st.error("  * ❌ `extra_tickers.json` ファイルはありますが、中の `'codes'` の配列が空 `[]` になっています。")
-                else:
-                    st.error("  * ❌ `extra_tickers.json` ファイルが、指定のフォルダ内に存在しません。登録がまだ反映されていないか、保存ディレクトリがずれている可能性があります。")
-                
-                # 4. stock_study側の呼び出し関数の戻り値もチェック
-                loaded_extra = stock_study.get_extra_tickers()
-                st.write(f"  * 📡 `get_extra_tickers()` 関数の最終ロード結果: `{len(loaded_extra)}` 件取得")
-                
-            except Exception as ex:
-                st.error(f"  * ❌ JSONデータ確認中に例外エラーが発生しました: {ex}")
+            st.write("🔄 **【調査ステップ1：スプレッドシートから最新ティッカーの同期を試行します】**")
+            
+            # フルダウンロードの前に Sheets ➔ JSON 同期を明示的に呼び出し
+            codes_in_json, sync_error = sync_extra_tickers_to_local()
+            
+            if sync_error:
+                st.error(f"  * ❌ 同期処理でエラーが検出されました:  \n    `{sync_error}`")
+                st.info("  * 💡 対策: `secrets.toml` のGoogle認証情報、スプレッドシートの共有権限、またはシート名が『extra_tickers』になっているか確認してください。")
+            else:
+                st.success(f"  * ✅ Google Sheetsからの同期に成功し、JSONを新規作成しました。")
+                st.write(f"  * 📁 同期された追加ティッカー数: `{len(codes_in_json)}` 件")
+                if codes_in_json:
+                    st.write(f"  * 📄 同期されたコード: `{', '.join(codes_in_json)}`")
+            
+            # 物理的な探索フォルダ・パスの再表示
+            cache_path = os.path.join(stock_study.WORK_DIR, "extra_tickers.json")
+            st.write(f"  * 📁 JSONファイル探索パス:  \n    `{cache_path}`")
+            
+            if os.path.exists(cache_path):
+                st.write("  * ✅ `extra_tickers.json` の物理的な存在を確認しました。")
+            else:
+                st.error("  * ❌ 同期処理後も依然として `extra_tickers.json` が見つかりません。")
             
             st.write("----------------------------------------------------------------")
             # =========================================================================
@@ -2751,19 +2759,16 @@ if selected_page == "データ管理・保守":
             
             st.write("yfinance からバッチダウンロードを開始します（レート制限防止のために少し時間がかかります）...")
             
-            # 💡 【追加】バックエンドからの進捗報告メッセージを st.status 内に1行ずつ st.write 出力するコールバック関数
             def update_rebuild_status(msg):
                 st.write(msg)
                 
             try:
-                # 💡 修正したコールバック引数 status_callback を渡して実行
                 success = stock_study.full_rebuild_all_database(
                     is_jp=is_jp, 
                     interval=rebuild_interval, 
                     status_callback=update_rebuild_status
                 )
                 if success:
-                    # キャッシュクリアして次回ロードに最新を反映
                     get_db_last_update.clear()
                     load_unified_db.clear()
                     status_box.update(label="✅ 一括フルダウンロード完了！", state="complete")
