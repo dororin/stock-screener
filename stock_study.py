@@ -212,17 +212,26 @@ def get_topix500_tickers() -> list:
         return []
 
 def get_extra_tickers() -> list:
-    """extra_tickers.jsonから追加収集ティッカーを読み込む"""
+    """extra_tickers.jsonから追加収集ティッカーを読み込む（デバッグ強化版）"""
     cache_path = os.path.join(WORK_DIR, "extra_tickers.json")
+    print(f"🔍 [デバッグ] extra_tickers.json をロードします。探しているパス: {cache_path}")
+    
     if not os.path.exists(cache_path):
+        print(f"⚠️ [警告] {cache_path} が物理的に存在しません。スプレッドシートからの同期（sync_extra_tickers_to_local）が正常に行われていない可能性があります。")
         return []
+        
     try:
-        with open(cache_path, "r") as f:
+        with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        
+        # JSONの中身をそのままコンソールに出力
+        print(f"🔍 [デバッグ] JSONファイルの中身を読み込みました: {data}")
+        
         codes = data.get("codes", [])
-        print(f"✅ 追加ティッカー: {len(codes)}件 ({cache_path})")
+        print(f"✅ 追加ティッカー読み込み成功: 計 {len(codes)}件 ({cache_path}) -> 登録コード: {codes}")
         return codes
-    except Exception:
+    except Exception as e:
+        print(f"❌ [エラー] extra_tickers.json のパースに失敗しました: {e}")
         return []
 
 def get_all_collection_tickers() -> list:
