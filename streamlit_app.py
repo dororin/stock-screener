@@ -2531,8 +2531,13 @@ if selected_page == "データ管理・保守":
                 if "cliff_date" in display_df.columns:
                     display_df["cliff_date"] = pd.to_datetime(display_df["cliff_date"]).dt.strftime("%Y-%m-%d")
                 if "pct_change" in display_df.columns:
-                    display_df["pct_change"] = (display_df["pct_change"] * 100).round(1).astype(str) + "%"
-                display_df.columns = ["銘柄", "崖日付", "前日終値", "当日終値", "変化率"]
+                    display_df["pct_change"] = display_df["pct_change"].apply(
+                        lambda x: f"{x*100:.1f}%" if pd.notna(x) else "－"
+                    )
+                cols = ["ticker", "cliff_date", "before_close", "after_close", "pct_change", "anomaly_type"]
+                cols = [c for c in cols if c in display_df.columns]
+                display_df = display_df[cols]
+                display_df.columns = ["銘柄", "崖日付", "前日終値", "当日終値", "変化率", "異常種別"][:len(cols)]
                 st.dataframe(display_df, use_container_width=True, hide_index=True)
                 st.caption("↑ 銘柄コードを下の修復フォームに入力して修復を実行できます")
 
