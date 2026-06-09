@@ -1267,30 +1267,6 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
 # ==============================================================================
 
 def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
-    """
-    日足データの崖（急落/急騰バグ）を検出し、崖より古い全データを倍率修正する。
-
-    検出ロジック：
-    1. 負の株価を最優先で直接検出
-       崖位置 = 「負の株価の最終行の次の行」（正常値に戻った最初の行）
-    2. pct_changeによる急変検出
-       valid_maskによる除外はしない（出来高ゼロ行除外だと崖位置がずれる）
-       絶対値で閾値判定（負値同士の符号反転対策）
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        単一銘柄の日足データ（date, open, high, low, close, volume列を含む）
-    threshold : float
-        崖とみなす変化率の絶対値（デフォルト0.35 = 35%）
-
-    Returns
-    -------
-    df_fixed : pd.DataFrame
-        修正済みデータ
-    repairs : list[dict]
-        適用した修正のログ（崖日付・multiplier・修正前後終値）。分足への流用に使用する。
-    """
     if df.empty:
         return df, []
 
@@ -1300,6 +1276,14 @@ def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
     processed_idxs = set()
 
     ticker_label = df["ticker"].iloc[0] if "ticker" in df.columns else ""
+
+    # ==================================================================
+    # 【追加防衛策】検出②に進む前に、残っているマイナス価格を一律で絶対値に事前変換する
+    # ==================================================================
+    if (df["close"] < 0).any():
+        print(f"  ℹ️ [{ticker_label}] 未処理の負の株価を検出。安全のため全データを絶対値に変換します。")
+        for col in price_cols:
+            df[col] = df[col].abs()
 
     # ------------------------------------------------------------------
     # 検出①：負の株価を直接検出
