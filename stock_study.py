@@ -1355,27 +1355,36 @@ def scan_all_anomalies(
     result_rows = []
 
     # ------------------------------------------------------------------
-    # 検出①：負の株価の「境界線（入り口と出口）」だけを検出（何百行も並ぶのを防ぐ）
+    # 検出①：負の株価の「境界線」をgroupby考慮で安全に検出
     # ------------------------------------------------------------------
     negative_mask = db_df["close"] < 0
     
-    # 正常→負への切り替わり（入り口）
-    pos_to_neg = negative_mask & (~negative_mask.shift(1, fill_value=False))
-    # 負→正常への切り替わり（出口）
-    neg_to_pos = (~negative_mask) & (negative_mask.shift(1, fill_value=False))
+    # 💡 他銘柄の境界を跨がないよう groupby 経由で shift を実行。
+    # データの最古の行がマイナスでも切り替わりと判定されないよう fill_value=True を指定。
+    shifted_neg_mask_for_pos = db_df.groupby("ticker")["close"].apply(
+        lambda x: (x < 0).shift(1, fill_value=True)
+    ).reset_index(level=0, drop=True)
+    pos_to_neg = negative_mask & (~shifted_neg_mask_for_pos)
+
+    # データの最古の行がプラスでも切り替わりと判定されないよう fill_value=False を指定。
+    shifted_neg_mask_for_neg = db_df.groupby("ticker")["close"].apply(
+        lambda x: (x < 0).shift(1, fill_value=False)
+    ).reset_index(level=0, drop=True)
+    neg_to_pos = (~negative_mask) & shifted_neg_mask_for_neg
     
     boundary_mask = pos_to_neg | neg_to_pos
     
     if boundary_mask.any():
         boundary_rows = db_df[boundary_mask].copy()
-        boundary_rows["before_close"] = db_df["close"].shift(1)[boundary_mask].values
+        # 💡 前日終値も groupby して安全に取得（最古データの場合は NaN になります）
+        boundary_rows["before_close"] = db_df.groupby("ticker")["close"].shift(1)[boundary_mask].values
         boundary_rows["after_close"] = boundary_rows["close"]
         boundary_rows["pct_change"] = float("nan")
         boundary_rows["anomaly_type"] = "負の株価（切り替え境界）"
         result_rows.append(boundary_rows[["ticker", "date", "before_close", "after_close", "pct_change", "anomaly_type"]])
 
     # ------------------------------------------------------------------
-    # 検出②：株価の絶対値ベースによる急変（崖）検出（マイナスであっても崖を検知可能に）
+    # 検出②：絶対値ベースによる急変（崖）検出
     # ------------------------------------------------------------------
     abs_close = db_df["close"].abs()
     pct = abs_close.groupby(db_df["ticker"]).pct_change()
@@ -1384,7 +1393,8 @@ def scan_all_anomalies(
 
     if cliff_mask.any():
         cliff_rows = db_df[cliff_mask].copy()
-        cliff_rows["before_close"] = db_df["close"].shift(1)[cliff_mask].values
+        # 💡 前日終値も安全に groupby して取得
+        cliff_rows["before_close"] = db_df.groupby("ticker")["close"].shift(1)[cliff_mask].values
         cliff_rows["after_close"] = cliff_rows["close"]
         cliff_rows["pct_change"] = pct[cliff_mask].values
         cliff_rows["anomaly_type"] = "急変（" + (pct[cliff_mask] * 100).round(1).astype(str) + "%）"
@@ -1394,13 +1404,39 @@ def scan_all_anomalies(
         print(f"✅ 異常箇所は検出されませんでした（閾値: {threshold*100:.0f}%）")
         return pd.DataFrame()
 
+    # ------------------------------------------------------------------
+    # 3. データの結合と、同日複数異常の重複マージ
+    # ------------------------------------------------------------------
     result = pd.concat(result_rows, ignore_index=True)
     result = result.rename(columns={"date": "cliff_date"})
+    
+    # 💡 【重複解決】同じ日・同じ銘柄で複数の判定がある場合、1行にまとめて情報を統合する
+    def aggregate_anomalies(group):
+        # 異常の表記をマージ（例: 「境界 ＆ 急変」）
+        types = " ＆ ".join(group["anomaly_type"].unique())
+        
+        # 有効な変化率があれば優先
+        pct_vals = group["pct_change"].dropna()
+        pct_val = pct_vals.iloc[0] if not pct_vals.empty else float("nan")
+        
+        # 有効な前日・当日終値があれば最優先で採用
+        before_val = group["before_close"].dropna().iloc[0] if not group["before_close"].dropna().empty else float("nan")
+        after_val = group["after_close"].dropna().iloc[0] if not group["after_close"].dropna().empty else float("nan")
+        
+        return pd.Series({
+            "before_close": before_val,
+            "after_close": after_val,
+            "pct_change": pct_val,
+            "anomaly_type": types
+        })
+        
+    result = result.groupby(["ticker", "cliff_date"], as_index=False).apply(aggregate_anomalies)
+    
     result = result.sort_values(["ticker", "cliff_date"]).reset_index(drop=True)
 
     print(f"⚠️ {len(result)}件の異常箇所を検出しました（{result['ticker'].nunique()}銘柄）")
     return result
-
+    
 # ==============================================================================
 # [修正4] apply_scale_repair_with_intraday_propagation()
 #         日足修正 → 分足DBへの自動波及
