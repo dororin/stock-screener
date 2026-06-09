@@ -212,26 +212,27 @@ def get_topix500_tickers() -> list:
         return []
 
 def get_extra_tickers() -> list:
-    """extra_tickers.jsonから追加収集ティッカーを読み込む（デバッグ強化版）"""
+    """extra_tickers.jsonから追加収集ティッカーを読み込む（詳細なデバッグログ付き）"""
     cache_path = os.path.join(WORK_DIR, "extra_tickers.json")
-    print(f"🔍 [デバッグ] extra_tickers.json をロードします。探しているパス: {cache_path}")
+    print(f"🔍 [get_extra_tickers] 探索するJSONパス: {cache_path}")
     
     if not os.path.exists(cache_path):
-        print(f"⚠️ [警告] {cache_path} が物理的に存在しません。スプレッドシートからの同期（sync_extra_tickers_to_local）が正常に行われていない可能性があります。")
+        print(f"⚠️ [get_extra_tickers] 指定パスにファイルが存在しません: {cache_path}")
         return []
-        
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         
-        # JSONの中身をそのままコンソールに出力
-        print(f"🔍 [デバッグ] JSONファイルの中身を読み込みました: {data}")
-        
+        # キーの存在確認
+        if "codes" not in data:
+            print("❌ [get_extra_tickers] JSON内に 'codes' キーが見つかりません。")
+            return []
+            
         codes = data.get("codes", [])
-        print(f"✅ 追加ティッカー読み込み成功: 計 {len(codes)}件 ({cache_path}) -> 登録コード: {codes}")
+        print(f"✅ [get_extra_tickers] 読み込み成功: 計 {len(codes)} 件のティッカーを検出しました。 => {codes}")
         return codes
     except Exception as e:
-        print(f"❌ [エラー] extra_tickers.json のパースに失敗しました: {e}")
+        print(f"❌ [get_extra_tickers] ファイルのオープン、またはJSONとしてのパース中にエラーが発生しました: {e}")
         return []
 
 def get_all_collection_tickers() -> list:
@@ -1125,22 +1126,32 @@ def main():
 if __name__ == "__main__":
     main()
 
-def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d") -> bool:
+def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_callback=None) -> bool:
     """
     指定した市場と時間足のデータを完全にゼロから新規取得し、Parquetデータベースとして新規保存します。
+    （UI進捗報告用の status_callback 追加版）
     """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
     market_name = "JP" if is_jp else "US"
-    tickers = get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
+    
+    if is_jp:
+        log("🔍 [フル再構築] 収集対象ティッカー（TOPIX500 + 追加ETF）のロードを開始します...")
+        tickers = get_all_collection_tickers()
+    else:
+        tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
     
     if not tickers:
-        print("❌ 収集対象の銘柄コードが見つかりません。")
+        log("❌ [フル再構築] 収集対象の銘柄コードが見つかりません。")
         return False
         
     tickers = [sanitize_ticker(t, is_jp) for t in tickers]
     suffix = ".T" if is_jp else ""
     now = datetime.now()
     
-    # 時間足に応じた取得開始日の算出（yfinanceの取得限界制限を考慮）
     if interval == "1m":
         start_date_dt = now - timedelta(days=6)
     elif interval == "5m":
@@ -1148,11 +1159,9 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d") -> bool:
     elif interval == "60m":
         start_date_dt = now - timedelta(days=718)
     else:  # "1d" (日足)
-        # スクリーニングに必要な移動平均期間（200日以上）を十分に満たし、
-        # ダウンロード負荷を現実的に抑えるため「2020年以降(約6年間)」をデフォルトに設定
-        start_date_dt = datetime(2000, 1, 1)
+        start_date_dt = datetime(2020, 1, 1)
         
-    print(f"🚨 [全体一括再構築] {market_name} ({interval}) をゼロから新規作成します。 (開始日: {start_date_dt.strftime('%Y-%m-%d')})")
+    log(f"🚨 [フル再構築] {market_name} ({interval}) を開始日 {start_date_dt.strftime('%Y-%m-%d')} から新規作成します。(総収集ターゲット数: {len(tickers)} 銘柄)")
     
     all_downloaded = []
     # 安全にダウンロードするため、30銘柄ずつの小バッチに分けてループ実行
@@ -1160,12 +1169,17 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d") -> bool:
     for i in range(0, len(tickers), BATCH_SIZE):
         chunk = tickers[i:i+BATCH_SIZE]
         symbols = [f"{t}{suffix}" for t in chunk]
+        
+        # どの銘柄をダウンロードしているのか、UI側に進捗表示
+        sample_symbols = ", ".join(chunk[:5])
+        log(f"  📥 ダウンロード中 ({i + 1}〜{min(i + BATCH_SIZE, len(tickers))} / {len(tickers)}): {sample_symbols} ...")
+        
         try:
             df_raw = yf.download(
                 symbols,
                 start=start_date_dt.strftime("%Y-%m-%d"),
                 interval=interval,
-                auto_adjust=False,  # 分割調整のみ・配当調整なし（TVとの整合性を優先）
+                auto_adjust=False,
                 actions=True,
                 progress=False,
                 threads=True,
@@ -1174,8 +1188,11 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d") -> bool:
             chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
             if not chunk_processed.empty:
                 all_downloaded.append(chunk_processed)
+                log(f"    -> 取得成功: {len(chunk_processed['ticker'].unique())} 銘柄のデータを Parquet 一時バッファに格納しました。")
+            else:
+                log(f"    -> 🧊 API応答は正常ですが、このバッチはデータ取得件数 0 件でした。")
         except Exception as e:
-            print(f"⚠️ バッチ取得エラー ({i}-{i+BATCH_SIZE}): {e}")
+            log(f"    -> ⚠️ バッチ取得エラー ({i}-{i+BATCH_SIZE}): {e}")
         time.sleep(1.5) # レートリミット回避のディレイ
         
     if all_downloaded:
@@ -1187,10 +1204,11 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d") -> bool:
                 final_df["is_finalized"] = final_df["date"] < (now - timedelta(hours=1))
         
         final_df = final_df.sort_values(["ticker", "date"]).reset_index(drop=True)
-        # use_dictionary=False を適用して保存する
         save_price_db(final_df, interval, is_jp=is_jp)
+        log(f"✅ [フル再構築] すべてのダウンロードデータを統合し、{interval} の Parquet データベースを新規上書き保存しました。")
         return True
     else:
+        log("❌ [フル再構築] 新規データが1件も取得できなかったため、保存をスキップしました。")
         return False
 
 def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: bool = True, log_func=None):

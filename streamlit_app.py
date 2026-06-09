@@ -2701,6 +2701,43 @@ if selected_page == "データ管理・保守":
     if btn_full_rebuild:
         status_box = st.status(f"📡 {market_mode} {rebuild_interval} データベースを一括クリーンビルド中...", expanded=True)
         with status_box:
+            
+            # =========================================================================
+            # 🔍 【追加：JSON存在確認および登録件数確認のUIログ】
+            # =========================================================================
+            st.write("🔍 **【調査ステップ1：JSONおよび追加ETFデータの状態確認】**")
+            try:
+                # 1. 物理的な探索フォルダ・パスを表示
+                cache_path = os.path.join(stock_study.WORK_DIR, "extra_tickers.json")
+                st.write(f"  * 📁 システムが参照しようとしているJSONファイルパス:  \n    `{cache_path}`")
+                
+                # 2. ファイルの実在チェック
+                if os.path.exists(cache_path):
+                    st.write("  * ✅ `extra_tickers.json` が物理的に存在することを確認しました。")
+                    
+                    # 3. 直接JSONを読み出して中身をUIに書き出し
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        js_data = json.load(f)
+                    
+                    codes_in_json = js_data.get("codes", [])
+                    st.write(f"  * 📄 JSON内の `'codes'` キーに登録されているコード数: `{len(codes_in_json)}` 件")
+                    if codes_in_json:
+                        st.write(f"  * 📄 登録コード一覧: `{', '.join(codes_in_json)}`")
+                    else:
+                        st.error("  * ❌ `extra_tickers.json` ファイルはありますが、中の `'codes'` の配列が空 `[]` になっています。")
+                else:
+                    st.error("  * ❌ `extra_tickers.json` ファイルが、指定のフォルダ内に存在しません。登録がまだ反映されていないか、保存ディレクトリがずれている可能性があります。")
+                
+                # 4. stock_study側の呼び出し関数の戻り値もチェック
+                loaded_extra = stock_study.get_extra_tickers()
+                st.write(f"  * 📡 `get_extra_tickers()` 関数の最終ロード結果: `{len(loaded_extra)}` 件取得")
+                
+            except Exception as ex:
+                st.error(f"  * ❌ JSONデータ確認中に例外エラーが発生しました: {ex}")
+            
+            st.write("----------------------------------------------------------------")
+            # =========================================================================
+
             st.write("既存のParquetファイルをクリアしています...")
             filename = stock_study.get_db_filename(rebuild_interval, is_jp=is_jp)
             work_file = os.path.join(stock_study.WORK_DIR, filename)
@@ -2713,8 +2750,18 @@ if selected_page == "データ管理・保守":
                     st.write(f"⚠️ 既存ファイルのクリアに失敗（新規書き出し時に自動上書きされます）: {e}")
             
             st.write("yfinance からバッチダウンロードを開始します（レート制限防止のために少し時間がかかります）...")
+            
+            # 💡 【追加】バックエンドからの進捗報告メッセージを st.status 内に1行ずつ st.write 出力するコールバック関数
+            def update_rebuild_status(msg):
+                st.write(msg)
+                
             try:
-                success = stock_study.full_rebuild_all_database(is_jp=is_jp, interval=rebuild_interval)
+                # 💡 修正したコールバック引数 status_callback を渡して実行
+                success = stock_study.full_rebuild_all_database(
+                    is_jp=is_jp, 
+                    interval=rebuild_interval, 
+                    status_callback=update_rebuild_status
+                )
                 if success:
                     # キャッシュクリアして次回ロードに最新を反映
                     get_db_last_update.clear()
