@@ -932,3 +932,141 @@ def run_database_health_scan(is_jp: bool) -> list:
         except Exception:
             pass
     return anomalies
+
+# core/database_service.py へ追加
+
+def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, multiplier: float, is_jp: bool = True) -> dict:
+    """指定された銘柄と崖日付、修正倍率に基づいて、1d〜1mすべての時間足の過去データ（cliff_dateより前）に一律の補正（後ろ向き調整）を強制適用します。"""
+    pure_ticker = sanitize_ticker(ticker, is_jp)
+    results = {}
+    try:
+        target_dt = pd.to_datetime(cliff_date)
+    except Exception as e:
+        return {"error": f"崖日付のパース失敗: {e}"}
+
+    for interval in ["1d", "60m", "5m", "1m"]:
+        try:
+            db_df = load_price_db(interval, is_jp=is_jp)
+        except FileNotFoundError:
+            results[interval] = "DBなし"
+            continue
+        if db_df.empty:
+            results[interval] = "データ空"
+            continue
+
+        mask = db_df["ticker"] == pure_ticker
+        ticker_data = db_df[mask].copy()
+        if ticker_data.empty:
+            results[interval] = "対象データなし"
+            continue
+
+        # 崖日付より過去のデータを判定
+        ticker_data["date"] = pd.to_datetime(ticker_data["date"])
+        pre_mask = ticker_data["date"] < target_dt
+        
+        if not pre_mask.any():
+            results[interval] = "対象期間（崖日より過去）のデータなし"
+            continue
+
+        price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in db_df.columns]
+        
+        # 実際に補正を適用 (過去全体を一律処理)
+        for col in price_cols:
+            ticker_data.loc[pre_mask, col] = ticker_data.loc[pre_mask, col] * multiplier
+        if "volume" in db_df.columns:
+            ticker_data.loc[pre_mask, "volume"] = ticker_data.loc[pre_mask, "volume"] / multiplier
+
+        # データベースへの書き戻し
+        db_df = db_df[~mask]
+        
+        # 日付型を元のDBの形式に復元
+        if not db_df.empty:
+            if pd.api.types.is_datetime64_any_dtype(db_df["date"]):
+                ticker_data["date"] = pd.to_datetime(ticker_data["date"])
+            else:
+                ticker_data["date"] = ticker_data["date"].dt.strftime("%Y-%m-%d %H:%M:%S" if interval != "1d" else "%Y-%m-%d")
+        
+        db_df = pd.concat([db_df, ticker_data], ignore_index=True)
+        db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
+        save_price_db(db_df, interval, is_jp=is_jp)
+        results[interval] = f"{pre_mask.sum()}件補正適用完了"
+    return results
+
+
+def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
+    """スプレッドシートから修復ログ/パッチ定義一覧を読み込み、新しい順（降順）に並べ替えてParquetデータベースに一括自動適用します。"""
+    def log(msg):
+        print(msg)
+        if status_callback: status_callback(msg)
+
+    try:
+        from data_access.sheets_api import load_repair_log_from_sheets
+        log_df = load_repair_log_from_sheets()
+    except Exception as e:
+        log(f"❌ [パッチ一括再適用] スプレッドシートからのログ取得に失敗: {e}")
+        return 0
+
+    if log_df.empty:
+        log("🧊 保存されているパッチ情報はありません。")
+        return 0
+
+    market_str = "JP" if is_jp else "US"
+    valid_patches = []
+    
+    for _, row in log_df.iterrows():
+        # 市場の一致を確認 (JP/US)
+        if str(row.get("market", "")).strip().upper() != market_str:
+            continue
+        
+        ticker = str(row.get("ticker", "")).strip()
+        cliff_date_str = str(row.get("cliff_date", "")).strip()
+        multiplier_str = str(row.get("multiplier", "")).strip()
+        
+        if not ticker or not cliff_date_str or not multiplier_str:
+            continue
+            
+        try:
+            multiplier_val = float(multiplier_str)
+            if multiplier_val <= 0 or multiplier_val == 1.0:
+                continue  # 不要な補正値はスキップ
+            cliff_dt = pd.to_datetime(cliff_date_str)
+        except Exception:
+            continue  # パース失敗行はスキップ
+
+        valid_patches.append({
+            "ticker": ticker,
+            "cliff_date": cliff_dt,
+            "multiplier": multiplier_val,
+            "memo": str(row.get("memo", ""))
+        })
+
+    if not valid_patches:
+        log("🧊 有効な再適用対象パッチはありませんでした。")
+        return 0
+
+    # 【超重要ルール】崖日付の降順（新しい日付 ➔ 古い日付の順）にソート！
+    # これにより、クレーターバグや一時的バグに対する「上げ下げ2回の一律適用」が数学的に正しく相殺されます。
+    valid_patches = sorted(valid_patches, key=lambda x: x["cliff_date"], reverse=True)
+
+    log(f"🛠️ [パッチ一括再適用] {len(valid_patches)}件のパッチを降順（新しい日付順）に適用します...")
+    
+    success_count = 0
+    for patch in valid_patches:
+        t = patch["ticker"]
+        dt_str = patch["cliff_date"].strftime("%Y-%m-%d")
+        mul = patch["multiplier"]
+        memo = patch["memo"]
+        
+        log(f"  👉 適用中: [{t}] 崖日: {dt_str} | 比率: {mul:.6f} ({memo})")
+        res = apply_forced_scale_patch_to_all_timeframes(t, dt_str, mul, is_jp=is_jp)
+        
+        # 1dまたは他の時間足のどれかで実際にデータが補正されたか判定
+        applied = any("件補正適用完了" in str(v) for v in res.values())
+        if applied:
+            success_count += 1
+            log(f"     ✅ 補正成功 -> 1d: {res.get('1d', 'なし')}, 60m: {res.get('60m', 'なし')}")
+        else:
+            log(f"     ℹ️ 補正対象データなし（該当期間のデータが未同期、または不要）")
+            
+    log(f"🎉 [パッチ一括再適用] 処理完了。成功: {success_count} / {len(valid_patches)} 件")
+    return success_count
