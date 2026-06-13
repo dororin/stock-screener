@@ -150,6 +150,8 @@ def load_tickers_from_file(file_path: str) -> list:
 
 # core/collector.py より修正
 
+# core/collector.py より修正
+
 def parse_yfinance_batch(df_raw: pd.DataFrame, chunk_tickers: list, is_jp: bool = True) -> pd.DataFrame:
     """yfinanceの生バッチ出力（MultiIndex対応含む）を統一されたDataFrame形式にパースします。"""
     if df_raw.empty:
@@ -157,6 +159,9 @@ def parse_yfinance_batch(df_raw: pd.DataFrame, chunk_tickers: list, is_jp: bool 
     all_rows = []
     is_multi = isinstance(df_raw.columns, pd.MultiIndex)
     suffix = ".T" if is_jp else ""
+    
+    # 強制的に数値キャストおよび無限大（inf）をNaNに変換する対象カラム
+    numeric_cols = ["open", "high", "low", "close", "adj close", "volume", "stock splits", "dividends"]
     
     if not is_multi:
         if len(chunk_tickers) == 1:
@@ -167,7 +172,15 @@ def parse_yfinance_batch(df_raw: pd.DataFrame, chunk_tickers: list, is_jp: bool 
             dt_col = pd.to_datetime(t_df["date"])
             t_df["date"] = dt_col.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None) if dt_col.dt.tz is not None else dt_col
             t_df["ticker"] = str(chunk_tickers[0])
-            # "adj close" を target_cols に追加
+            
+            # --- 数値キャストおよび異常値のクレンジング処理 ---
+            for col in numeric_cols:
+                if col in t_df.columns:
+                    # errors='coerce' で非数値や不適切な文字列をすべて NaN にキャスト
+                    t_df[col] = pd.to_numeric(t_df[col], errors='coerce')
+                    # 実数値の inf, -inf も nan に置換して保存時の PyArrow エラーを防止
+                    t_df[col] = t_df[col].replace([float('inf'), float('-inf')], float('nan'))
+            
             target_cols = ["date", "ticker", "open", "high", "low", "close", "adj close", "volume", "stock splits", "dividends"]
             valid_cols = [c for c in target_cols if c in t_df.columns]
             return t_df[valid_cols]
@@ -196,7 +209,15 @@ def parse_yfinance_batch(df_raw: pd.DataFrame, chunk_tickers: list, is_jp: bool 
             dt_col = pd.to_datetime(t_df["date"])
             t_df["date"] = dt_col.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None) if dt_col.dt.tz is not None else dt_col
             t_df["ticker"] = str(ticker)
-            # "adj close" を target_cols に追加
+            
+            # --- 数値キャストおよび異常値のクレンジング処理 ---
+            for col in numeric_cols:
+                if col in t_df.columns:
+                    # errors='coerce' で非数値や不適切な文字列をすべて NaN にキャスト
+                    t_df[col] = pd.to_numeric(t_df[col], errors='coerce')
+                    # 実数値の inf, -inf も nan に置換して保存時の PyArrow エラーを防止
+                    t_df[col] = t_df[col].replace([float('inf'), float('-inf')], float('nan'))
+            
             target_cols = ["date", "ticker", "open", "high", "low", "close", "adj close", "volume", "stock splits", "dividends"]
             valid_cols = [c for c in target_cols if c in t_df.columns]
             all_rows.append(t_df[valid_cols])
