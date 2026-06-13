@@ -53,6 +53,8 @@ def analyze_db_update_needs(is_jp: bool = True) -> dict:
             "error": str(e),
         }
 
+# core/database_service.py より修正 (1/4)
+
 def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, is_jp: bool = True, forced_split_ratio: float = None) -> pd.DataFrame:
     """新旧DataFrameをマージし、権利落ちや手動強制分割比率などを数学的に後ろ向き調整します。"""
     if new_df is None or new_df.empty:
@@ -87,7 +89,8 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
                     anomaly_idx = anomaly_mask.idxmax()
                     split_date = t_new.loc[anomaly_idx, "date"]
                     pre_mask = t_new["date"] < split_date
-                    price_cols = ["open", "high", "low", "close"]
+                    # price_cols に "adj close" を追加
+                    price_cols = ["open", "high", "low", "close", "adj close"]
                     for col in price_cols:
                         if col in t_new.columns:
                             t_new.loc[pre_mask, col] = t_new.loc[pre_mask, col] / forced_split_ratio
@@ -117,7 +120,8 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
                             
                         if est_ratio >= 1.5:
                             pre_mask = t_new["date"] < split_date
-                            price_cols = ["open", "high", "low", "close"]
+                            # price_cols に "adj close" を追加
+                            price_cols = ["open", "high", "low", "close", "adj close"]
                             for col in price_cols:
                                 if col in t_new.columns:
                                     t_new.loc[pre_mask, col] = t_new.loc[pre_mask, col] / est_ratio
@@ -166,7 +170,8 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
                         apply_split = False
             
             if apply_split:
-                price_cols = ["open", "high", "low", "close"]
+                # price_cols に "adj close" を追加
+                price_cols = ["open", "high", "low", "close", "adj close"]
                 for col in price_cols:
                     if col in t_old.columns:
                         t_old[col] = t_old[col] * split_ratio
@@ -185,6 +190,8 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
     combined = pd.concat([old_untouched] + processed_parts, ignore_index=True)
     combined = combined.drop_duplicates(subset=["date", "ticker"], keep="last")
     return combined.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+# core/database_service.py より修正 (2/4)
 
 def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: bool = True, log_func=None):
     """日足等で検知した株式分割を、短期足DB(60m, 5m, 1m)へ数学的に先行適用します。"""
@@ -224,7 +231,8 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
             
             if apply_split:
                 _log(f"  🔄 [{ticker}] {interval} に分割調整を適用中 (ratio: {split_ratio:.4f})...")
-                price_cols = ["open", "high", "low", "close"]
+                # price_cols に "adj close" を追加
+                price_cols = ["open", "high", "low", "close", "adj close"]
                 for col in price_cols:
                     if col in db_df.columns:
                         db_df.loc[mask, col] = db_df.loc[mask, col] * split_ratio
@@ -577,12 +585,15 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
             results[interval] = f"エラー: {str(e)}"
     return results
 
+# core/database_service.py より修正 (3/4)
+
 def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
     """配信異常などによる価格の急変（崖・負の数値など）を検出し後ろ向きスケール調整します。"""
     if df.empty:
         return df, []
     df = df.sort_values("date").reset_index(drop=True)
-    price_cols = [c for c in ["open", "high", "low", "close"] if c in df.columns]
+    # price_cols の探索リストに "adj close" を追加
+    price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in df.columns]
     repairs = []
 
     negative_mask = df["close"] < 0
@@ -678,6 +689,8 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
     result = result.groupby(["ticker", "cliff_date"], as_index=False).apply(aggregate_anomalies)
     return result.sort_values(["ticker", "cliff_date"]).reset_index(drop=True)
 
+# core/database_service.py より修正 (4/4)
+
 def apply_scale_repair_with_intraday_propagation(ticker: str, is_jp: bool = True, threshold: float = 0.35, dry_run: bool = False) -> dict:
     """指定銘柄の日足異常を修復したうえで、その倍率を分足等の短期足データベースへ一挙遡及波及させます。"""
     pure_ticker = sanitize_ticker(ticker, is_jp)
@@ -714,7 +727,8 @@ def apply_scale_repair_with_intraday_propagation(ticker: str, is_jp: bool = True
             continue
 
         ticker_intra = ticker_intra.sort_values("date").reset_index(drop=True)
-        price_cols = [c for c in ["open", "high", "low", "close"] if c in ticker_intra.columns]
+        # price_cols の探索リストに "adj close" を追加
+        price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in ticker_intra.columns]
         repairs_sorted = sorted(repairs, key=lambda x: x["cliff_date"], reverse=True)
 
         applied_count = 0

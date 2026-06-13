@@ -148,6 +148,8 @@ def load_tickers_from_file(file_path: str) -> list:
         print(f"❌ [load_tickers_from_file] 読み込み失敗: {e}")
         return []
 
+# core/collector.py より修正
+
 def parse_yfinance_batch(df_raw: pd.DataFrame, chunk_tickers: list, is_jp: bool = True) -> pd.DataFrame:
     """yfinanceの生バッチ出力（MultiIndex対応含む）を統一されたDataFrame形式にパースします。"""
     if df_raw.empty:
@@ -165,7 +167,8 @@ def parse_yfinance_batch(df_raw: pd.DataFrame, chunk_tickers: list, is_jp: bool 
             dt_col = pd.to_datetime(t_df["date"])
             t_df["date"] = dt_col.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None) if dt_col.dt.tz is not None else dt_col
             t_df["ticker"] = str(chunk_tickers[0])
-            target_cols = ["date", "ticker", "open", "high", "low", "close", "volume", "stock splits", "dividends"]
+            # "adj close" を target_cols に追加
+            target_cols = ["date", "ticker", "open", "high", "low", "close", "adj close", "volume", "stock splits", "dividends"]
             valid_cols = [c for c in target_cols if c in t_df.columns]
             return t_df[valid_cols]
         else:
@@ -193,14 +196,15 @@ def parse_yfinance_batch(df_raw: pd.DataFrame, chunk_tickers: list, is_jp: bool 
             dt_col = pd.to_datetime(t_df["date"])
             t_df["date"] = dt_col.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None) if dt_col.dt.tz is not None else dt_col
             t_df["ticker"] = str(ticker)
-            target_cols = ["date", "ticker", "open", "high", "low", "close", "volume", "stock splits", "dividends"]
+            # "adj close" を target_cols に追加
+            target_cols = ["date", "ticker", "open", "high", "low", "close", "adj close", "volume", "stock splits", "dividends"]
             valid_cols = [c for c in target_cols if c in t_df.columns]
             all_rows.append(t_df[valid_cols])
         except Exception:
             continue
             
     return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
-
+    
 def get_benchmark_latest_date(interval: str, is_jp: bool = True) -> pd.Timestamp:
     """高流動性のベンチマークを用いて取引所の最新の日時を判定し、時間外ノイズを丸めて返します。"""
     symbols = ["7203.T", "^N225"] if is_jp else ["AAPL", "^GSPC"]
