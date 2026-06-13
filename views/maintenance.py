@@ -117,6 +117,8 @@ def render_etf_manager():
             st.caption("登録されている追加ETFはありません。")
 
 # ── データベース健康診断コンポーネント ──
+# views/maintenance.py 内の render_database_diagnostics_ui 該当部分を修正
+
 def render_database_diagnostics_ui(is_jp: bool):
     st.divider()
     st.subheader("📊 データベース健康診断 (段差・不具合検出)")
@@ -171,6 +173,12 @@ def render_database_diagnostics_ui(is_jp: bool):
         st.write("---")
         st.markdown(f"### 🔍 **{ticker} ({interval})** 崖の周辺データ確認")
         
+        # 表示対象カラムを動的に決定 (adj close があれば追加)
+        cols_to_disp = ["date", "open", "high", "low", "close"]
+        if "adj close" in df_ticker.columns:
+            cols_to_disp.append("adj close")
+        cols_to_disp.append("volume")
+        
         if len(detected_dates) == 2:
             start_date = pd.to_datetime(detected_dates[0])
             end_date = pd.to_datetime(detected_dates[1])
@@ -186,7 +194,7 @@ def render_database_diagnostics_ui(is_jp: bool):
                         (df_ticker["date"] >= start_date - pd.Timedelta(days=10)) & 
                         (df_ticker["date"] <= start_date + pd.Timedelta(days=10))
                     ]
-                    st.dataframe(df_in[["date", "open", "high", "low", "close", "volume"]], use_container_width=True, hide_index=True)
+                    st.dataframe(df_in[cols_to_disp], use_container_width=True, hide_index=True)
                     
                 with col_out:
                     st.markdown(f"📈 **崖の出口（正常に戻ったポイント）**")
@@ -194,14 +202,14 @@ def render_database_diagnostics_ui(is_jp: bool):
                         (df_ticker["date"] >= end_date - pd.Timedelta(days=10)) & 
                         (df_ticker["date"] <= end_date + pd.Timedelta(days=10))
                     ]
-                    st.dataframe(df_out[["date", "open", "high", "low", "close", "volume"]], use_container_width=True, hide_index=True)
+                    st.dataframe(df_out[cols_to_disp], use_container_width=True, hide_index=True)
             else:
                 st.markdown(f"📊 **不具合の全貌（前後10日間のマージン付き）**")
                 df_view = df_ticker[
                     (df_ticker["date"] >= start_date - pd.Timedelta(days=10)) & 
                     (df_ticker["date"] <= end_date + pd.Timedelta(days=10))
                 ]
-                st.dataframe(df_view[["date", "open", "high", "low", "close", "volume"]], use_container_width=True, hide_index=True)
+                st.dataframe(df_view[cols_to_disp], use_container_width=True, hide_index=True)
                 
         elif len(detected_dates) == 1:
             start_date = pd.to_datetime(detected_dates[0])
@@ -210,7 +218,7 @@ def render_database_diagnostics_ui(is_jp: bool):
                 (df_ticker["date"] >= start_date - pd.Timedelta(days=15)) & 
                 (df_ticker["date"] <= start_date + pd.Timedelta(days=15))
             ]
-            st.dataframe(df_view[["date", "open", "high", "low", "close", "volume"]], use_container_width=True, hide_index=True)
+            st.dataframe(df_view[cols_to_disp], use_container_width=True, hide_index=True)
             
         st.divider()
         st.markdown("#### 🛠️ **推奨される手動治療パッチの設定**")
@@ -331,6 +339,21 @@ with st.expander("🔍 異常データスキャン（修復対象の特定）", 
                 display_df["pct_change"] = display_df["pct_change"].apply(
                     lambda x: f"{x*100:.1f}%" if pd.notna(x) else "－"
                 )
+                
+            # カラム名を日本語にマッピングして Close と Adj Close を並列表示
+            rename_map = {
+                "ticker": "銘柄",
+                "cliff_date": "崖日付",
+                "before_close": "修正前 Close",
+                "after_close": "修正後 Close",
+                "before_adj_close": "修正前 Adj Close",
+                "after_adj_close": "修正後 Adj Close",
+                "pct_change": "変化率",
+                "anomaly_type": "不具合種類"
+            }
+            # 存在するカラムのみをリネームして表示
+            display_df = display_df.rename(columns={k: v for k, v in rename_map.items() if k in display_df.columns})
+            
             st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 st.write(" ")

@@ -637,6 +637,8 @@ def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
 
 # core/database_service.py より修正 (1/2)
 
+# core/database_service.py より修正 (1/2)
+
 def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: float = 0.35) -> pd.DataFrame:
     """全銘柄を対象に、ベクトル演算により瞬間的に異常価格（崖・負の値）を探索しリスト化します。"""
     try:
@@ -649,9 +651,10 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
     db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
     result_rows = []
 
-    # チェック対象の列を決定（adj closeが存在すれば追加して両方検証）
+    # チェック対象の列を決定
     cols_to_check = ["close"]
-    if "adj close" in db_df.columns:
+    has_adj = "adj close" in db_df.columns
+    if has_adj:
         cols_to_check.append("adj close")
 
     for p_col in cols_to_check:
@@ -667,11 +670,22 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
         
         if boundary_mask.any():
             boundary_rows = db_df[boundary_mask].copy()
-            boundary_rows["before_close"] = db_df.groupby("ticker")[p_col].shift(1)[boundary_mask].values
-            boundary_rows["after_close"] = boundary_rows[p_col]
+            # 常に Close と Adj Close 両方の前後データを並べて取得
+            boundary_rows["before_close"] = db_df.groupby("ticker")["close"].shift(1)[boundary_mask].values
+            boundary_rows["after_close"] = boundary_rows["close"]
+            
+            if has_adj:
+                boundary_rows["before_adj_close"] = db_df.groupby("ticker")["adj close"].shift(1)[boundary_mask].values
+                boundary_rows["after_adj_close"] = boundary_rows["adj close"]
+            else:
+                boundary_rows["before_adj_close"] = float("nan")
+                boundary_rows["after_adj_close"] = float("nan")
+
             boundary_rows["pct_change"] = float("nan")
             boundary_rows["anomaly_type"] = f"負の株価（切り替え境界）{col_label}"
-            result_rows.append(boundary_rows[["ticker", "date", "before_close", "after_close", "pct_change", "anomaly_type"]])
+            
+            sel_cols = ["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "pct_change", "anomaly_type"]
+            result_rows.append(boundary_rows[sel_cols])
 
         # 2. 崖（急変）チェック
         abs_close = db_df[p_col].abs()
@@ -680,11 +694,22 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
 
         if cliff_mask.any():
             cliff_rows = db_df[cliff_mask].copy()
-            cliff_rows["before_close"] = db_df.groupby("ticker")[p_col].shift(1)[cliff_mask].values
-            cliff_rows["after_close"] = cliff_rows[p_col]
+            # 常に Close と Adj Close 両方の前後データを並べて取得
+            cliff_rows["before_close"] = db_df.groupby("ticker")["close"].shift(1)[cliff_mask].values
+            cliff_rows["after_close"] = cliff_rows["close"]
+            
+            if has_adj:
+                cliff_rows["before_adj_close"] = db_df.groupby("ticker")["adj close"].shift(1)[cliff_mask].values
+                cliff_rows["after_adj_close"] = cliff_rows["adj close"]
+            else:
+                cliff_rows["before_adj_close"] = float("nan")
+                cliff_rows["after_adj_close"] = float("nan")
+
             cliff_rows["pct_change"] = pct[cliff_mask].values
             cliff_rows["anomaly_type"] = f"急変{col_label}（" + (pct[cliff_mask] * 100).round(1).astype(str) + "%）"
-            result_rows.append(cliff_rows[["ticker", "date", "before_close", "after_close", "pct_change", "anomaly_type"]])
+            
+            sel_cols = ["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "pct_change", "anomaly_type"]
+            result_rows.append(cliff_rows[sel_cols])
 
     if not result_rows:
         return pd.DataFrame()
@@ -694,9 +719,21 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
         types = " ＆ ".join(group["anomaly_type"].unique())
         pct_vals = group["pct_change"].dropna()
         pct_val = pct_vals.iloc[0] if not pct_vals.empty else float("nan")
-        before_val = group["before_close"].dropna().iloc[0] if not group["before_close"].dropna().empty else float("nan")
-        after_val = group["after_close"].dropna().iloc[0] if not group["after_close"].dropna().empty else float("nan")
-        return pd.Series({"before_close": before_val, "after_close": after_val, "pct_change": pct_val, "anomaly_type": types})
+        
+        # 集約時も Close / Adj Close の両方の代表値を取得
+        before_close_val = group["before_close"].dropna().iloc[0] if not group["before_close"].dropna().empty else float("nan")
+        after_close_val = group["after_close"].dropna().iloc[0] if not group["after_close"].dropna().empty else float("nan")
+        before_adj_val = group["before_adj_close"].dropna().iloc[0] if not group["before_adj_close"].dropna().empty else float("nan")
+        after_adj_val = group["after_adj_close"].dropna().iloc[0] if not group["after_adj_close"].dropna().empty else float("nan")
+        
+        return pd.Series({
+            "before_close": before_close_val, 
+            "after_close": after_close_val, 
+            "before_adj_close": before_adj_val, 
+            "after_adj_close": after_adj_val, 
+            "pct_change": pct_val, 
+            "anomaly_type": types
+        })
         
     result = result.groupby(["ticker", "cliff_date"], as_index=False).apply(aggregate_anomalies)
     return result.sort_values(["ticker", "cliff_date"]).reset_index(drop=True)
@@ -773,6 +810,8 @@ def apply_scale_repair_with_intraday_propagation(ticker: str, is_jp: bool = True
 
 # core/database_service.py より修正 (2/2)
 
+# core/database_service.py より修正 (2/2)
+
 def run_database_health_scan(is_jp: bool) -> list:
     """全タイムフレームのParquetデータベースを自動スキャンし、異常陥没・高騰・段差などを診断します。"""
     anomalies = []
@@ -785,14 +824,16 @@ def run_database_health_scan(is_jp: bool) -> list:
             
             # チェック対象カラムの動的決定
             cols_to_check = ["close"]
-            if "adj close" in df.columns:
+            has_adj = "adj close" in df.columns
+            if has_adj:
                 cols_to_check.append("adj close")
+                df["pct_adj_close"] = df.groupby("ticker")["adj close"].pct_change()
+
+            df["pct_close"] = df.groupby("ticker")["close"].pct_change()
 
             for p_col in cols_to_check:
                 col_label = " (Adj Close)" if p_col == "adj close" else ""
-                pct_col = f"pct_{p_col.replace(' ', '_')}"
-                
-                df[pct_col] = df.groupby("ticker")[p_col].pct_change()
+                pct_col = "pct_adj_close" if p_col == "adj close" else "pct_close"
                 
                 # 急激な陥没（-40%以下）または急騰（+50%以上）を検知
                 anomaly_indices = df[(df[pct_col] <= -0.40) | (df[pct_col] >= 0.50)].index.tolist()
@@ -809,50 +850,84 @@ def run_database_health_scan(is_jp: bool) -> list:
                     if n < 2:
                         continue
                         
-                    pre_p = curr_p / (1.0 + pct_val)
+                    # 近隣の各価格を対比用に取得
+                    curr_close = row["close"]
+                    curr_adj = row["adj close"] if has_adj else float("nan")
+                    
+                    pre_close = curr_close / (1.0 + row["pct_close"])
+                    pre_adj = curr_adj / (1.0 + row["pct_adj_close"]) if has_adj else float("nan")
+                    
                     if pct_val <= -0.40:
                         found_recovery = False
                         recovery_idx = -1
                         for j in range(1, n):
                             post_p = close_vals[j]
-                            if (pre_p * 0.85) <= post_p <= (pre_p * 1.15):
+                            if (pre_p := curr_p / (1.0 + pct_val)) * 0.85 <= post_p <= pre_p * 1.15:
                                 found_recovery = True
                                 recovery_idx = j
                                 break
+                        
+                        post_close = ticker_df["close"].iloc[recovery_idx] if found_recovery else float("nan")
+                        post_adj = ticker_df["adj close"].iloc[recovery_idx] if (found_recovery and has_adj) else float("nan")
+
                         if found_recovery:
                             bug_end_date = dates[recovery_idx - 1]
+                            price_msg = f"Close: {pre_close:.1f} ➔ {curr_close:.1f} ➔ {post_close:.1f}"
+                            if has_adj:
+                                price_msg += f" | Adj: {pre_adj:.1f} ➔ {curr_adj:.1f} ➔ {post_adj:.1f}"
+                                
                             anomalies.append({
                                 "時間足": interval, "コード": ticker, "不具合種類": f"🚨 クレーターバグ{col_label}",
                                 "発生日/時刻": f"{str(dates[0])[:16]} 〜 {str(bug_end_date)[:16]}",
-                                "異常値": f"{curr_p:.2f}", "前後価格": f"{pre_p:.2f} ➔ {close_vals[recovery_idx]:.2f}"
+                                "異常値": f"Close: {curr_close:.1f}" + (f" / Adj: {curr_adj:.1f}" if has_adj else ""),
+                                "前後価格": price_msg
                             })
                         else:
+                            price_msg = f"Close: {pre_close:.1f} ➔ {curr_close:.1f}"
+                            if has_adj:
+                                price_msg += f" | Adj: {pre_adj:.1f} ➔ {curr_adj:.1f}"
+                                
                             anomalies.append({
                                 "時間足": interval, "コード": ticker, "不具合種類": f"📉 階段段差（未調整分割）{col_label}",
                                 "発生日/時刻": f"{str(dates[0])[:16]} 〜 最新",
-                                "異常値": f"前日: {pre_p:.1f} ➔ 当日: {curr_p:.1f}", "前後価格": f"{pre_p:.2f} ➔ {curr_p:.2f}"
+                                "異常値": f"Close: {curr_close:.1f}" + (f" / Adj: {curr_adj:.1f}" if has_adj else ""),
+                                "前後価格": price_msg
                             })
                     elif pct_val >= 0.50:
                         found_recovery = False
                         recovery_idx = -1
                         for j in range(1, n):
                             post_p = close_vals[j]
-                            if (pre_p * 0.85) <= post_p <= (pre_p * 1.15):
+                            if (pre_p := curr_p / (1.0 + pct_val)) * 0.85 <= post_p <= pre_p * 1.15:
                                 found_recovery = True
                                 recovery_idx = j
                                 break
+                        
+                        post_close = ticker_df["close"].iloc[recovery_idx] if found_recovery else float("nan")
+                        post_adj = ticker_df["adj close"].iloc[recovery_idx] if (found_recovery and has_adj) else float("nan")
+
                         if found_recovery:
                             bug_end_date = dates[recovery_idx - 1]
+                            price_msg = f"Close: {pre_close:.1f} ➔ {curr_close:.1f} ➔ {post_close:.1f}"
+                            if has_adj:
+                                price_msg += f" | Adj: {pre_adj:.1f} ➔ {curr_adj:.1f} ➔ {post_adj:.1f}"
+                                
                             anomalies.append({
                                 "時間足": interval, "コード": ticker, "不具合種類": f"📈 タワーバグ{col_label}",
                                 "発生日/時刻": f"{str(dates[0])[:16]} 〜 {str(bug_end_date)[:16]}",
-                                "異常値": f"{curr_p:.2f}", "前後価格": f"{pre_p:.2f} ➔ {close_vals[recovery_idx]:.2f}"
+                                "異常値": f"Close: {curr_close:.1f}" + (f" / Adj: {curr_adj:.1f}" if has_adj else ""),
+                                "前後価格": price_msg
                             })
                         else:
+                            price_msg = f"Close: {pre_close:.1f} ➔ {curr_close:.1f}"
+                            if has_adj:
+                                price_msg += f" | Adj: {pre_adj:.1f} ➔ {curr_adj:.1f}"
+                                
                             anomalies.append({
                                 "時間足": interval, "コード": ticker, "不具合種類": f"📈 階段段差（未調整併合）{col_label}",
                                 "発生日/時刻": f"{str(dates[0])[:16]} 〜 最新",
-                                "異常値": f"前日: {pre_p:.1f} ➔ 当日: {curr_p:.1f}", "前後価格": f"{pre_p:.2f} ➔ {curr_p:.2f}"
+                                "異常値": f"Close: {curr_close:.1f}" + (f" / Adj: {curr_adj:.1f}" if has_adj else ""),
+                                "前後価格": price_msg
                             })
         except Exception:
             pass
