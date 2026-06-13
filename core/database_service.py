@@ -635,6 +635,8 @@ def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
         })
     return df, repairs
 
+# core/database_service.py より修正 (1/2)
+
 def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: float = 0.35) -> pd.DataFrame:
     """全銘柄を対象に、ベクトル演算により瞬間的に異常価格（崖・負の値）を探索しリスト化します。"""
     try:
@@ -647,32 +649,42 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
     db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
     result_rows = []
 
-    negative_mask = db_df["close"] < 0
-    shifted_neg_mask_for_pos = db_df.groupby("ticker")["close"].apply(lambda x: (x < 0).shift(1, fill_value=True)).reset_index(level=0, drop=True)
-    pos_to_neg = negative_mask & (~shifted_neg_mask_for_pos)
-    shifted_neg_mask_for_neg = db_df.groupby("ticker")["close"].apply(lambda x: (x < 0).shift(1, fill_value=False)).reset_index(level=0, drop=True)
-    neg_to_pos = (~negative_mask) & shifted_neg_mask_for_neg
-    boundary_mask = pos_to_neg | neg_to_pos
-    
-    if boundary_mask.any():
-        boundary_rows = db_df[boundary_mask].copy()
-        boundary_rows["before_close"] = db_df.groupby("ticker")["close"].shift(1)[boundary_mask].values
-        boundary_rows["after_close"] = boundary_rows["close"]
-        boundary_rows["pct_change"] = float("nan")
-        boundary_rows["anomaly_type"] = "負の株価（切り替え境界）"
-        result_rows.append(boundary_rows[["ticker", "date", "before_close", "after_close", "pct_change", "anomaly_type"]])
+    # チェック対象の列を決定（adj closeが存在すれば追加して両方検証）
+    cols_to_check = ["close"]
+    if "adj close" in db_df.columns:
+        cols_to_check.append("adj close")
 
-    abs_close = db_df["close"].abs()
-    pct = abs_close.groupby(db_df["ticker"]).pct_change()
-    cliff_mask = pct.abs() >= threshold
+    for p_col in cols_to_check:
+        col_label = " (Adj Close)" if p_col == "adj close" else ""
+        
+        # 1. 負の数チェック
+        negative_mask = db_df[p_col] < 0
+        shifted_neg_mask_for_pos = db_df.groupby("ticker")[p_col].apply(lambda x: (x < 0).shift(1, fill_value=True)).reset_index(level=0, drop=True)
+        pos_to_neg = negative_mask & (~shifted_neg_mask_for_pos)
+        shifted_neg_mask_for_neg = db_df.groupby("ticker")[p_col].apply(lambda x: (x < 0).shift(1, fill_value=False)).reset_index(level=0, drop=True)
+        neg_to_pos = (~negative_mask) & shifted_neg_mask_for_neg
+        boundary_mask = pos_to_neg | neg_to_pos
+        
+        if boundary_mask.any():
+            boundary_rows = db_df[boundary_mask].copy()
+            boundary_rows["before_close"] = db_df.groupby("ticker")[p_col].shift(1)[boundary_mask].values
+            boundary_rows["after_close"] = boundary_rows[p_col]
+            boundary_rows["pct_change"] = float("nan")
+            boundary_rows["anomaly_type"] = f"負の株価（切り替え境界）{col_label}"
+            result_rows.append(boundary_rows[["ticker", "date", "before_close", "after_close", "pct_change", "anomaly_type"]])
 
-    if cliff_mask.any():
-        cliff_rows = db_df[cliff_mask].copy()
-        cliff_rows["before_close"] = db_df.groupby("ticker")["close"].shift(1)[cliff_mask].values
-        cliff_rows["after_close"] = cliff_rows["close"]
-        cliff_rows["pct_change"] = pct[cliff_mask].values
-        cliff_rows["anomaly_type"] = "急変（" + (pct[cliff_mask] * 100).round(1).astype(str) + "%）"
-        result_rows.append(cliff_rows[["ticker", "date", "before_close", "after_close", "pct_change", "anomaly_type"]])
+        # 2. 崖（急変）チェック
+        abs_close = db_df[p_col].abs()
+        pct = abs_close.groupby(db_df["ticker"]).pct_change()
+        cliff_mask = pct.abs() >= threshold
+
+        if cliff_mask.any():
+            cliff_rows = db_df[cliff_mask].copy()
+            cliff_rows["before_close"] = db_df.groupby("ticker")[p_col].shift(1)[cliff_mask].values
+            cliff_rows["after_close"] = cliff_rows[p_col]
+            cliff_rows["pct_change"] = pct[cliff_mask].values
+            cliff_rows["anomaly_type"] = f"急変{col_label}（" + (pct[cliff_mask] * 100).round(1).astype(str) + "%）"
+            result_rows.append(cliff_rows[["ticker", "date", "before_close", "after_close", "pct_change", "anomaly_type"]])
 
     if not result_rows:
         return pd.DataFrame()
@@ -759,6 +771,8 @@ def apply_scale_repair_with_intraday_propagation(ticker: str, is_jp: bool = True
     results["ticker"] = pure_ticker
     return results
 
+# core/database_service.py より修正 (2/2)
+
 def run_database_health_scan(is_jp: bool) -> list:
     """全タイムフレームのParquetデータベースを自動スキャンし、異常陥没・高騰・段差などを診断します。"""
     anomalies = []
@@ -768,67 +782,78 @@ def run_database_health_scan(is_jp: bool) -> list:
             if df.empty:
                 continue
             df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
-            df["pct"] = df.groupby("ticker")["close"].pct_change()
             
-            anomaly_indices = df[(df["pct"] <= -0.40) | (df["pct"] >= 0.50)].index.tolist()
-            for i in anomaly_indices:
-                row = df.loc[i]
-                ticker = row["ticker"]
-                curr_p = row["close"]
-                pct_val = row["pct"]
+            # チェック対象カラムの動的決定
+            cols_to_check = ["close"]
+            if "adj close" in df.columns:
+                cols_to_check.append("adj close")
+
+            for p_col in cols_to_check:
+                col_label = " (Adj Close)" if p_col == "adj close" else ""
+                pct_col = f"pct_{p_col.replace(' ', '_')}"
                 
-                ticker_df = df[(df["ticker"] == ticker) & (df.index >= i)].copy()
-                dates = ticker_df["date"].tolist()
-                close_vals = ticker_df["close"].tolist()
-                n = len(ticker_df)
-                if n < 2:
-                    continue
+                df[pct_col] = df.groupby("ticker")[p_col].pct_change()
+                
+                # 急激な陥没（-40%以下）または急騰（+50%以上）を検知
+                anomaly_indices = df[(df[pct_col] <= -0.40) | (df[pct_col] >= 0.50)].index.tolist()
+                for i in anomaly_indices:
+                    row = df.loc[i]
+                    ticker = row["ticker"]
+                    curr_p = row[p_col]
+                    pct_val = row[pct_col]
                     
-                pre_p = curr_p / (1.0 + pct_val)
-                if pct_val <= -0.40:
-                    found_recovery = False
-                    recovery_idx = -1
-                    for j in range(1, n):
-                        post_p = close_vals[j]
-                        if (pre_p * 0.85) <= post_p <= (pre_p * 1.15):
-                            found_recovery = True
-                            recovery_idx = j
-                            break
-                    if found_recovery:
-                        bug_end_date = dates[recovery_idx - 1]
-                        anomalies.append({
-                            "時間足": interval, "コード": ticker, "不具合種類": "🚨 クレーターバグ",
-                            "発生日/時刻": f"{str(dates[0])[:16]} 〜 {str(bug_end_date)[:16]}",
-                            "異常値": f"{curr_p:.2f}", "前後価格": f"{pre_p:.2f} ➔ {close_vals[recovery_idx]:.2f}"
-                        })
-                    else:
-                        anomalies.append({
-                            "時間足": interval, "コード": ticker, "不具合種類": "📉 階段段差（未調整分割）",
-                            "発生日/時刻": f"{str(dates[0])[:16]} 〜 最新",
-                            "異常値": f"前日: {pre_p:.1f} ➔ 当日: {curr_p:.1f}", "前後価格": f"{pre_p:.2f} ➔ {curr_p:.2f}"
-                        })
-                elif pct_val >= 0.50:
-                    found_recovery = False
-                    recovery_idx = -1
-                    for j in range(1, n):
-                        post_p = close_vals[j]
-                        if (pre_p * 0.85) <= post_p <= (pre_p * 1.15):
-                            found_recovery = True
-                            recovery_idx = j
-                            break
-                    if found_recovery:
-                        bug_end_date = dates[recovery_idx - 1]
-                        anomalies.append({
-                            "時間足": interval, "コード": ticker, "不具合種類": "📈 タワーバグ",
-                            "発生日/時刻": f"{str(dates[0])[:16]} 〜 {str(bug_end_date)[:16]}",
-                            "異常値": f"{curr_p:.2f}", "前後価格": f"{pre_p:.2f} ➔ {close_vals[recovery_idx]:.2f}"
-                        })
-                    else:
-                        anomalies.append({
-                            "時間足": interval, "コード": ticker, "不具合種類": "📈 階段段差（未調整併合）",
-                            "発生日/時刻": f"{str(dates[0])[:16]} 〜 最新",
-                            "異常値": f"前日: {pre_p:.1f} ➔ 当日: {curr_p:.1f}", "前後価格": f"{pre_p:.2f} ➔ {curr_p:.2f}"
-                        })
+                    ticker_df = df[(df["ticker"] == ticker) & (df.index >= i)].copy()
+                    dates = ticker_df["date"].tolist()
+                    close_vals = ticker_df[p_col].tolist()
+                    n = len(ticker_df)
+                    if n < 2:
+                        continue
+                        
+                    pre_p = curr_p / (1.0 + pct_val)
+                    if pct_val <= -0.40:
+                        found_recovery = False
+                        recovery_idx = -1
+                        for j in range(1, n):
+                            post_p = close_vals[j]
+                            if (pre_p * 0.85) <= post_p <= (pre_p * 1.15):
+                                found_recovery = True
+                                recovery_idx = j
+                                break
+                        if found_recovery:
+                            bug_end_date = dates[recovery_idx - 1]
+                            anomalies.append({
+                                "時間足": interval, "コード": ticker, "不具合種類": f"🚨 クレーターバグ{col_label}",
+                                "発生日/時刻": f"{str(dates[0])[:16]} 〜 {str(bug_end_date)[:16]}",
+                                "異常値": f"{curr_p:.2f}", "前後価格": f"{pre_p:.2f} ➔ {close_vals[recovery_idx]:.2f}"
+                            })
+                        else:
+                            anomalies.append({
+                                "時間足": interval, "コード": ticker, "不具合種類": f"📉 階段段差（未調整分割）{col_label}",
+                                "発生日/時刻": f"{str(dates[0])[:16]} 〜 最新",
+                                "異常値": f"前日: {pre_p:.1f} ➔ 当日: {curr_p:.1f}", "前後価格": f"{pre_p:.2f} ➔ {curr_p:.2f}"
+                            })
+                    elif pct_val >= 0.50:
+                        found_recovery = False
+                        recovery_idx = -1
+                        for j in range(1, n):
+                            post_p = close_vals[j]
+                            if (pre_p * 0.85) <= post_p <= (pre_p * 1.15):
+                                found_recovery = True
+                                recovery_idx = j
+                                break
+                        if found_recovery:
+                            bug_end_date = dates[recovery_idx - 1]
+                            anomalies.append({
+                                "時間足": interval, "コード": ticker, "不具合種類": f"📈 タワーバグ{col_label}",
+                                "発生日/時刻": f"{str(dates[0])[:16]} 〜 {str(bug_end_date)[:16]}",
+                                "異常値": f"{curr_p:.2f}", "前後価格": f"{pre_p:.2f} ➔ {close_vals[recovery_idx]:.2f}"
+                            })
+                        else:
+                            anomalies.append({
+                                "時間足": interval, "コード": ticker, "不具合種類": f"📈 階段段差（未調整併合）{col_label}",
+                                "発生日/時刻": f"{str(dates[0])[:16]} 〜 最新",
+                                "異常値": f"前日: {pre_p:.1f} ➔ 当日: {curr_p:.1f}", "前後価格": f"{pre_p:.2f} ➔ {curr_p:.2f}"
+                            })
         except Exception:
             pass
     return anomalies
