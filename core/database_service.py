@@ -333,7 +333,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                 if interval == "1m": start_date_dt = now - timedelta(days=6)
                 elif interval == "5m": start_date_dt = now - timedelta(days=58)
                 elif interval == "60m": start_date_dt = now - timedelta(days=718)
-                else: start_date_dt = datetime(2000, 1, 1)
+                else: start_date_dt = datetime(2016, 1, 1)
                 start_date_str = start_date_dt.strftime("%Y-%m-%d")
             else:
                 start_date_dt = t_last
@@ -431,7 +431,7 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
     if interval == "1m": start_date_dt = now - timedelta(days=6)
     elif interval == "5m": start_date_dt = now - timedelta(days=58)
     elif interval == "60m": start_date_dt = now - timedelta(days=718)
-    else: start_date_dt = datetime(2000, 1, 1)
+    else: start_date_dt = datetime(2016, 1, 1)
         
     log(f"🚨 [フル再構築] {market_name} ({interval}) 開始。総数: {len(tickers)}")
     
@@ -481,7 +481,7 @@ def rebuild_single_ticker_db(ticker: str, is_jp: bool = True, interval: str = "1
     if interval == "1m": start_date_dt = now - timedelta(days=6)
     elif interval == "5m": start_date_dt = now - timedelta(days=58)
     elif interval == "60m": start_date_dt = now - timedelta(days=718)
-    else: start_date_dt = datetime(2000, 1, 1)
+    else: start_date_dt = datetime(2016, 1, 1)
         
     try:
         df_raw = yf.download(
