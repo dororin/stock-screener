@@ -269,32 +269,39 @@ if is_jp:
             if f"etf_visible_{_code}" not in st.session_state:
                 st.session_state[f"etf_visible_{_code}"] = True
 
-        # ─── ★CSS注入: ポップオーバーの表示領域を縦横マウス可変・レスポンシブ化 ───
+        # ─── ★修正版CSS注入: 横幅・高さの !important を外し、マウスでの伸縮を許可 ───
         st.markdown(
             """
             <style>
-            /* デフォルト（PC・大画面タブレット用） */
+            /* ──────── デフォルト（PC・大画面タブレット用） ──────── */
             div[data-testid="stPopoverBody"] {
-                resize: both !important;      /* マウスドラッグでのリサイズを有効化 */
-                overflow: auto !important;     /* resize機能に必須の設定 */
+                resize: both !important;       /* マウスでの引き伸ばしを有効化 */
+                overflow: auto !important;      /* resize動作に必須の設定 */
                 
-                width: 85vw !important;        /* 初期表示幅：画面幅の85% */
-                min-width: 850px !important;   /* 最小幅（目盛りのつぶれを防止） */
-                max-width: 1400px !important;  /* 最大幅制限 */
+                /* 
+                   ★超重要: 初期の幅と高さ。ドラッグ操作（ブラウザの書き込み）で
+                   上書きできるように、ここだけ !important を外しておきます。
+                */
+                width: 85vw;                    /* 初期の横幅 */
+                height: 500px;                  /* 初期の高さ */
                 
-                height: 500px !important;      /* 初期表示高 */
-                min-height: 400px !important;  /* 最小高 */
+                /* つぶれ防止やはみ出し防止用の制限値は !important で固定します */
+                min-width: 850px !important;
+                min-height: 400px !important;
+                max-width: 95vw !important;
+                max-height: 90vh !important;
                 padding: 20px !important;
             }
 
-            /* スマホ用（画面幅が 768px 以下の時） */
+            /* ──────── スマホ用（スマホはドラッグ不可のため自動縮小） ──────── */
             @media (max-width: 768px) {
                 div[data-testid="stPopoverBody"] {
-                    resize: none !important;     /* スマホはドラッグをオフにする */
+                    resize: none !important;
                     width: 90vw !important;
                     min-width: 280px !important;
                     max-width: 95vw !important;
                     height: auto !important;
+                    min-height: auto !important;
                     padding: 10px !important;
                 }
             }
