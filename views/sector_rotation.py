@@ -274,6 +274,124 @@ if is_jp:
         CHILD_COLS = 5
         ETF_GRID_COLS = n_cols
 
+        # --- 追加するフラグメント関数 ---
+        @st.fragment
+        def render_single_etf_card(code, name, period_days, resample_weekly, db_df, TOPIX17_TO_JP_SECTOR, CHILD_COLS):
+            """
+            1つのETFカードとその配下の構成銘柄ドリルダウンをフラグメント化。
+            この中でのボタン操作（表示・非表示、展開）は、このカードの中身だけを高速に再描画します。
+            """
+            visible = st.session_state.get(f"etf_visible_{code}", True)
+            expanded = st.session_state.get(f"etf_expand_{code}", False)
+
+            with st.container(border=True):
+                hc1, hc2 = st.columns([5, 1])
+                vis_label = "表示" if not visible else "非表示"
+                
+                # ボタンクリックでセッションを書き換え、このフラグメントだけを自動再描画
+                if hc2.button(vis_label, key=f"vis_{code}", use_container_width=True):
+                    st.session_state[f"etf_visible_{code}"] = not visible
+                    if visible:
+                        st.session_state[f"etf_expand_{code}"] = False
+                    # st.rerun() は不要（ボタンクリックによりこの関数内だけが自動再実行されます）
+
+                if visible:
+                    try:
+                        etf_abs, etf_sma75, etf_sma200, etf_wvf, etf_vol = compute_sector_absolute_data(
+                            db_df, [code], period_days, resample_weekly
+                        )
+                    except Exception:
+                        etf_abs = pd.Series(dtype=float)
+                        etf_sma75 = etf_sma200 = etf_wvf = etf_vol = pd.Series(dtype=float)
+
+                    etf_mom = get_sector_momentum(
+                        compute_sector_index_from_df(db_df, [code], period_days, resample_weekly),
+                        days=min(5, period_days)
+                    )
+                    badge_e = "🟢" if etf_mom >= 0 else "🔴"
+                    color_e = "#26a69a" if etf_mom >= 0 else "#ef5350"
+
+                    hc1.markdown(
+                        f"<span style='font-size:0.9rem; font-weight:600; color:{color_e}'>"
+                        f"{badge_e} {code} {name}</span>"
+                        f"<span style='font-size:0.8rem; color:{color_e}; margin-left:6px;'>{etf_mom:+.2f}%</span>",
+                        unsafe_allow_html=True
+                    )
+
+                    if not etf_abs.empty:
+                        render_lwc_sector_mini(
+                            etf_abs, sma_fast=etf_sma75, sma_slow=etf_sma200,
+                            wvf_lit=etf_wvf, volume_series=etf_vol,
+                            key=f"etf_abs_mini_{code}", height=150
+                        )
+                    else:
+                        st.caption("データなし")
+
+                    jp_sector_name = TOPIX17_TO_JP_SECTOR.get(code)
+                    constituent_codes = settings.JP_SECTORS.get(jp_sector_name, []) if jp_sector_name else []
+                    if not constituent_codes:
+                        sectors_loaded = load_sector_master_from_sheets(True)
+                        constituent_codes = sectors_loaded.get(jp_sector_name, []) if jp_sector_name else []
+
+                    if constituent_codes:
+                        exp_label = "▲ 閉じる" if expanded else f"▼ 構成{len(constituent_codes)}銘柄"
+                        if st.button(exp_label, key=f"exp_{code}", use_container_width=True):
+                            st.session_state[f"etf_expand_{code}"] = not expanded
+                            # st.rerun() は不要
+
+                        # ドリルダウン構成銘柄の展開描画もフラグメント内で完結
+                        if expanded:
+                            st.markdown(
+                                f"<div style='border-left: 3px solid #42a5f5; padding-left: 10px; "
+                                f"margin: 4px 0 6px; font-size:0.85rem; font-weight:600; color:#42a5f5;'>"
+                                f"↳ {code} {name} の構成銘柄（{len(constituent_codes)}銘柄）</div>",
+                                unsafe_allow_html=True
+                            )
+
+                            child_rows = [
+                                constituent_codes[i:i + CHILD_COLS]
+                                for i in range(0, len(constituent_codes), CHILD_COLS)
+                            ]
+                            for child_row in child_rows:
+                                c_cols = st.columns(CHILD_COLS)
+                                for cj, stock_code in enumerate(child_row):
+                                    with c_cols[cj]:
+                                        try:
+                                            s_abs, s_sma75, s_sma200, s_wvf, s_vol = compute_sector_absolute_data(
+                                                db_df, [stock_code], period_days, resample_weekly
+                                            )
+                                        except Exception:
+                                            s_abs = pd.Series(dtype=float)
+                                            s_sma75 = s_sma200 = s_wvf = s_vol = pd.Series(dtype=float)
+
+                                        s_mom = get_sector_momentum(
+                                            compute_sector_index_from_df(db_df, [stock_code], period_days, resample_weekly),
+                                            days=min(5, period_days)
+                                        )
+                                        s_badge = "🟢" if s_mom >= 3.0 else "🔴" if s_mom <= -3.0 else "⚪"
+                                        s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
+
+                                        with st.container(border=True):
+                                            st.markdown(
+                                                f"<div style='font-size:0.78rem; font-weight:600; color:{s_color};'>"
+                                                f"{s_badge} {stock_code}</div>"
+                                                f"<div style='font-size:0.75rem; color:#9e9e9e;'>{s_mom:+.2f}%</div>",
+                                                unsafe_allow_html=True
+                                            )
+                                            if not s_abs.empty:
+                                                render_lwc_sector_mini(
+                                                    s_abs, sma_fast=s_sma75, sma_slow=s_sma200,
+                                                    wvf_lit=s_wvf, volume_series=s_vol,
+                                                    key=f"stock_mini_{code}_{stock_code}", height=130
+                                                )
+                                            else:
+                                                st.caption("データなし")
+                else:
+                    hc1.markdown(
+                        f"<span style='font-size:0.85rem; color:#9e9e9e;'>{code} {name}</span>",
+                        unsafe_allow_html=True
+                    )
+
         rows_17 = [
             all_etf_codes[i:i + ETF_GRID_COLS]
             for i in range(0, len(all_etf_codes), ETF_GRID_COLS)
@@ -283,128 +401,12 @@ if is_jp:
             row_cols = st.columns(ETF_GRID_COLS)
             for ci, code in enumerate(row_codes):
                 name = settings.TOPIX17_NAMES.get(code, code)
-                visible = st.session_state[f"etf_visible_{code}"]
-                expanded = st.session_state[f"etf_expand_{code}"]
-
                 with row_cols[ci]:
-                    with st.container(border=True):
-                        hc1, hc2 = st.columns([5, 1])
-                        vis_label = "表示" if not visible else "非表示"
-                        if hc2.button(vis_label, key=f"vis_{code}", use_container_width=True):
-                            st.session_state[f"etf_visible_{code}"] = not visible
-                            if visible:
-                                st.session_state[f"etf_expand_{code}"] = False
-                            st.rerun()
-
-                        if visible:
-                            try:
-                                etf_abs, etf_sma75, etf_sma200, etf_wvf, etf_vol = compute_sector_absolute_data(
-                                    db_df, [code], period_days, resample_weekly
-                                )
-                            except Exception:
-                                etf_abs = pd.Series(dtype=float)
-                                etf_sma75 = etf_sma200 = etf_wvf = etf_vol = pd.Series(dtype=float)
-
-                            etf_mom = get_sector_momentum(
-                                compute_sector_index_from_df(db_df, [code], period_days, resample_weekly),
-                                days=min(5, period_days)
-                            )
-                            badge_e = "🟢" if etf_mom >= 0 else "🔴"
-                            color_e = "#26a69a" if etf_mom >= 0 else "#ef5350"
-
-                            hc1.markdown(
-                                f"<span style='font-size:0.9rem; font-weight:600; color:{color_e}'>"
-                                f"{badge_e} {code} {name}</span>"
-                                f"<span style='font-size:0.8rem; color:{color_e}; margin-left:6px;'>{etf_mom:+.2f}%</span>",
-                                unsafe_allow_html=True
-                            )
-
-                            if not etf_abs.empty:
-                                render_lwc_sector_mini(
-                                    etf_abs, sma_fast=etf_sma75, sma_slow=etf_sma200,
-                                    wvf_lit=etf_wvf, volume_series=etf_vol,
-                                    key=f"etf_abs_mini_{code}", height=150
-                                )
-                            else:
-                                st.caption("データなし")
-
-                            jp_sector_name = TOPIX17_TO_JP_SECTOR.get(code)
-                            constituent_codes = settings.JP_SECTORS.get(jp_sector_name, []) if jp_sector_name else []
-                            if not constituent_codes:
-                                sectors_loaded = load_sector_master_from_sheets(True)
-                                constituent_codes = sectors_loaded.get(jp_sector_name, []) if jp_sector_name else []
-
-                            if constituent_codes:
-                                exp_label = "▲ 閉じる" if expanded else f"▼ 構成{len(constituent_codes)}銘柄"
-                                if st.button(exp_label, key=f"exp_{code}", use_container_width=True):
-                                    st.session_state[f"etf_expand_{code}"] = not expanded
-                                    st.rerun()
-                        else:
-                            hc1.markdown(
-                                f"<span style='font-size:0.85rem; color:#9e9e9e;'>{code} {name}</span>",
-                                unsafe_allow_html=True
-                            )
-
-            # 構成銘柄のドリルダウン展開描画
-            for code in row_codes:
-                if not st.session_state.get(f"etf_expand_{code}", False):
-                    continue
-                name = settings.TOPIX17_NAMES.get(code, code)
-                jp_sector_name = TOPIX17_TO_JP_SECTOR.get(code)
-                constituent_codes = settings.JP_SECTORS.get(jp_sector_name, []) if jp_sector_name else []
-                if not constituent_codes:
-                    sectors_loaded = load_sector_master_from_sheets(True)
-                    constituent_codes = sectors_loaded.get(jp_sector_name, []) if jp_sector_name else []
-                if not constituent_codes:
-                    continue
-
-                st.markdown(
-                    f"<div style='border-left: 3px solid #42a5f5; padding-left: 10px; "
-                    f"margin: 4px 0 6px; font-size:0.85rem; font-weight:600; color:#42a5f5;'>"
-                    f"↳ {code} {name} の構成銘柄（{len(constituent_codes)}銘柄）</div>",
-                    unsafe_allow_html=True
-                )
-
-                child_rows = [
-                    constituent_codes[i:i + CHILD_COLS]
-                    for i in range(0, len(constituent_codes), CHILD_COLS)
-                ]
-                for child_row in child_rows:
-                    c_cols = st.columns(CHILD_COLS)
-                    for cj, stock_code in enumerate(child_row):
-                        with c_cols[cj]:
-                            try:
-                                s_abs, s_sma75, s_sma200, s_wvf, s_vol = compute_sector_absolute_data(
-                                    db_df, [stock_code], period_days, resample_weekly
-                                )
-                            except Exception:
-                                s_abs = pd.Series(dtype=float)
-                                s_sma75 = s_sma200 = s_wvf = s_vol = pd.Series(dtype=float)
-
-                            s_mom = get_sector_momentum(
-                                compute_sector_index_from_df(db_df, [stock_code], period_days, resample_weekly),
-                                days=min(5, period_days)
-                            )
-                            s_badge = "🟢" if s_mom >= 3.0 else "🔴" if s_mom <= -3.0 else "⚪"
-                            s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
-
-                            with st.container(border=True):
-                                st.markdown(
-                                    f"<div style='font-size:0.78rem; font-weight:600; color:{s_color};'>"
-                                    f"{s_badge} {stock_code}</div>"
-                                    f"<div style='font-size:0.75rem; color:#9e9e9e;'>{s_mom:+.2f}%</div>",
-                                    unsafe_allow_html=True
-                                )
-                                if not s_abs.empty:
-                                    render_lwc_sector_mini(
-                                        s_abs, sma_fast=s_sma75, sma_slow=s_sma200,
-                                        wvf_lit=s_wvf, volume_series=s_vol,
-                                        key=f"stock_mini_{code}_{stock_code}", height=130
-                                    )
-                                else:
-                                    st.caption("データなし")
-
-                st.markdown("<hr style='margin: 0.6rem 0 !important; opacity:0.15;'>", unsafe_allow_html=True)
+                    # フラグメントを呼び出し
+                    render_single_etf_card(
+                        code, name, period_days, resample_weekly, db_df, 
+                        TOPIX17_TO_JP_SECTOR, CHILD_COLS=5
+                    )
 
 # =========================================================================
 # 🇺🇸 米国株モード

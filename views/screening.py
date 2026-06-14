@@ -70,6 +70,60 @@ with st.sidebar:
                 st.success("結果を保存しました！")
                 st.rerun()
 
+# --- 追加するフラグメント関数 ---
+@st.fragment
+def render_screened_stock_card(r, index_num, unique_key):
+    """
+    スクリーニングされた1銘柄のカードをフラグメント化。
+    お気に入り⭐トグルを切り替えても、このカード以外は一切再描画されず高速に動作します。
+    """
+    with st.container(border=True):
+        c1, c2 = st.columns([0.85, 0.15])
+        c1.subheader(f"[{r['コード']}](https://jp.tradingview.com/chart/?symbol=TSE%3A{r['コード']}) {r['銘柄']}")
+        
+        # お気に入りトグル
+        is_fav = st.session_state.result_df.at[index_num, 'お気に入り']
+        new_fav = c2.toggle("⭐", value=is_fav, key=f"f_{r['コード']}_{unique_key}", label_visibility="collapsed")
+        
+        if new_fav != is_fav:
+            st.session_state.result_df.at[index_num, 'お気に入り'] = new_fav
+            # st.rerun() などは不要（このフラグメントだけが裏で自動更新されます）
+            
+        i1, i2 = st.columns([1, 2])
+        
+        if r['チャート']:
+            try:
+                _raw = r['チャート']
+                if isinstance(_raw, str) and len(_raw) > 10:
+                    chart_df = pd.read_json(io.StringIO(_raw))
+                    chart_df['date'] = pd.to_datetime(chart_df['date'])
+                    chart_df = chart_df.sort_values('date').reset_index(drop=True)
+                    _sma_fast = chart_df.set_index('date')['sma50'] if 'sma50' in chart_df.columns else None
+                    _sma_slow = chart_df.set_index('date')['sma200'] if 'sma200' in chart_df.columns else None
+                    _lwc_key = f"sc_frag_{r['コード']}_{unique_key}"
+                    with i1:
+                        render_lwc_candle_mini(
+                            chart_df,
+                            sma_fast=_sma_fast,
+                            sma_slow=_sma_slow,
+                            key=_lwc_key,
+                            height=180,
+                        )
+            except Exception as _e:
+                i1.caption(f"⚠️ {_e}")
+                
+        # メトリクスの表示
+        m1 = i2.columns(3)
+        m1[0].metric("現在値", f"¥{r['現在値']:,.1f}")
+        m1[1].metric("消灯目安", f"¥{r['消灯目安(安値)']:,.1f}")
+        m1[2].metric("200日乖離", f"{r['乖離率(%)']}%")
+        
+        m2 = i2.columns(4)
+        m2[0].metric("WVF", r['WVF'])
+        m2[1].metric("Upper", r['WVF Upper'])
+        m2[2].metric("傾き", f"{r['200MA傾き率']:.5f}")
+        m2[3].metric("日", r['シグナル日'])
+
 # スクリーニング銘柄カード群の描画
 if not st.session_state.result_df.empty:
     rdf = st.session_state.result_df
@@ -80,49 +134,8 @@ if not st.session_state.result_df.empty:
             if i + j < len(rdf):
                 r = rdf.iloc[i + j]
                 with cols[j]:
-                    with st.container(border=True):
-                        c1, c2 = st.columns([0.85, 0.15])
-                        c1.subheader(f"[{r['コード']}](https://jp.tradingview.com/chart/?symbol=TSE%3A{r['コード']}) {r['銘柄']}")
-                        
-                        # お気に入りトグルスイッチ
-                        if c2.toggle("⭐", value=r['お気に入り'], key=f"f_{r['コード']}_{i+j}", label_visibility="collapsed") != r['お気に入り']:
-                            st.session_state.result_df.at[i + j, 'お気に入り'] = not r['お気に入り']
-                            
-                        i1, i2 = st.columns([1, 2])
-                        
-                        # 銘柄に添付された簡易ローソク足情報をLWCで復元・描画
-                        if r['チャート']:
-                            try:
-                                _raw = r['チャート']
-                                if isinstance(_raw, str) and len(_raw) > 10:
-                                    chart_df = pd.read_json(io.StringIO(_raw))
-                                    chart_df['date'] = pd.to_datetime(chart_df['date'])
-                                    chart_df = chart_df.sort_values('date').reset_index(drop=True)
-                                    _sma_fast = chart_df.set_index('date')['sma50'] if 'sma50' in chart_df.columns else None
-                                    _sma_slow = chart_df.set_index('date')['sma200'] if 'sma200' in chart_df.columns else None
-                                    _lwc_key = f"sc_{r['コード']}_{i}_{j}"
-                                    with i1:
-                                        render_lwc_candle_mini(
-                                            chart_df,
-                                            sma_fast=_sma_fast,
-                                            sma_slow=_sma_slow,
-                                            key=_lwc_key,
-                                            height=180,
-                                        )
-                            except Exception as _e:
-                                i1.caption(f"⚠️ {_e}")
-                                
-                        # 指標メトリクスの展開表示
-                        m1 = i2.columns(3)
-                        m1[0].metric("現在値", f"¥{r['現在値']:,.1f}")
-                        m1[1].metric("消灯目安", f"¥{r['消灯目安(安値)']:,.1f}")
-                        m1[2].metric("200日乖離", f"{r['乖離率(%)']}%")
-                        
-                        m2 = i2.columns(4)
-                        m2[0].metric("WVF", r['WVF'])
-                        m2[1].metric("Upper", r['WVF Upper'])
-                        m2[2].metric("傾き", f"{r['200MA傾き率']:.5f}")
-                        m2[3].metric("日", r['シグナル日'])
+                    # フラグメント関数の呼び出し
+                    render_screened_stock_card(r, index_num=i+j, unique_key=f"{i}_{j}")
 else:
     if st.session_state.performed_scan:
         st.warning("条件に一致する銘柄は見つかりませんでした。")

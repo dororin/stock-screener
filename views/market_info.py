@@ -252,8 +252,9 @@ def update_and_load_saitei_data() -> pd.DataFrame:
         pass
     return merged_df
 
+
 # =====================================================================
-# 📈 画面描画制御部
+# 📈 画面描画制御部 (フラグメント設計)
 # =====================================================================
 
 # セッション状態の初期化
@@ -267,6 +268,7 @@ if 'naaim_df' not in st.session_state:
 # タイトルヘッダー
 st.title("📈 マーケット情報")
 
+# 指数最新化ボタン（これはセッションデータを全体更新するため非フラグメントとします）
 if st.button("マーケット指数データを最新化", type="primary"):
     with st.spinner("外部サイトから指数情報を収集しています..."):
         df_s = update_and_load_saitei_data()
@@ -279,84 +281,115 @@ if st.button("マーケット指数データを最新化", type="primary"):
         if not df_n.empty:
             st.session_state.naaim_df = df_n
         st.success("指数データの取得が完了しました。")
+        st.rerun()  # データ更新後にアプリ全体を再ロードして各フラグメントに反映させる
 
 st.write("---")
 
-col1, col2 = st.columns([2, 3])
-with col1:
-    st.subheader("📊 分析ダッシュボード")
-with col2:
-    period = st.radio(
-        "表示期間の変更:", 
-        ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "3年", "全"], 
-        index=3, 
-        horizontal=True, 
-        label_visibility="collapsed"
-    )
-    
-end_dt = st.session_state.saitei_df['Date'].max() if not st.session_state.saitei_df.empty else pd.Timestamp.now()
-if period == "1ヶ月":
-    start_dt = end_dt - pd.DateOffset(months=1)
-elif period == "3ヶ月":
-    start_dt = end_dt - pd.DateOffset(months=3)
-elif period == "6ヶ月":
-    start_dt = end_dt - pd.DateOffset(months=6)
-elif period == "1年":
-    start_dt = end_dt - pd.DateOffset(years=1)
-elif period == "3年":
-    start_dt = end_dt - pd.DateOffset(years=3)
-else:
-    start_dt = st.session_state.saitei_df['Date'].min() if not st.session_state.saitei_df.empty else end_dt - pd.DateOffset(years=10)
 
-st.write("---")
-
-m_col1, _ = st.columns([1, 1])
-with m_col1:
-    if not st.session_state.naaim_df.empty:
-        latest_naaim = st.session_state.naaim_df.iloc[-1]
-        prev_naaim = st.session_state.naaim_df.iloc[-2] if len(st.session_state.naaim_df) > 1 else latest_naaim
-        delta = round(latest_naaim['NAAIM'] - prev_naaim['NAAIM'], 2)
-        st.metric("最新 NAAIM Exposure Index", f"{latest_naaim['NAAIM']}", delta=f"{delta}")
-        st.caption(f"更新日: {latest_naaim['Date'].strftime('%Y-%m-%d')}")
+# ── 【フラグメント1】全体指数分析ダッシュボード ──
+@st.fragment
+def render_market_dashboard_fragment():
+    """
+    全体指数のダッシュボードを描画するフラグメント。
+    表示期間（period）を変更しても、下部にある個別銘柄の検索・描画処理は巻き込まれません。
+    """
+    col1, col2 = st.columns([2, 3])
+    with col1:
+        st.subheader("📊 分析ダッシュボード")
+    with col2:
+        period = st.radio(
+            "表示期間の変更:", 
+            ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "3年", "全"], 
+            index=3, 
+            horizontal=True, 
+            label_visibility="collapsed",
+            key="market_dashboard_period"  # キーの重複を回避
+        )
         
-# 総合マーケットサブプロットチャートの展開
-if not st.session_state.saitei_df.empty or not st.session_state.sinyou_df.empty or not st.session_state.naaim_df.empty:
-    fig = plot_market_dashboard(st.session_state.saitei_df, st.session_state.sinyou_df, st.session_state.naaim_df)
-    if fig:
-        fig.update_xaxes(range=[start_dt, end_dt + pd.Timedelta(days=7)])
-        if not st.session_state.saitei_df.empty:
-            v = st.session_state.saitei_df[(st.session_state.saitei_df['Date'] >= start_dt) & (st.session_state.saitei_df['Date'] <= end_dt)]
-            if not v.empty:
-                fig.update_yaxes(range=[v['Nikkei225'].min()*0.98, v['Nikkei225'].max()*1.02], row=1, col=1, secondary_y=False)
-        fig.update_yaxes(fixedrange=True)
-        st.plotly_chart(fig, use_container_width=True)
-else:
-    st.info("「マーケット指数データを最新化」ボタンを押して、スプレッドシートおよび最新データをロードしてください。")
+    # 選択した期間に基づく日付フィルターの計算
+    end_dt = st.session_state.saitei_df['Date'].max() if not st.session_state.saitei_df.empty else pd.Timestamp.now()
+    if period == "1ヶ月":
+        start_dt = end_dt - pd.DateOffset(months=1)
+    elif period == "3ヶ月":
+        start_dt = end_dt - pd.DateOffset(months=3)
+    elif period == "6ヶ月":
+        start_dt = end_dt - pd.DateOffset(months=6)
+    elif period == "1年":
+        start_dt = end_dt - pd.DateOffset(years=1)
+    elif period == "3年":
+        start_dt = end_dt - pd.DateOffset(years=3)
+    else:
+        start_dt = st.session_state.saitei_df['Date'].min() if not st.session_state.saitei_df.empty else end_dt - pd.DateOffset(years=10)
+
+    st.write("---")
+
+    m_col1, _ = st.columns([1, 1])
+    with m_col1:
+        if not st.session_state.naaim_df.empty:
+            latest_naaim = st.session_state.naaim_df.iloc[-1]
+            prev_naaim = st.session_state.naaim_df.iloc[-2] if len(st.session_state.naaim_df) > 1 else latest_naaim
+            delta = round(latest_naaim['NAAIM'] - prev_naaim['NAAIM'], 2)
+            st.metric("最新 NAAIM Exposure Index", f"{latest_naaim['NAAIM']}", delta=f"{delta}")
+            st.caption(f"更新日: {latest_naaim['Date'].strftime('%Y-%m-%d')}")
+            
+    # 総合マーケットサブプロットチャートの展開
+    if not st.session_state.saitei_df.empty or not st.session_state.sinyou_df.empty or not st.session_state.naaim_df.empty:
+        fig = plot_market_dashboard(st.session_state.saitei_df, st.session_state.sinyou_df, st.session_state.naaim_df)
+        if fig:
+            fig.update_xaxes(range=[start_dt, end_dt + pd.Timedelta(days=7)])
+            if not st.session_state.saitei_df.empty:
+                v = st.session_state.saitei_df[(st.session_state.saitei_df['Date'] >= start_dt) & (st.session_state.saitei_df['Date'] <= end_dt)]
+                if not v.empty:
+                    fig.update_yaxes(range=[v['Nikkei225'].min()*0.98, v['Nikkei225'].max()*1.02], row=1, col=1, secondary_y=False)
+            fig.update_yaxes(fixedrange=True)
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("「マーケット指数データを最新化」ボタンを押して、スプレッドシートおよび最新データをロードしてください。")
+
+
+# ── 【フラグメント2】個別銘柄の信用残検索 ──
+@st.fragment
+def render_individual_margin_fragment():
+    """
+    個別銘柄の検索窓とチャートを描画するフラグメント。
+    銘柄コードを入力したり、期間を切り替えたりしても、上部にある非常に重い全体ダッシュボードは再描画されません。
+    """
+    st.subheader("🔍 個別銘柄 信用残検索 (IRBank)")
+    c1, c2 = st.columns([1, 4])
+    search_code = c1.text_input("銘柄コード", value="1321", placeholder="例: 1321", key="margin_search_code")
     
+    if search_code:
+        with st.spinner(f"{search_code} の信用残データを取得中..."):
+            idf = fetch_irbank_margin(search_code)
+            if not idf.empty:
+                # フラグメント内のラジオボタンとしてkeyを設定
+                p = st.radio("表示期間の変更:", ["6ヶ月", "1年", "3年", "全"], key="ir_p", horizontal=True)
+                i_end = idf['Date'].max()
+                if p == "6ヶ月":
+                    i_start = i_end - pd.DateOffset(months=6)
+                elif p == "1年":
+                    i_start = i_end - pd.DateOffset(years=1)
+                elif p == "3年":
+                    i_start = i_end - pd.DateOffset(years=3)
+                else:
+                    i_start = idf['Date'].min()
+                    
+                vdf = idf[idf['Date'] >= i_start]
+                if not vdf.empty:
+                    ifig = plot_individual_margin(vdf, search_code)
+                    st.plotly_chart(ifig, use_container_width=True)
+            else:
+                st.warning("IRBankからデータが見つかりませんでした。日本株のコードを再確認してください。")
+
+
+# =====================================================================
+# 呼び出し実行部
+# =====================================================================
+
+# 1. 全体指数分析ダッシュボードのフラグメントを実行
+render_market_dashboard_fragment()
+
 st.write("---")
 
-# 個別信用残の参照
-st.subheader("🔍 個別銘柄 信用残検索 (IRBank)")
-c1, c2 = st.columns([1, 4])
-search_code = c1.text_input("銘柄コード", value="1321", placeholder="例: 1321")
-if search_code:
-    with st.spinner(f"{search_code} の信用残データを取得中..."):
-        idf = fetch_irbank_margin(search_code)
-        if not idf.empty:
-            p = st.radio("表示期間の変更:", ["6ヶ月", "1年", "3年", "全"], key="ir_p", horizontal=True)
-            i_end = idf['Date'].max()
-            if p == "6ヶ月":
-                i_start = i_end - pd.DateOffset(months=6)
-            elif p == "1年":
-                i_start = i_end - pd.DateOffset(years=1)
-            elif p == "3年":
-                i_start = i_end - pd.DateOffset(years=3)
-            else:
-                i_start = idf['Date'].min()
-                
-            vdf = idf[idf['Date'] >= i_start]
-            if not vdf.empty:
-                ifig = plot_individual_margin(vdf, search_code)
-                st.plotly_chart(ifig, use_container_width=True)
-        else:
-            st.warning("IRBankからデータが見つかりませんでした。日本株のコードを再確認してください。")
+# 2. 個別信用残検索のフラグメントを実行
+render_individual_margin_fragment()
