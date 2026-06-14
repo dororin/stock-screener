@@ -384,31 +384,29 @@ with st.expander("🔍 異常データスキャン（修復対象の特定）", 
 
 st.write(" ")
 
-# 入力フィールドのレイアウト (銘柄、崖日付、倍率を並べて配置)
-rep_col1, rep_col2, rep_col3, rep_col4 = st.columns([2, 2, 2, 1])
-with rep_col1:
-    rep_ticker = st.text_input("銘柄コード", placeholder="例: 1629 や AAPL", key="rep_ticker_box")
-with rep_col2:
-    rep_date = st.text_input("崖日付 (YYYY-MM-DD)", placeholder="例: 2024-07-15", key="rep_date_box", help="手動補正基準日。空欄なら自動調整モードになります。")
-with rep_col3:
-    rep_ratio_str = st.text_input("補正/分割比率", placeholder="例: 0.002 や 10.0", key="rep_ratio_box")
-with rep_col4:
-    st.write(" ")
-    st.write(" ")
-    btn_repair = st.button("🔧 実行", use_container_width=True, type="primary")
+# UI入力欄
+rep_ticker = st.text_input("安全一括修復を実行する銘柄コードを入力してください", placeholder="例: 1306 や AAPL", key="rep_ticker_box")
+rep_date_str = st.text_input("修正開始日/崖日付 (空欄なら自動検知)", placeholder="例: 2026-03-30", key="rep_date_box")
+rep_ratio_str = st.text_input("手動修正比率 multiplier (空欄なら自動検知)", placeholder="例: 0.1 や 3.25e-8", key="rep_ratio_box")
 
-if btn_repair:
+rep_col3_btn = st.button("🔧 安全一括修復を実行")
+
+if rep_col3_btn:
     if not rep_ticker:
         st.error("銘柄コードが入力されていません。")
+    # ─── 修正箇所: 「日付」と「倍率」の両方が空白の場合は動作させない安全ガード ───
+    elif not rep_date_str.strip() and not rep_ratio_str.strip():
+        st.error("❌ 誤動作防止のため、「修正開始日」と「手動修正比率」が【どちらも空白】の場合は修復処理を実行できません。どちらか片方、または両方を入力してください。")
+    # ────────────────────────────────────────────────────────────────────────
     else:
         pure_t = sanitize_ticker(rep_ticker, is_jp=is_jp)
         market_str = "JP" if is_jp else "US"
         
         # ── パターンA: 崖日付と比率が明示的に入力された場合（手動ピンポイント一律調整） ──
-        if rep_date.strip() and rep_ratio_str.strip():
+        if rep_date_str.strip() and rep_ratio_str.strip():
             try:
                 multiplier = float(rep_ratio_str.strip())
-                cliff_dt = pd.to_datetime(rep_date.strip())
+                cliff_dt = pd.to_datetime(rep_date_str.strip())
                 cliff_dt_str = cliff_dt.strftime("%Y-%m-%d")
             except Exception as e:
                 st.error(f"崖日付、または補正倍率の形式が不正です: {e}")
@@ -449,7 +447,7 @@ if btn_repair:
                 else:
                     st.warning("⚠️ 修復はParquetに適用されましたが、スプレッドシートへのパッチ永続化に失敗しました。")
         
-        # ── パターンB: 崖日付が空欄の場合（従来通りの自動判定・マージ修復モード） ──
+        # ── パターンB: 日付または比率のいずれかが入力されている場合（自動判定と手動指定マージ修復モード） ──
         else:
             forced_ratio = None
             if rep_ratio_str.strip():
@@ -459,7 +457,7 @@ if btn_repair:
                     st.error("比率は有効な数字で入力してください。")
                     st.stop()
 
-            with st.spinner(f"🔧 [{pure_t}] をスキャンして自動修復マージ中..."):
+            with st.spinner(f"🔧 [{pure_t}] の一括修復を実行中..."):
                 results_legacy = repair_single_ticker_all_timeframes(
                     pure_t,
                     is_jp=is_jp,
@@ -507,11 +505,11 @@ if btn_repair:
                         "executed_at": executed_at,
                         "ticker": pure_t,
                         "market": market_str,
-                        "cliff_date": "",
+                        "cliff_date": rep_date_str.strip() if rep_date_str.strip() else "",
                         "interval": "all",
                         "before_close": "",
                         "after_close": "",
-                        "multiplier": "",
+                        "multiplier": forced_ratio if forced_ratio else "",
                         "memo": "通常マージ自動修復のみ（自動調整）",
                     }])
                 st.success("✅ 自動判定による修復処理およびログ保存が完了しました。")

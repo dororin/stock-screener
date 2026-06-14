@@ -79,7 +79,7 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
         split_ratio = 1.0
         
         if forced_split_ratio is not None and forced_split_ratio > 0:
-            split_ratio = 1.0 / forced_split_ratio
+            split_ratio = forced_split_ratio  # 逆数（1.0/ratio）にするのをやめ、入力値をそのまま倍率に
             has_split = True
             
             if len(t_new) > 1:
@@ -89,13 +89,14 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
                     anomaly_idx = anomaly_mask.idxmax()
                     split_date = t_new.loc[anomaly_idx, "date"]
                     pre_mask = t_new["date"] < split_date
-                    # price_cols に "adj close" を追加
-                    price_cols = ["open", "high", "low", "close", "adj close"]
+                    price_cols = ["open", "high", "low", "close"]
                     for col in price_cols:
                         if col in t_new.columns:
-                            t_new.loc[pre_mask, col] = t_new.loc[pre_mask, col] / forced_split_ratio
+                            # 割り算（/）を掛け算（*）に変更（0.1と入力されたらそのまま0.1が掛けられます）
+                            t_new.loc[pre_mask, col] = t_new.loc[pre_mask, col] * forced_split_ratio
                     if "volume" in t_new.columns:
-                        t_new.loc[pre_mask, "volume"] = t_new.loc[pre_mask, "volume"] * forced_split_ratio
+                        # 出来高は逆数（割り算）にする
+                        t_new.loc[pre_mask, "volume"] = t_new.loc[pre_mask, "volume"] / forced_split_ratio
         else:
             if len(t_new) > 1:
                 pct_changes = t_new["close"].pct_change()
