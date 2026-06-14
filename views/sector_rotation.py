@@ -264,36 +264,59 @@ if is_jp:
 
         all_etf_codes = list(settings.TOPIX17_NAMES.keys())
 
-        # 1. 表示・非表示トグル制御用の状態のみセッションに仕込む
+        # トグル制御用の状態をセッションに仕込む
         for _code in all_etf_codes:
             if f"etf_visible_{_code}" not in st.session_state:
                 st.session_state[f"etf_visible_{_code}"] = True
 
-        ETF_GRID_COLS = n_cols
+        # ─── ★CSS注入: ポップオーバーの表示領域を縦横マウス可変・レスポンシブ化 ───
+        st.markdown(
+            """
+            <style>
+            /* デフォルト（PC・大画面タブレット用） */
+            div[data-testid="stPopoverBody"] {
+                resize: both !important;      /* マウスドラッグでのリサイズを有効化 */
+                overflow: auto !important;     /* resize機能に必須の設定 */
+                
+                width: 85vw !important;        /* 初期表示幅：画面幅の85% */
+                min-width: 850px !important;   /* 最小幅（目盛りのつぶれを防止） */
+                max-width: 1400px !important;  /* 最大幅制限 */
+                
+                height: 500px !important;      /* 初期表示高 */
+                min-height: 400px !important;  /* 最小高 */
+                padding: 20px !important;
+            }
 
-        rows_17 = [
-            all_etf_codes[i:i + ETF_GRID_COLS]
-            for i in range(0, len(all_etf_codes), ETF_GRID_COLS)
-        ]
+            /* スマホ用（画面幅が 768px 以下の時） */
+            @media (max-width: 768px) {
+                div[data-testid="stPopoverBody"] {
+                    resize: none !important;     /* スマホはドラッグをオフにする */
+                    width: 90vw !important;
+                    min-width: 280px !important;
+                    max-width: 95vw !important;
+                    height: auto !important;
+                    padding: 10px !important;
+                }
+            }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
 
-        # 2. 表示状態を安全に切り替えるコールバック関数を定義
+        # 表示切り替え時のコールバック関数（st.rerun不要で安全に書き換えるため）
         def toggle_etf_visibility(code):
             st.session_state[f"etf_visible_{code}"] = not st.session_state[f"etf_visible_{code}"]
 
-        # 3. 各カードの操作を独立させて軽量化するためのフラグメント定義
+        # 個別のETFカードと構成銘柄ポップオーバーをフラグメント（部分更新）化
         @st.fragment
         def render_etf_card_fragment(code, name):
-            """
-            ETFカード1枚をフラグメント化。
-            ボタンクリックでコールバック関数が先に走り、自動でこのカードだけが再描画されます。
-            """
             visible = st.session_state[f"etf_visible_{code}"]
             
             with st.container(border=True):
                 hc1, hc2 = st.columns([5, 1])
                 vis_label = "表示" if not visible else "非表示"
                 
-                # on_click コールバックを仕込むことで st.rerun を一切使わずに部分描画を更新します
+                # コールバック指定で部分更新。st.rerunエラーを回避します
                 hc2.button(
                     vis_label, 
                     key=f"vis_{code}", 
@@ -340,19 +363,19 @@ if is_jp:
                         sectors_loaded = load_sector_master_from_sheets(True)
                         constituent_codes = sectors_loaded.get(jp_sector_name, []) if jp_sector_name else []
 
-                    # ─── ポップオーバーによる構成銘柄展開 ───
+                    # ─── ポップオーバーによる構成銘柄展開 (CSSで幅広・可変化したため5列並びで表示) ───
                     if constituent_codes:
                         with st.popover(f"🔍 構成{len(constituent_codes)}銘柄の一覧", use_container_width=True):
                             st.markdown(
                                 f"<div style='border-left: 3px solid #42a5f5; padding-left: 10px; "
-                                f"margin: 4px 0 12px; font-size:0.9rem; font-weight:600; color:#42a5f5;'>"
-                                f"↳ {code} {name} の構成銘柄一覧</div>",
+                                f"margin: 4px 0 12px; font-size:0.95rem; font-weight:600; color:#42a5f5;'>"
+                                f"↳ {code} {name} の構成銘柄一覧（マウスで右下を引き伸ばせます）</div>",
                                 unsafe_allow_html=True
                             )
 
-                            p_cols = st.columns(3)
+                            p_cols = st.columns(5) # 広大になったため5列構成に復元
                             for s_idx, stock_code in enumerate(constituent_codes):
-                                col_to_use = p_cols[s_idx % 3]
+                                col_to_use = p_cols[s_idx % 5]
                                 with col_to_use:
                                     try:
                                         s_abs, s_sma75, s_sma200, s_wvf, s_vol = compute_sector_absolute_data(
@@ -390,13 +413,19 @@ if is_jp:
                         unsafe_allow_html=True
                     )
 
-        # 4. グリッド展開処理の実行
-        # (関数の外側で columns の with を適用し、その中でフラグメントを実行。これで要素の増殖を完璧に防ぎます)
+        CHILD_COLS = 5
+        ETF_GRID_COLS = n_cols
+
+        rows_17 = [
+            all_etf_codes[i:i + ETF_GRID_COLS]
+            for i in range(0, len(all_etf_codes), ETF_GRID_COLS)
+        ]
+
+        # columnsコンテキストの内側で安全にフラグメントを呼ぶことで、再描画時の要素増殖エラーを防止
         for row_codes in rows_17:
             row_cols = st.columns(ETF_GRID_COLS)
             for ci, code in enumerate(row_codes):
                 name = settings.TOPIX17_NAMES.get(code, code)
-                # 親列のコンテキストに入り、その中でフラグメント関数を叩きます
                 with row_cols[ci]:
                     render_etf_card_fragment(code, name)
 
