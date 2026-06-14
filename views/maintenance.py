@@ -342,24 +342,45 @@ with st.expander("🔍 異常データスキャン（修復対象の特定）", 
             display_df = anomalies.copy()
             if "cliff_date" in display_df.columns:
                 display_df["cliff_date"] = pd.to_datetime(display_df["cliff_date"]).dt.strftime("%Y-%m-%d")
+            
+            # パーセンテージ表示に変換
             if "pct_change" in display_df.columns:
                 display_df["pct_change"] = display_df["pct_change"].apply(
                     lambda x: f"{x*100:.1f}%" if pd.notna(x) else "－"
                 )
-                
-            # カラム名を日本語にマッピング
+            
+            # 推測比率のフォーマット
+            if "est_multiplier" in display_df.columns:
+                display_df["est_multiplier"] = display_df["est_multiplier"].apply(
+                    lambda x: f"{x:.8f}".rstrip('0').rstrip('.') if pd.notna(x) else "－"
+                )
+
+            # 新カラム名マッピングにリネームして表示
             rename_map = {
                 "ticker": "銘柄",
                 "cliff_date": "崖日付",
-                "before_close": "修正前 Close",
-                "after_close": "修正後 Close",
-                "before_adj_close": "修正前 Adj Close",
-                "after_adj_close": "修正後 Adj Close",
+                "anomaly_type": "不具合種類",
+                "est_multiplier": "推測修正比率 (当日÷1日前)",
                 "pct_change": "変化率",
-                "anomaly_type": "不具合種類"
+                "before_close": "1日前 Close",
+                "after_close": "Close",
+                "before_adj_close": "1日前 Adj Close",
+                "after_adj_close": "Adj Close",
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "volume": "Volume"
             }
-            display_df = display_df.rename(columns={k: v for k, v in rename_map.items() if k in display_df.columns})
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            display_df = display_df.rename(columns=rename_map)
+            
+            # 整然としたカラム順を定義
+            col_order = [
+                "銘柄", "崖日付", "不具合種類", "推測修正比率 (当日÷1日前)", "変化率", 
+                "1日前 Close", "Close", "1日前 Adj Close", "Adj Close", 
+                "Open", "High", "Low", "Volume"
+            ]
+            valid_cols = [c for c in col_order if c in display_df.columns]
+            st.dataframe(display_df[valid_cols], use_container_width=True, hide_index=True)
 
 st.write(" ")
 
@@ -495,7 +516,66 @@ if btn_repair:
                     }])
                 st.success("✅ 自動判定による修復処理およびログ保存が完了しました。")
 
+st.write(" ")
 st.divider()
+
+# ── 【新規追加】指定日以前データ部分削除パッチUI ──
+st.markdown("#### 🗑️ 指定日以前データ一括物理削除パッチ")
+st.write(
+    "SBI新生銀行（8303）などの再上場銘柄において、過去の上場廃止前の不要な歴史データや"
+    "取引のない数年間の空白期間を、1d〜1mすべての時間足のDBから完全に物理削除します。"
+)
+
+del_col1, del_col2, del_col3 = st.columns([3, 2, 1])
+with del_col1:
+    del_ticker = st.text_input("データ削除を実行する銘柄コード", placeholder="例: 8303 や 1306", key="del_ticker_box")
+with del_col2:
+    del_date_str = st.text_input("削除の境界となる日付 (この日以前をすべて消去)", placeholder="例: 2025-12-16", key="del_date_box")
+with del_col3:
+    st.write(" ")
+    st.write(" ")
+    btn_delete_before = st.button("🗑️ 指定日以前を物理削除", use_container_width=True, type="primary")
+
+if btn_delete_before:
+    if not del_ticker:
+        st.error("銘柄コードが入力されていません。")
+    elif not del_date_str:
+        st.error("削除の境界となる基準日付が入力されていません。")
+    else:
+        try:
+            # 入力日付のフォーマット簡易バリデーション
+            pd.to_datetime(del_date_str)
+        except ValueError:
+            st.error("日付は有効な形式（例: YYYY-MM-DD）で入力してください。")
+            st.stop()
+            
+        pure_t = sanitize_ticker(del_ticker, is_jp=is_jp)
+        with st.spinner(f"🗑️ [{pure_t}] の {del_date_str} 以前のデータを全時間足から物理削除中..."):
+            from core.database_service import delete_data_before_date
+            del_results = delete_data_before_date(pure_t, del_date_str, is_jp=is_jp)
+            
+            st.write("### 📋 削除完了レポート:")
+            for interval, msg in del_results.items():
+                icon = "✅" if "正常に" in msg else "ℹ️" if "なし" in msg else "⚠️"
+                st.write(f"{icon} **{interval}**: {msg}")
+            
+            # 修復ログへ記録を保存
+            from datetime import datetime
+            from data_access.sheets_api import save_repair_log_to_sheets
+            executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            market_str = "JP" if is_jp else "US"
+            save_repair_log_to_sheets([{
+                "executed_at": executed_at,
+                "ticker": pure_t,
+                "market": market_str,
+                "cliff_date": del_date_str,
+                "interval": "all_timeframes",
+                "before_close": "",
+                "after_close": "",
+                "multiplier": "",
+                "memo": f"手動削除パッチ実行（指定日以前の全消去）",
+            }])
+            st.success("✅ 削除処理とログの保存が正常に完了しました。")
 
 with st.expander("📋 修復ログ一覧", expanded=False):
     st.caption("スプレッドシートに保存された過去の修復履歴を表示します。")

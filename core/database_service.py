@@ -640,7 +640,7 @@ def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
 # core/database_service.py より修正 (1/2)
 
 def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: float = 0.35) -> pd.DataFrame:
-    """全銘柄を対象に、ベクトル演算により瞬間的に異常価格（崖・負の値）を探索しリスト化します。"""
+    """全銘柄を対象に、異常価格（崖・負の値）をスキャンし、推測比率や1日前/当日の四本値を含めてリスト化します。"""
     try:
         db_df = load_price_db(interval, is_jp=is_jp)
     except FileNotFoundError:
@@ -649,70 +649,66 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
         return pd.DataFrame()
 
     db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
+    has_adj = "adj close" in db_df.columns
     result_rows = []
 
-    # チェック対象の列を決定
-    cols_to_check = ["close"]
-    has_adj = "adj close" in db_df.columns
-    if has_adj:
-        cols_to_check.append("adj close")
+    # 負の株価チェック
+    negative_mask = db_df["close"] < 0
+    shifted_neg_mask_for_pos = db_df.groupby("ticker")["close"].apply(lambda x: (x < 0).shift(1, fill_value=True)).reset_index(level=0, drop=True)
+    pos_to_neg = negative_mask & (~shifted_neg_mask_for_pos)
+    shifted_neg_mask_for_neg = db_df.groupby("ticker")["close"].apply(lambda x: (x < 0).shift(1, fill_value=False)).reset_index(level=0, drop=True)
+    neg_to_pos = (~negative_mask) & shifted_neg_mask_for_neg
+    boundary_mask = pos_to_neg | neg_to_pos
+    
+    if boundary_mask.any():
+        boundary_rows = db_df[boundary_mask].copy()
+        boundary_rows["before_close"] = db_df.groupby("ticker")["close"].shift(1)[boundary_mask].values
+        boundary_rows["after_close"] = boundary_rows["close"]
+        if has_adj:
+            boundary_rows["before_adj_close"] = db_df.groupby("ticker")["adj close"].shift(1)[boundary_mask].values
+            boundary_rows["after_adj_close"] = boundary_rows["adj close"]
+        else:
+            boundary_rows["before_adj_close"] = float("nan")
+            boundary_rows["after_adj_close"] = float("nan")
 
-    for p_col in cols_to_check:
-        col_label = " (Adj Close)" if p_col == "adj close" else ""
+        boundary_rows["pct_change"] = float("nan")
+        boundary_rows["anomaly_type"] = "負の株価（境界）"
         
-        # 1. 負の数チェック
-        negative_mask = db_df[p_col] < 0
-        shifted_neg_mask_for_pos = db_df.groupby("ticker")[p_col].apply(lambda x: (x < 0).shift(1, fill_value=True)).reset_index(level=0, drop=True)
-        pos_to_neg = negative_mask & (~shifted_neg_mask_for_pos)
-        shifted_neg_mask_for_neg = db_df.groupby("ticker")[p_col].apply(lambda x: (x < 0).shift(1, fill_value=False)).reset_index(level=0, drop=True)
-        neg_to_pos = (~negative_mask) & shifted_neg_mask_for_neg
-        boundary_mask = pos_to_neg | neg_to_pos
+        # 必要なカラムをあらかじめ確保
+        for col in ["open", "high", "low", "volume"]:
+            if col not in boundary_rows.columns:
+                boundary_rows[col] = float("nan")
+                
+        result_rows.append(boundary_rows[["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "open", "high", "low", "volume", "pct_change", "anomaly_type"]])
+
+    # 崖（急変）チェック
+    abs_close = db_df["close"].abs()
+    pct = abs_close.groupby(db_df["ticker"]).pct_change()
+    cliff_mask = pct.abs() >= threshold
+
+    if cliff_mask.any():
+        cliff_rows = db_df[cliff_mask].copy()
+        cliff_rows["before_close"] = db_df.groupby("ticker")["close"].shift(1)[cliff_mask].values
+        cliff_rows["after_close"] = cliff_rows["close"]
+        if has_adj:
+            cliff_rows["before_adj_close"] = db_df.groupby("ticker")["adj close"].shift(1)[cliff_mask].values
+            cliff_rows["after_adj_close"] = cliff_rows["adj close"]
+        else:
+            cliff_rows["before_adj_close"] = float("nan")
+            cliff_rows["after_adj_close"] = float("nan")
+
+        cliff_rows["pct_change"] = pct[cliff_mask].values
+        cliff_rows["anomaly_type"] = "急変（" + (pct[cliff_mask] * 100).round(1).astype(str) + "%）"
         
-        if boundary_mask.any():
-            boundary_rows = db_df[boundary_mask].copy()
-            # 常に Close と Adj Close 両方の前後データを並べて取得
-            boundary_rows["before_close"] = db_df.groupby("ticker")["close"].shift(1)[boundary_mask].values
-            boundary_rows["after_close"] = boundary_rows["close"]
-            
-            if has_adj:
-                boundary_rows["before_adj_close"] = db_df.groupby("ticker")["adj close"].shift(1)[boundary_mask].values
-                boundary_rows["after_adj_close"] = boundary_rows["adj close"]
-            else:
-                boundary_rows["before_adj_close"] = float("nan")
-                boundary_rows["after_adj_close"] = float("nan")
-
-            boundary_rows["pct_change"] = float("nan")
-            boundary_rows["anomaly_type"] = f"負の株価（切り替え境界）{col_label}"
-            
-            sel_cols = ["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "pct_change", "anomaly_type"]
-            result_rows.append(boundary_rows[sel_cols])
-
-        # 2. 崖（急変）チェック
-        abs_close = db_df[p_col].abs()
-        pct = abs_close.groupby(db_df["ticker"]).pct_change()
-        cliff_mask = pct.abs() >= threshold
-
-        if cliff_mask.any():
-            cliff_rows = db_df[cliff_mask].copy()
-            # 常に Close と Adj Close 両方の前後データを並べて取得
-            cliff_rows["before_close"] = db_df.groupby("ticker")["close"].shift(1)[cliff_mask].values
-            cliff_rows["after_close"] = cliff_rows["close"]
-            
-            if has_adj:
-                cliff_rows["before_adj_close"] = db_df.groupby("ticker")["adj close"].shift(1)[cliff_mask].values
-                cliff_rows["after_adj_close"] = cliff_rows["adj close"]
-            else:
-                cliff_rows["before_adj_close"] = float("nan")
-                cliff_rows["after_adj_close"] = float("nan")
-
-            cliff_rows["pct_change"] = pct[cliff_mask].values
-            cliff_rows["anomaly_type"] = f"急変{col_label}（" + (pct[cliff_mask] * 100).round(1).astype(str) + "%）"
-            
-            sel_cols = ["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "pct_change", "anomaly_type"]
-            result_rows.append(cliff_rows[sel_cols])
+        for col in ["open", "high", "low", "volume"]:
+            if col not in cliff_rows.columns:
+                cliff_rows[col] = float("nan")
+                
+        result_rows.append(cliff_rows[["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "open", "high", "low", "volume", "pct_change", "anomaly_type"]])
 
     if not result_rows:
         return pd.DataFrame()
+        
     result = pd.concat(result_rows, ignore_index=True).rename(columns={"date": "cliff_date"})
     
     def aggregate_anomalies(group):
@@ -720,17 +716,31 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
         pct_vals = group["pct_change"].dropna()
         pct_val = pct_vals.iloc[0] if not pct_vals.empty else float("nan")
         
-        # 集約時も Close / Adj Close の両方の代表値を取得
         before_close_val = group["before_close"].dropna().iloc[0] if not group["before_close"].dropna().empty else float("nan")
         after_close_val = group["after_close"].dropna().iloc[0] if not group["after_close"].dropna().empty else float("nan")
         before_adj_val = group["before_adj_close"].dropna().iloc[0] if not group["before_adj_close"].dropna().empty else float("nan")
         after_adj_val = group["after_adj_close"].dropna().iloc[0] if not group["after_adj_close"].dropna().empty else float("nan")
         
+        open_val = group["open"].dropna().iloc[0] if not group["open"].dropna().empty else float("nan")
+        high_val = group["high"].dropna().iloc[0] if not group["high"].dropna().empty else float("nan")
+        low_val = group["low"].dropna().iloc[0] if not group["low"].dropna().empty else float("nan")
+        vol_val = group["volume"].dropna().iloc[0] if not group["volume"].dropna().empty else float("nan")
+        
+        # 修正倍率の自動推測（当日Close / 1日前Close）
+        est_multiplier = float("nan")
+        if before_close_val != 0 and pd.notna(before_close_val) and pd.notna(after_close_val):
+            est_multiplier = after_close_val / before_close_val
+            
         return pd.Series({
             "before_close": before_close_val, 
             "after_close": after_close_val, 
             "before_adj_close": before_adj_val, 
             "after_adj_close": after_adj_val, 
+            "open": open_val,
+            "high": high_val,
+            "low": low_val,
+            "volume": vol_val,
+            "est_multiplier": est_multiplier,
             "pct_change": pct_val, 
             "anomaly_type": types
         })
@@ -1070,3 +1080,38 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
             
     log(f"🎉 [パッチ一括再適用] 処理完了。成功: {success_count} / {len(valid_patches)} 件")
     return success_count
+
+
+def delete_data_before_date(ticker: str, limit_date_str: str, is_jp: bool = True) -> dict:
+    """指定された特定銘柄において、指定日以前（含む）のデータを1d〜1mすべての時間足から完全に物理削除します。"""
+    pure_ticker = sanitize_ticker(ticker, is_jp)
+    limit_dt = pd.to_datetime(limit_date_str)
+    results = {}
+
+    for interval in ["1d", "60m", "5m", "1m"]:
+        try:
+            db_df = load_price_db(interval, is_jp=is_jp)
+            if db_df.empty:
+                results[interval] = "DB空"
+                continue
+            
+            # 対象銘柄でかつ指定日以前（同日含む）の行を特定して除外
+            db_df["temp_date"] = pd.to_datetime(db_df["date"])
+            
+            mask_to_delete = (db_df["ticker"] == pure_ticker) & (db_df["temp_date"] <= limit_dt)
+            deleted_count = mask_to_delete.sum()
+            
+            if deleted_count > 0:
+                db_df = db_df[~mask_to_delete].copy()
+                db_df = db_df.drop(columns=["temp_date"])
+                db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
+                save_price_db(db_df, interval, is_jp=is_jp)
+                results[interval] = f"正常に {deleted_count:,} 件削除"
+            else:
+                results[interval] = "該当データなし"
+        except FileNotFoundError:
+            results[interval] = "DBファイルなし"
+        except Exception as e:
+            results[interval] = f"エラー: {str(e)}"
+            
+    return results
