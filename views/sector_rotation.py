@@ -264,7 +264,7 @@ if is_jp:
 
         all_etf_codes = list(settings.TOPIX17_NAMES.keys())
 
-        # 表示・非表示トグル制御用の状態のみセッションに仕込む（展開状態用のステートは不要になったため削除）
+        # 1. 表示・非表示トグル制御用の状態のみセッションに仕込む
         for _code in all_etf_codes:
             if f"etf_visible_{_code}" not in st.session_state:
                 st.session_state[f"etf_visible_{_code}"] = True
@@ -276,121 +276,129 @@ if is_jp:
             for i in range(0, len(all_etf_codes), ETF_GRID_COLS)
         ]
 
-        # 各カードの操作を独立させて軽量化するためのフラグメント定義
+        # 2. 表示状態を安全に切り替えるコールバック関数を定義
+        def toggle_etf_visibility(code):
+            st.session_state[f"etf_visible_{code}"] = not st.session_state[f"etf_visible_{code}"]
+
+        # 3. 各カードの操作を独立させて軽量化するためのフラグメント定義
         @st.fragment
-        def render_etf_card_fragment(code, name, row_col_ctx):
+        def render_etf_card_fragment(code, name):
             """
-            ETFカード1枚をフラグメント化し、ポップオーバー開閉時などの
-            再描画負荷を完全にこのカード内だけに閉じ込めます。
+            ETFカード1枚をフラグメント化。
+            ボタンクリックでコールバック関数が先に走り、自動でこのカードだけが再描画されます。
             """
             visible = st.session_state[f"etf_visible_{code}"]
             
-            with row_col_ctx:
-                with st.container(border=True):
-                    hc1, hc2 = st.columns([5, 1])
-                    vis_label = "表示" if not visible else "非表示"
-                    
-                    if hc2.button(vis_label, key=f"vis_{code}", use_container_width=True):
-                        st.session_state[f"etf_visible_{code}"] = not visible
-                        st.rerun(scope="fragment")
+            with st.container(border=True):
+                hc1, hc2 = st.columns([5, 1])
+                vis_label = "表示" if not visible else "非表示"
+                
+                # on_click コールバックを仕込むことで st.rerun を一切使わずに部分描画を更新します
+                hc2.button(
+                    vis_label, 
+                    key=f"vis_{code}", 
+                    use_container_width=True, 
+                    on_click=toggle_etf_visibility, 
+                    args=(code,)
+                )
 
-                    if visible:
-                        try:
-                            etf_abs, etf_sma75, etf_sma200, etf_wvf, etf_vol = compute_sector_absolute_data(
-                                db_df, [code], period_days, resample_weekly
-                            )
-                        except Exception:
-                            etf_abs = pd.Series(dtype=float)
-                            etf_sma75 = etf_sma200 = etf_wvf = etf_vol = pd.Series(dtype=float)
-
-                        etf_mom = get_sector_momentum(
-                            compute_sector_index_from_df(db_df, [code], period_days, resample_weekly),
-                            days=min(5, period_days)
+                if visible:
+                    try:
+                        etf_abs, etf_sma75, etf_sma200, etf_wvf, etf_vol = compute_sector_absolute_data(
+                            db_df, [code], period_days, resample_weekly
                         )
-                        badge_e = "🟢" if etf_mom >= 0 else "🔴"
-                        color_e = "#26a69a" if etf_mom >= 0 else "#ef5350"
+                    except Exception:
+                        etf_abs = pd.Series(dtype=float)
+                        etf_sma75 = etf_sma200 = etf_wvf = etf_vol = pd.Series(dtype=float)
 
-                        hc1.markdown(
-                            f"<span style='font-size:0.9rem; font-weight:600; color:{color_e}'>"
-                            f"{badge_e} {code} {name}</span>"
-                            f"<span style='font-size:0.8rem; color:{color_e}; margin-left:6px;'>{etf_mom:+.2f}%</span>",
-                            unsafe_allow_html=True
+                    etf_mom = get_sector_momentum(
+                        compute_sector_index_from_df(db_df, [code], period_days, resample_weekly),
+                        days=min(5, period_days)
+                    )
+                    badge_e = "🟢" if etf_mom >= 0 else "🔴"
+                    color_e = "#26a69a" if etf_mom >= 0 else "#ef5350"
+
+                    hc1.markdown(
+                        f"<span style='font-size:0.9rem; font-weight:600; color:{color_e}'>"
+                        f"{badge_e} {code} {name}</span>"
+                        f"<span style='font-size:0.8rem; color:{color_e}; margin-left:6px;'>{etf_mom:+.2f}%</span>",
+                        unsafe_allow_html=True
+                    )
+
+                    if not etf_abs.empty:
+                        render_lwc_sector_mini(
+                            etf_abs, sma_fast=etf_sma75, sma_slow=etf_sma200,
+                            wvf_lit=etf_wvf, volume_series=etf_vol,
+                            key=f"etf_abs_mini_{code}", height=150
                         )
-
-                        if not etf_abs.empty:
-                            render_lwc_sector_mini(
-                                etf_abs, sma_fast=etf_sma75, sma_slow=etf_sma200,
-                                wvf_lit=etf_wvf, volume_series=etf_vol,
-                                key=f"etf_abs_mini_{code}", height=150
-                            )
-                        else:
-                            st.caption("データなし")
-
-                        jp_sector_name = TOPIX17_TO_JP_SECTOR.get(code)
-                        constituent_codes = settings.JP_SECTORS.get(jp_sector_name, []) if jp_sector_name else []
-                        if not constituent_codes:
-                            sectors_loaded = load_sector_master_from_sheets(True)
-                            constituent_codes = sectors_loaded.get(jp_sector_name, []) if jp_sector_name else []
-
-                        # ─── ポップオーバーによる構成銘柄展開 ───
-                        if constituent_codes:
-                            # 吹き出しボタンをカード下部に配置（横幅いっぱいに引き伸ばす）
-                            with st.popover(f"🔍 構成{len(constituent_codes)}銘柄の一覧", use_container_width=True):
-                                st.markdown(
-                                    f"<div style='border-left: 3px solid #42a5f5; padding-left: 10px; "
-                                    f"margin: 4px 0 12px; font-size:0.9rem; font-weight:600; color:#42a5f5;'>"
-                                    f"↳ {code} {name} の構成銘柄一覧</div>",
-                                    unsafe_allow_html=True
-                                )
-
-                                # ポップオーバー内部に広々とした「3列レイアウト」を動的に生成
-                                p_cols = st.columns(3)
-                                for s_idx, stock_code in enumerate(constituent_codes):
-                                    col_to_use = p_cols[s_idx % 3]  # 3列に自動で順番に割り振る
-                                    with col_to_use:
-                                        try:
-                                            s_abs, s_sma75, s_sma200, s_wvf, s_vol = compute_sector_absolute_data(
-                                                db_df, [stock_code], period_days, resample_weekly
-                                            )
-                                        except Exception:
-                                            s_abs = pd.Series(dtype=float)
-                                            s_sma75 = s_sma200 = s_wvf = s_vol = pd.Series(dtype=float)
-
-                                        s_mom = get_sector_momentum(
-                                            compute_sector_index_from_df(db_df, [stock_code], period_days, resample_weekly),
-                                            days=min(5, period_days)
-                                        )
-                                        s_badge = "🟢" if s_mom >= 3.0 else "🔴" if s_mom <= -3.0 else "⚪"
-                                        s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
-
-                                        with st.container(border=True):
-                                            st.markdown(
-                                                f"<div style='font-size:0.78rem; font-weight:600; color:{s_color};'>"
-                                                f"{s_badge} {stock_code}</div>"
-                                                f"<div style='font-size:0.75rem; color:#9e9e9e;'>{s_mom:+.2f}%</div>",
-                                                unsafe_allow_html=True
-                                            )
-                                            if not s_abs.empty:
-                                                render_lwc_sector_mini(
-                                                    s_abs, sma_fast=s_sma75, sma_slow=s_sma200,
-                                                    wvf_lit=s_wvf, volume_series=s_vol,
-                                                    key=f"stock_pop_mini_{code}_{stock_code}", height=140
-                                                )
-                                            else:
-                                                st.caption("データなし")
                     else:
-                        hc1.markdown(
-                            f"<span style='font-size:0.85rem; color:#9e9e9e;'>{code} {name}</span>",
-                            unsafe_allow_html=True
-                        )
+                        st.caption("データなし")
 
-        # グリッド展開処理の実行（構成銘柄のドリルダウン展開ループは完全に不要になったため撤廃）
+                    jp_sector_name = TOPIX17_TO_JP_SECTOR.get(code)
+                    constituent_codes = settings.JP_SECTORS.get(jp_sector_name, []) if jp_sector_name else []
+                    if not constituent_codes:
+                        sectors_loaded = load_sector_master_from_sheets(True)
+                        constituent_codes = sectors_loaded.get(jp_sector_name, []) if jp_sector_name else []
+
+                    # ─── ポップオーバーによる構成銘柄展開 ───
+                    if constituent_codes:
+                        with st.popover(f"🔍 構成{len(constituent_codes)}銘柄の一覧", use_container_width=True):
+                            st.markdown(
+                                f"<div style='border-left: 3px solid #42a5f5; padding-left: 10px; "
+                                f"margin: 4px 0 12px; font-size:0.9rem; font-weight:600; color:#42a5f5;'>"
+                                f"↳ {code} {name} の構成銘柄一覧</div>",
+                                unsafe_allow_html=True
+                            )
+
+                            p_cols = st.columns(3)
+                            for s_idx, stock_code in enumerate(constituent_codes):
+                                col_to_use = p_cols[s_idx % 3]
+                                with col_to_use:
+                                    try:
+                                        s_abs, s_sma75, s_sma200, s_wvf, s_vol = compute_sector_absolute_data(
+                                            db_df, [stock_code], period_days, resample_weekly
+                                        )
+                                    except Exception:
+                                        s_abs = pd.Series(dtype=float)
+                                        s_sma75 = s_sma200 = s_wvf = s_vol = pd.Series(dtype=float)
+
+                                    s_mom = get_sector_momentum(
+                                        compute_sector_index_from_df(db_df, [stock_code], period_days, resample_weekly),
+                                        days=min(5, period_days)
+                                    )
+                                    s_badge = "🟢" if s_mom >= 3.0 else "🔴" if s_mom <= -3.0 else "⚪"
+                                    s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
+
+                                    with st.container(border=True):
+                                        st.markdown(
+                                            f"<div style='font-size:0.78rem; font-weight:600; color:{s_color};'>"
+                                            f"{s_badge} {stock_code}</div>"
+                                            f"<div style='font-size:0.75rem; color:#9e9e9e;'>{s_mom:+.2f}%</div>",
+                                            unsafe_allow_html=True
+                                        )
+                                        if not s_abs.empty:
+                                            render_lwc_sector_mini(
+                                                s_abs, sma_fast=s_sma75, sma_slow=s_sma200,
+                                                wvf_lit=s_wvf, volume_series=s_vol,
+                                                key=f"stock_pop_mini_{code}_{stock_code}", height=140
+                                            )
+                                        else:
+                                            st.caption("データなし")
+                else:
+                    hc1.markdown(
+                        f"<span style='font-size:0.85rem; color:#9e9e9e;'>{code} {name}</span>",
+                        unsafe_allow_html=True
+                    )
+
+        # 4. グリッド展開処理の実行
+        # (関数の外側で columns の with を適用し、その中でフラグメントを実行。これで要素の増殖を完璧に防ぎます)
         for row_codes in rows_17:
             row_cols = st.columns(ETF_GRID_COLS)
             for ci, code in enumerate(row_codes):
                 name = settings.TOPIX17_NAMES.get(code, code)
-                # 各カードを独立したフラグメントとしてレンダリング
-                render_etf_card_fragment(code, name, row_cols[ci])
+                # 親列のコンテキストに入り、その中でフラグメント関数を叩きます
+                with row_cols[ci]:
+                    render_etf_card_fragment(code, name)
 
 # =========================================================================
 # 🇺🇸 米国株モード
