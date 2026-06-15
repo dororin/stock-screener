@@ -11,6 +11,44 @@ from core.collector import (
     get_benchmark_latest_date, parse_yfinance_batch
 )
 
+def check_anomaly_need_patch(df_ticker: pd.DataFrame, cliff_date_str: str, multiplier: float, threshold: float = 0.10) -> bool:
+    """
+    指定された崖日付（cliff_date_str）の前後のClose価格を検証し、
+    パッチ適用が必要かどうかを判定する（仕様書の数式に基づく）。
+    """
+    if df_ticker.empty or len(df_ticker) < 2:
+        return False
+        
+    df_t = df_ticker.sort_values("date").reset_index(drop=True)
+    df_t["date_dt"] = pd.to_datetime(df_t["date"])
+    
+    try:
+        target_dt = pd.to_datetime(cliff_date_str)
+    except Exception:
+        return False
+    
+    # 崖日直前のレコード（target_dtより前の最大日付）
+    before_rows = df_t[df_t["date_dt"] < target_dt]
+    # 崖日当日のレコード（target_dt以降の最小日付）
+    after_rows = df_t[df_t["date_dt"] >= target_dt]
+    
+    if before_rows.empty or after_rows.empty:
+        return False
+        
+    p_before = before_rows.iloc[-1]["close"]
+    p_after = after_rows.iloc[0]["close"]
+    
+    if pd.isna(p_before) or pd.isna(p_after) or p_before == 0:
+        return False
+        
+    r_raw = p_after / p_before
+    r_adjusted = p_after / (p_before * multiplier)
+    
+    # 仕様書の判定条件: |R_adjusted - 1.0| <= |R_raw - 1.0| - threshold
+    if abs(r_adjusted - 1.0) <= abs(r_raw - 1.0) - threshold:
+        return True
+    return False
+
 def analyze_db_update_needs(is_jp: bool = True) -> dict:
     """現在の1dデータ最終更新日を判定し、期間更新や再取得、不足対象などを算出します。"""
     try:
@@ -407,8 +445,15 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         else:
             log(f"  🧊 追加データはありません。")
 
+    # ── 後処理: スプレッドシートのパッチ定義を「断絶事前チェック付き」で自動再適用 ──
+    log("🔄 【整合性自動復元】全体更新完了に伴い、保存済みの手動修復パッチを自動適用します...")
+    try:
+        apply_all_saved_patches(is_jp=is_jp, status_callback=status_callback)
+    except Exception as e:
+        log(f"⚠️ パッチの自動復元プロセス中にエラーが発生しました: {e}")
+
 def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_callback=None) -> bool:
-    """指定市場の該当時間足データベースを完全新規再構築（クリーンビルド）します。"""
+    """指定市場の該当時間足データベースを完全新規再構築（クリーンビルド）し、自動パッチ適用エンジンを走らせます。"""
     def log(msg):
         print(msg)
         if status_callback: status_callback(msg)
@@ -468,6 +513,14 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
         
         final_df = final_df.sort_values(["ticker", "date"]).reset_index(drop=True)
         save_price_db(final_df, interval, is_jp=is_jp)
+
+        # ── 後処理: スプレッドシートのパッチ定義を「断絶事前チェック付き」で自動再適用 ──
+        log("🔄 【整合性自動復元】フル再構築完了に伴い、保存済みの手動修復パッチを自動適用します...")
+        try:
+            apply_all_saved_patches(is_jp=is_jp, status_callback=status_callback)
+        except Exception as e:
+            log(f"⚠️ パッチの自動復元プロセス中にエラーが発生しました: {e}")
+
         return True
     return False
 
@@ -514,7 +567,7 @@ def rebuild_single_ticker_db(ticker: str, is_jp: bool = True, interval: str = "1
         return False
 
 def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_split_ratio: float = None) -> dict:
-    """指定された特定銘柄の1d〜1mすべての時間足を重複排除マージで安全修復します。"""
+    """指定された特定銘柄の1d〜1mすべての時間足を重複排除・部分置換マージで安全修復し、共通パッチ適用エンジンを実行します。"""
     pure_ticker = sanitize_ticker(ticker, is_jp)
     symbol = get_download_symbol(pure_ticker, is_jp)
     now = datetime.now()
@@ -536,17 +589,18 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
                 except FileNotFoundError:
                     db_df = pd.DataFrame()
 
-                old_df = db_df[db_df["ticker"] == pure_ticker].copy() if not db_df.empty else pd.DataFrame()
                 new_df["is_finalized"] = True
-                merged_df = merge_price_data(old_df, new_df, "1d", is_jp=is_jp, forced_split_ratio=forced_split_ratio)
+                
+                # 1d は完全なクリーン上書き
                 if not db_df.empty:
                     db_df = db_df[db_df["ticker"] != pure_ticker]
-                db_df = pd.concat([db_df, merged_df], ignore_index=True)
+                db_df = pd.concat([db_df, new_df], ignore_index=True)
                 db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
                 save_price_db(db_df, "1d", is_jp=is_jp)
                 results["1d"] = f"完全再構築成功 ({len(new_df):,}件)"
                 continue
 
+            # 短期足（60m, 5m, 1m）
             try:
                 db_df = load_price_db(interval, is_jp=is_jp)
             except FileNotFoundError:
@@ -559,21 +613,41 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
 
             df_raw = yf.download(symbol, start=start_date_dt.strftime("%Y-%m-%d"), interval=interval, auto_adjust=False, actions=True, progress=False)
             if df_raw.empty:
-                results[interval] = "新規データ空"
+                results[interval] = "新規データ空（置換なし）"
                 continue
             new_df = parse_yfinance_batch(df_raw, [pure_ticker], is_jp=is_jp)
             if new_df.empty:
-                results[interval] = "パース結果空"
+                results[interval] = "パース結果空（置換なし）"
                 continue
-            merged_df = merge_price_data(old_df, new_df, interval, forced_split_ratio=forced_split_ratio)
+
+            new_df["is_finalized"] = True
+
+            # 重複期間だけ部分置換マージ
+            if not old_df.empty:
+                new_dates = pd.to_datetime(new_df["date"])
+                old_df["date_dt"] = pd.to_datetime(old_df["date"])
+                old_filtered = old_df[~old_df["date_dt"].isin(new_dates)].copy()
+                if "date_dt" in old_filtered.columns:
+                    old_filtered = old_filtered.drop(columns=["date_dt"])
+                merged_df = pd.concat([old_filtered, new_df], ignore_index=True)
+            else:
+                merged_df = new_df
+
             if not db_df.empty:
                 db_df = db_df[db_df["ticker"] != pure_ticker]
             db_df = pd.concat([db_df, merged_df], ignore_index=True)
             db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
             save_price_db(db_df, interval, is_jp=is_jp)
-            results[interval] = f"修復成功 ({len(merged_df):,}件)"
+            results[interval] = f"部分置換マージ修復成功 ({len(merged_df):,}件)"
         except Exception as e:
             results[interval] = f"エラー: {str(e)}"
+
+    # ── 後処理: 保存済みパッチの冪等再適用 ──
+    try:
+        apply_all_saved_patches(is_jp=is_jp)
+    except Exception as e:
+        print(f"個別ダウンロード完了後の自動パッチ適用でエラー: {e}")
+
     return results
 
 def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
@@ -624,7 +698,7 @@ def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
     return df, repairs
 
 def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: float = 0.35) -> pd.DataFrame:
-    """全銘柄を対象に、異常価格（崖・負の値）をスキャンし、推測比率や1日前/当日の四本値を含めてリスト化します（不具合種類は除外）。"""
+    """全銘柄を対象に、異常価格（崖・負の値）をスキャンし、推測比率や1日前/当日の四本値を含めてリスト化します。"""
     try:
         db_df = load_price_db(interval, is_jp=is_jp)
     except FileNotFoundError:
@@ -657,7 +731,6 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
 
         boundary_rows["pct_change"] = float("nan")
         
-        # 必要なカラムをあらかじめ確保
         for col in ["open", "high", "low", "volume"]:
             if col not in boundary_rows.columns:
                 boundary_rows[col] = float("nan")
@@ -913,7 +986,13 @@ def run_database_health_scan(is_jp: bool) -> list:
     return anomalies
 
 def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, multiplier: float, is_jp: bool = True) -> dict:
-    """指定された銘柄と崖日付、修正倍率に基づいて、1d〜1mすべての時間足に補正（後ろ向き調整）を強制適用します。"""
+    """指定された銘柄と崖日付、修正倍率に基づいて、断絶事前チェックを行い、必要な時間足にのみ補正（後ろ向き調整）を強制適用します。"""
+
+    # --- 安全ガードを追加 ---
+    if multiplier <= 0:
+        return {"error": f"処理を中断しました。倍率に 0 以下の数値（{multiplier}）は指定できません。"}
+    # ----------------------
+
     pure_ticker = sanitize_ticker(ticker, is_jp)
     results = {}
     try:
@@ -935,6 +1014,12 @@ def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, mul
         ticker_data = db_df[mask].copy()
         if ticker_data.empty:
             results[interval] = "対象データなし"
+            continue
+
+        # ── 断絶事前チェック（既に平らな足への二重適用を防ぐ） ──
+        need_apply = check_anomaly_need_patch(ticker_data, cliff_date, multiplier)
+        if not need_apply:
+            results[interval] = "スキップ（既に調整済み、または適用不要な落差です）"
             continue
 
         ticker_data["date"] = pd.to_datetime(ticker_data["date"])
@@ -966,7 +1051,7 @@ def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, mul
     return results
 
 def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
-    """スプレッドシートから修復ログ/パッチ定義一覧を読み込み、降順にソートしてParquetデータベースに一括自動適用します。"""
+    """スプレッドシートから修復ログ/パッチ定義一覧を読み込み、断絶事前チェック付きでParquetデータベースに一括自動適用（冪等復元）します。"""
     def log(msg):
         print(msg)
         if status_callback: status_callback(msg)
@@ -1015,9 +1100,10 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
         log("🧊 有効な再適用対象パッチはありませんでした。")
         return 0
 
+    # 崖日時の降順（最新パッチから順）に検証・適用
     valid_patches = sorted(valid_patches, key=lambda x: x["cliff_date"], reverse=True)
 
-    log(f"🛠️ [パッチ一括再適用] {len(valid_patches)}件のパッチを降順（新しい日付順）に適用します...")
+    log(f"🛠️ [パッチ一括再適用] {len(valid_patches)}件の定義を「断絶事前チェック」を挟んで適用します...")
     
     success_count = 0
     for patch in valid_patches:
@@ -1026,17 +1112,18 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
         mul = patch["multiplier"]
         memo = patch["memo"]
         
-        log(f"  👉 適用中: [{t}] 崖日: {dt_str} | 比率: {mul:.6f} ({memo})")
         res = apply_forced_scale_patch_to_all_timeframes(t, dt_str, mul, is_jp=is_jp)
         
-        applied = any("件補正適用完了" in str(v) for v in res.values())
+        applied = any("補正適用完了" in str(v) for v in res.values())
         if applied:
             success_count += 1
-            log(f"     ✅ 補正成功 -> 1d: {res.get('1d', 'なし')}, 60m: {res.get('60m', 'なし')}")
+            log(f"  👉 適用完了: [{t}] 崖日: {dt_str} | 比率: {mul:.6f} ({memo})")
+            log(f"     ➔ 1d: {res.get('1d', 'なし')}, 60m: {res.get('60m', 'なし')}")
         else:
-            log(f"     ℹ️ 補正対象データなし（該当期間のデータが未同期、または不要）")
+            # 既に適用済みの場合は二重適用にならず、安全にスルーされます
+            pass
             
-    log(f"🎉 [パッチ一括再適用] 処理完了。成功: {success_count} / {len(valid_patches)} 件")
+    log(f"🎉 [パッチ一括再適用] 処理完了。新規適用: {success_count} / {len(valid_patches)} 件（他は適用済みのため安全にスルーされました）")
     return success_count
 
 def delete_data_before_date(ticker: str, limit_date_str: str, is_jp: bool = True) -> dict:

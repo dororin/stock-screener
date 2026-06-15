@@ -174,7 +174,6 @@ def render_database_diagnostics_ui(is_jp: bool):
         st.write("---")
         st.markdown(f"### 🔍 **{ticker} ({interval})** 崖の周辺データ確認")
         
-        # 表示対象カラムを動的に決定 (adj close があれば追加)
         cols_to_disp = ["date", "open", "high", "low", "close"]
         if "adj close" in df_ticker.columns:
             cols_to_disp.append("adj close")
@@ -205,7 +204,7 @@ def render_database_diagnostics_ui(is_jp: bool):
                     ]
                     st.dataframe(df_out[cols_to_disp], use_container_width=True, hide_index=True)
             else:
-                st.markdown(f"📊 **不具合の全貌（前後10日間のマージン付き）**")
+                st.markdown(f"📊 **不具合 of 全貌（前後10日間のマージン付き）**")
                 df_view = df_ticker[
                     (df_ticker["date"] >= start_date - pd.Timedelta(days=10)) & 
                     (df_ticker["date"] <= end_date + pd.Timedelta(days=10))
@@ -306,13 +305,8 @@ if st.button("🔄 全体差分ダウンロードを実行", key="btn_all_diff_u
                     status_callback=update_status_on_screen
                 )
                 
-                # --- [自動パッチ適用] 全体更新に伴い、保存済みの手動修復パッチを再適用 ---
-                st.write("🔄 **【整合性自動復元】全体更新完了に伴い、保存済みの手動修復パッチを自動再適用中...**")
-                apply_all_saved_patches(is_jp=is_jp, status_callback=update_status_on_screen)
-                # ----------------------------------------------------------------------
-
                 status_box.update(label="✅ 全体差分ダウンロード ＆ 補正適用完了！", state="complete")
-                st.success("すべてのデータベースが正常に同期され、手動修復も自動復元されました。")
+                st.success("すべてのデータベースが正常に同期され、手動修復パッチも断絶事前チェック付きで自動適用されました。")
                 time.sleep(0.5)
                 st.rerun()
             except Exception as e:
@@ -325,7 +319,9 @@ st.divider()
 st.subheader("3️⃣ 手動ピンポイント一括安全修復")
 st.write(
     "特定の銘柄においてデータの欠損や分割による不整合が発生した場合、既存データを破壊することなく、"
-    "すべての時間足（1d, 60m, 5m, 1m）に対して一括で重複排除マージまたは一律調整の治療を実行します。"
+    "すべての時間足（1d, 60m, 5m, 1m）に対して治療を実行します。修正開始日と修正比率を「両方とも空欄」にして実行した場合、"
+    "1dは全歴史ダウンロード、短期足は取得限界を安全に部分置換マージ（個別銘柄ダウンロード復元）します。"
+    "保存済みの手動パッチは断絶事前チェック付きで適用されるため、既に平らな時間足には二重適用されません。"
 )
 
 with st.expander("🔍 異常データスキャン（修復対象の特定）", expanded=False):
@@ -341,19 +337,16 @@ with st.expander("🔍 異常データスキャン（修復対象の特定）", 
             if "cliff_date" in display_df.columns:
                 display_df["cliff_date"] = pd.to_datetime(display_df["cliff_date"]).dt.strftime("%Y-%m-%d")
             
-            # パーセンテージ表示に変換
             if "pct_change" in display_df.columns:
                 display_df["pct_change"] = display_df["pct_change"].apply(
                     lambda x: f"{x*100:.1f}%" if pd.notna(x) else "－"
                 )
             
-            # 推測比率のフォーマット
             if "est_multiplier" in display_df.columns:
                 display_df["est_multiplier"] = display_df["est_multiplier"].apply(
                     lambda x: f"{x:.8f}".rstrip('0').rstrip('.') if pd.notna(x) else "－"
                 )
 
-            # 新カラム名マッピングにリネームして表示 (不具合種類を除去)
             rename_map = {
                 "ticker": "銘柄",
                 "cliff_date": "崖日付",
@@ -370,7 +363,6 @@ with st.expander("🔍 異常データスキャン（修復対象の特定）", 
             }
             display_df = display_df.rename(columns=rename_map)
             
-            # 整然としたカラム順を定義 (不具合種類を除去)
             col_order = [
                 "銘柄", "崖日付", "推測修正比率 (当日÷1日前)", "変化率", 
                 "1日前 Close", "Close", "1日前 Adj Close", "Adj Close", 
@@ -381,7 +373,7 @@ with st.expander("🔍 異常データスキャン（修復対象の特定）", 
 
 st.write(" ")
 
-# UI入力欄（横並び＋st.formによる自動リラン防止）
+# UI入力欄
 with st.form(key="safe_repair_form"):
     col_t1, col_t2, col_t3 = st.columns(3)
     with col_t1:
@@ -393,26 +385,44 @@ with st.form(key="safe_repair_form"):
     with col_t2:
         rep_date_str = st.text_input(
             "修正開始日", 
-            placeholder="例: 2026-03-30(検出された崖日付のままでOK）", 
+            placeholder="空白で個別ダウンロード復元", 
             key="rep_date_box"
         )
     with col_t3:
         rep_ratio_str = st.text_input(
             "修正比率", 
-            placeholder="例:0.1(検出された推測修正比率のままでOK)", 
+            placeholder="空白で個別ダウンロード復元", 
             key="rep_ratio_box"
         )
     
+    repair_confirm = st.checkbox(
+        "⚠️ 入力内容が適正であることを確認しました（Enter誤送信防止用の安全ロック解除）", 
+        value=False, 
+        key="chk_repair_confirm"
+    )
+    
     rep_col3_btn = st.form_submit_button("🔧 安全一括修復を実行", type="primary")
 
+# フォームが送信された直後のプログラム制御
 if rep_col3_btn:
+    if not repair_confirm:
+        st.error("❌ 誤動作・Enter誤送信防止用の安全ロックがかかっています。修復を実行するには、必ずフォーム内のチェックボックスをONにしてから実行してください。")
+        st.stop()
+
     if not rep_ticker:
         st.error("銘柄コードが入力されていません。")
-    # ─── 安全ガード ───
-    elif not rep_date_str.strip() and not rep_ratio_str.strip():
-        st.error("❌ 誤動作防止のため、「修正開始日」と「修正比率」が【どちらも空白】の場合は修復処理を実行できません。")
-    # ─────────────────
     else:
+        # 🛡️ 安全ガード：修正比率のゼロ以下を遮断
+        if rep_ratio_str.strip():
+            try:
+                temp_ratio = float(rep_ratio_str.strip())
+                if temp_ratio <= 0:
+                    st.error(f"❌ 危険防止のため、修正比率に 0 以下の数値（指定値: {temp_ratio}）を設定することはできません。")
+                    st.stop()
+            except ValueError:
+                st.error("修正比率には有効な数値を入力してください。")
+                st.stop()
+
         pure_t = sanitize_ticker(rep_ticker, is_jp=is_jp)
         market_str = "JP" if is_jp else "US"
         
@@ -427,7 +437,6 @@ if rep_col3_btn:
                 st.stop()
                 
             with st.spinner(f"🔧 [{pure_t}] の {cliff_dt_str} 以前を一律 {multiplier} 倍に補正調整中..."):
-                # 1d〜1mすべての時間足にパッチを強制適用して更新
                 results = apply_forced_scale_patch_to_all_timeframes(
                     pure_t, 
                     cliff_dt_str, 
@@ -435,13 +444,11 @@ if rep_col3_btn:
                     is_jp=is_jp
                 )
                 
-                # 適用レポート
                 st.write("### 📋 手動修復適用レポート:")
                 for interval, msg in results.items():
-                    icon = "✅" if "補正適用完了" in msg else "⚠️"
+                    icon = "✅" if "補正適用完了" in msg else "ℹ️" if "スキップ" in msg else "⚠️"
                     st.write(f"{icon} **{interval}**: {msg}")
                     
-                # スプレッドシートにパッチ定義をマスタとして保存
                 executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 log_row = {
                     "executed_at": executed_at,
@@ -457,85 +464,49 @@ if rep_col3_btn:
                 
                 saved = save_repair_log_to_sheets([log_row])
                 if saved:
-                    st.success("✅ パッチ定義をスプレッドシートに保存しました。次回フル再構築時にも自動再適用されます。")
+                    st.success("✅ パッチ定義をスプレッドシートに保存しました。次回ダウンロード・再構築時にも断絶事前チェック付きで自動適用されます。")
                 else:
                     st.warning("⚠️ 修復はParquetに適用されましたが、スプレッドシートへの保存に失敗しました。")
         
-        # ── パターンB: 日付または比率のいずれかが入力されている場合（自動判定と手動指定マージ修復モード） ──
-        else:
-            forced_ratio = None
-            if rep_ratio_str.strip():
-                try:
-                    forced_ratio = float(rep_ratio_str.strip())
-                except ValueError:
-                    st.error("比率は有効な数字で入力してください。")
-                    st.stop()
-
-            with st.spinner(f"🔧 [{pure_t}] の一括修復を実行中..."):
-                results_legacy = repair_single_ticker_all_timeframes(
+        # ── パターンB: どちらも空白の場合（仕様書 4-②「個別銘柄ダウンロード・手動ピンポイント復元」） ──
+        elif not rep_date_str.strip() and not rep_ratio_str.strip():
+            with st.spinner(f"🔧 [{pure_t}] の個別ダウンロード・手動ピンポイント復元を実行中..."):
+                results = repair_single_ticker_all_timeframes(
                     pure_t,
-                    is_jp=is_jp,
-                    forced_split_ratio=forced_ratio
+                    is_jp=is_jp
                 )
-                results_scale = apply_scale_repair_with_intraday_propagation(
-                    pure_t,
-                    is_jp=is_jp,
-                    threshold=0.35,
-                    dry_run=False
-                )
-
-                # 結果レポート
-                st.write("### 📋 自動修復適用レポート:")
-                for interval, msg in results_legacy.items():
-                    icon = "✅" if "修復成功" in msg or "置換" in msg or "再構築" in msg else "⚠️"
-                    st.write(f"{icon} **{interval}** (マージ修復): {msg}")
-
-                repair_details = results_scale.pop("repair_details", [])
-                results_scale.pop("ticker", None)
-                for interval, msg in results_scale.items():
-                    icon = "✅" if "修正" in msg or "波及" in msg else "ℹ️"
-                    st.write(f"{icon} **{interval}** (崖修復): {msg}")
-
-                # スプレッドシートへ自動修復内容を保存
+                
+                st.write("### 📋 個別銘柄復元レポート:")
+                for interval, msg in results.items():
+                    icon = "✅" if "成功" in msg or "再構築" in msg else "⚠️"
+                    st.write(f"{icon} **{interval}**: {msg}")
+                
                 executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if repair_details:
-                    log_rows = [
-                        {
-                            "executed_at": executed_at,
-                            "ticker": pure_t,
-                            "market": market_str,
-                            "cliff_date": r["cliff_date"].strftime("%Y-%m-%d") if hasattr(r["cliff_date"], "strftime") else str(r["cliff_date"]),
-                            "interval": "1d→all",
-                            "before_close": r.get("before_close", ""),
-                            "after_close": r.get("after_close", ""),
-                            "multiplier": r.get("multiplier", ""),
-                            "memo": "自動崖検知補正（閾値35%）",
-                        }
-                        for r in repair_details
-                    ]
-                    save_repair_log_to_sheets(log_rows)
-                else:
-                    save_repair_log_to_sheets([{
-                        "executed_at": executed_at,
-                        "ticker": pure_t,
-                        "market": market_str,
-                        "cliff_date": rep_date_str.strip() if rep_date_str.strip() else "",
-                        "interval": "all",
-                        "before_close": "",
-                        "after_close": "",
-                        "multiplier": forced_ratio if forced_ratio else "",
-                        "memo": "通常マージ自動修復のみ（自動調整）",
-                    }])
-                st.success("✅ 自動判定による修復処理およびログ保存が完了しました。")
+                save_repair_log_to_sheets([{
+                    "executed_at": executed_at,
+                    "ticker": pure_t,
+                    "market": market_str,
+                    "cliff_date": "",
+                    "interval": "all",
+                    "before_close": "",
+                    "after_close": "",
+                    "multiplier": "",
+                    "memo": "手動ピンポイント個別銘柄ダウンロード復元（1dクリーン・分足置換マージ）",
+                }])
+                st.success("✅ 個別銘柄の復元および自動パッチの冪等再適用処理が完了しました。")
+                
+        # ── パターンC: 片方のみ入力されている場合の安全ガード ──
+        else:
+            st.error("❌ 「修正開始日」と「修正比率」は、【両方入力する】（崖修正パッチの登録）か、【両方とも空欄にする】（個別銘柄ダウンロード復元）のいずれかのみ有効です。")
 
 st.write(" ")
 st.divider()
 
-# ── 【新規追加】指定日以前データ部分削除パッチUI ──
+# ── 指定日以前データ部分削除パッチUI ──
 st.markdown("#### 🗑️ 指定日以前データ一括物理削除パッチ")
 st.write(
-    "SBI新生銀行（8303）などの再上場銘柄において、過去の上場廃止前の不要な歴史データや"
-    "取引のない数年間の空白期間を、1d〜1mすべての時間足のDBから完全に物理削除します。"
+    "再上場銘柄などにおける、過去の上場廃止前の不要な歴史データや"
+    "取引のない期間を、すべての時間足のDBから完全に物理削除します。"
 )
 
 del_col1, del_col2, del_col3 = st.columns([3, 2, 1])
@@ -570,7 +541,6 @@ if btn_delete_before:
                 icon = "✅" if "正常に" in msg else "ℹ️" if "なし" in msg else "⚠️"
                 st.write(f"{icon} **{interval}**: {msg}")
             
-            # 修復ログへ記録を保存
             from datetime import datetime
             from data_access.sheets_api import save_repair_log_to_sheets
             executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -622,10 +592,10 @@ with st.expander("📋 修復ログ一覧", expanded=False):
 
 # ── 手動パッチ全適用UIコンポーネント ──
 st.write(" ")
-st.markdown("#### 🔄 **保存済みパッチの冪等（べきとう）復元システム**")
+st.markdown("#### 🔄 **保存済みパッチの冪等復元システム**")
 st.caption(
-    "データベースを白紙初期化したり、yfinanceからフル再構築した場合、手動修正した履歴がすべて消えてしまいます。"
-    "以下のボタンを押すことで、スプレッドシートに記録されたすべての手動パッチ（崖・倍率）を自動ソートし一括再適用（復元）します。"
+    "データベースを初期化したりフル再構築した場合、手動修正した履歴が消失してしまいます。"
+    "スプレッドシートに記録された手動パッチを、断絶事前チェック付きで一括再適用（復元）します。既に適用済みの時間足は安全にスルーされます。"
 )
 
 if st.button("🔄 保存されているすべてのパッチを一括再適用して復元", key="btn_apply_all_patches_manual", type="secondary"):
@@ -636,10 +606,10 @@ if st.button("🔄 保存されているすべてのパッチを一括再適用�
         try:
             count = apply_all_saved_patches(is_jp=is_jp, status_callback=update_patch_status)
             if count > 0:
-                status_box.update(label=f"✅ {count}件のパッチ再適用が完了しました！", state="complete")
+                status_box.update(label=f"✅ {count}件のパッチ適用（断絶事前チェック適合分）が完了しました！", state="complete")
                 st.success(f"データベースの整合性が過去のパッチ定義に基づいて元通り復元されました。")
             else:
-                status_box.update(label="🧊 適用対象の有効なパッチはありませんでした。", state="complete")
+                status_box.update(label="🧊 適用対象（現在未適用の崖があるもの）はありませんでした。", state="complete")
         except Exception as e:
             status_box.update(label="❌ エラーが発生しました", state="error")
             st.error(f"パッチの一括適用中にエラーが発生しました: {e}")
@@ -695,19 +665,15 @@ if btn_full_rebuild:
             st.write(msg)
             
         try:
+            # 内部で apply_all_saved_patches も自動的に呼び出されます
             success = full_rebuild_all_database(
                 is_jp=is_jp, 
                 interval=rebuild_interval, 
                 status_callback=update_rebuild_status
             )
             if success:
-                # --- [自動パッチ適用] フル再構築後に自動的にパッチを一括適用して整合性を復元 ---
-                st.write("🔄 **【整合性自動復元】フル再構築完了に伴い、保存済みの手動修復パッチを再適用中...**")
-                apply_all_saved_patches(is_jp=is_jp, status_callback=update_rebuild_status)
-                # ----------------------------------------------------------------------
-                
-                status_box.update(label="✅ 一括フルダウンロード完了！", state="complete")
-                st.success(f"{rebuild_interval} データベースの再構築とパッチ復元が完了しました！")
+                status_box.update(label="✅ 一括フルダウンロード ＆ 補正適用完了！", state="complete")
+                st.success(f"{rebuild_interval} データベースの再構築と、断絶事前チェックによるパッチ復元が正常に完了しました。")
                 time.sleep(0.5)
                 st.rerun()
             else:
