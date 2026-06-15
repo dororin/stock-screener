@@ -228,20 +228,18 @@ def render_database_diagnostics_ui(is_jp: bool):
         if "階段段差" in anomaly_type:
             suggested_end = (base_date - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             st.code(
-                f"① 銘柄コード         : {ticker}\n"
-                f"② 開始日（省略可）   : (空欄にする)\n"
-                f"③ 終了日（省略可）   : {suggested_end}\n"
-                f"④ 修復/分割比率     : (上の崖の落差に応じて、1306.Tなら 0.1 を入力)", 
+                f"① 銘柄コード   : {ticker}\n"
+                f"② 修正開始日   : (空欄にする)\n"
+                f"③ 修正比率     : (上の崖の落差に応じて、1306.Tなら 0.1 を入力)", 
                 language="text"
             )
         else:
             start_str = start_date.strftime("%Y-%m-%d")
             end_str = end_date.strftime("%Y-%m-%d")
             st.code(
-                f"① 銘柄コード         : {ticker}\n"
-                f"② 開始日（省略可）   : {start_str}\n"
-                f"③ 終了日（省略可）   : {end_str}\n"
-                f"④ 修復/分割比率     : (元の適正価格/潰れた価格の比率。1629.Tなら 500.0 を入力)", 
+                f"① 銘柄コード   : {ticker}\n"
+                f"② 修正開始日   : {start_str}\n"
+                f"③ 修正比率     : (元の適正価格/潰れた価格の比率。1629.Tなら 500.0 を入力)", 
                 language="text"
             )
 
@@ -355,11 +353,10 @@ with st.expander("🔍 異常データスキャン（修復対象の特定）", 
                     lambda x: f"{x:.8f}".rstrip('0').rstrip('.') if pd.notna(x) else "－"
                 )
 
-            # 新カラム名マッピングにリネームして表示
+            # 新カラム名マッピングにリネームして表示 (不具合種類を除去)
             rename_map = {
                 "ticker": "銘柄",
                 "cliff_date": "崖日付",
-                "anomaly_type": "不具合種類",
                 "est_multiplier": "推測修正比率 (当日÷1日前)",
                 "pct_change": "変化率",
                 "before_close": "1日前 Close",
@@ -373,9 +370,9 @@ with st.expander("🔍 異常データスキャン（修復対象の特定）", 
             }
             display_df = display_df.rename(columns=rename_map)
             
-            # 整然としたカラム順を定義
+            # 整然としたカラム順を定義 (不具合種類を除去)
             col_order = [
-                "銘柄", "崖日付", "不具合種類", "推測修正比率 (当日÷1日前)", "変化率", 
+                "銘柄", "崖日付", "推測修正比率 (当日÷1日前)", "変化率", 
                 "1日前 Close", "Close", "1日前 Adj Close", "Adj Close", 
                 "Open", "High", "Low", "Volume"
             ]
@@ -384,20 +381,37 @@ with st.expander("🔍 異常データスキャン（修復対象の特定）", 
 
 st.write(" ")
 
-# UI入力欄
-rep_ticker = st.text_input("安全一括修復を実行する銘柄コードを入力してください", placeholder="例: 1306 や AAPL", key="rep_ticker_box")
-rep_date_str = st.text_input("修正開始日/崖日付 (空欄なら自動検知)", placeholder="例: 2026-03-30", key="rep_date_box")
-rep_ratio_str = st.text_input("手動修正比率 multiplier (空欄なら自動検知)", placeholder="例: 0.1 や 3.25e-8", key="rep_ratio_box")
-
-rep_col3_btn = st.button("🔧 安全一括修復を実行")
+# UI入力欄（横並び＋st.formによる自動リラン防止）
+with st.form(key="safe_repair_form"):
+    col_t1, col_t2, col_t3 = st.columns(3)
+    with col_t1:
+        rep_ticker = st.text_input(
+            "銘柄コード", 
+            placeholder="例:1629（.T不要）", 
+            key="rep_ticker_box"
+        )
+    with col_t2:
+        rep_date_str = st.text_input(
+            "修正開始日", 
+            placeholder="例: 2026-03-30(検出された崖日付のままでOK）", 
+            key="rep_date_box"
+        )
+    with col_t3:
+        rep_ratio_str = st.text_input(
+            "修正比率", 
+            placeholder="例:0.1(検出された推測修正比率のままでOK)", 
+            key="rep_ratio_box"
+        )
+    
+    rep_col3_btn = st.form_submit_button("🔧 安全一括修復を実行", type="primary")
 
 if rep_col3_btn:
     if not rep_ticker:
         st.error("銘柄コードが入力されていません。")
-    # ─── 修正箇所: 「日付」と「倍率」の両方が空白の場合は動作させない安全ガード ───
+    # ─── 安全ガード ───
     elif not rep_date_str.strip() and not rep_ratio_str.strip():
-        st.error("❌ 誤動作防止のため、「修正開始日」と「手動修正比率」が【どちらも空白】の場合は修復処理を実行できません。どちらか片方、または両方を入力してください。")
-    # ────────────────────────────────────────────────────────────────────────
+        st.error("❌ 誤動作防止のため、「修正開始日」と「修正比率」が【どちらも空白】の場合は修復処理を実行できません。")
+    # ─────────────────
     else:
         pure_t = sanitize_ticker(rep_ticker, is_jp=is_jp)
         market_str = "JP" if is_jp else "US"
@@ -443,9 +457,9 @@ if rep_col3_btn:
                 
                 saved = save_repair_log_to_sheets([log_row])
                 if saved:
-                    st.success("✅ パッチ定義をスプレッドシートに保存しました。次回初期化・フル再構築時にも自動的に適用（復元）されます。")
+                    st.success("✅ パッチ定義をスプレッドシートに保存しました。次回フル再構築時にも自動再適用されます。")
                 else:
-                    st.warning("⚠️ 修復はParquetに適用されましたが、スプレッドシートへのパッチ永続化に失敗しました。")
+                    st.warning("⚠️ 修復はParquetに適用されましたが、スプレッドシートへの保存に失敗しました。")
         
         # ── パターンB: 日付または比率のいずれかが入力されている場合（自動判定と手動指定マージ修復モード） ──
         else:
@@ -541,7 +555,6 @@ if btn_delete_before:
         st.error("削除の境界となる基準日付が入力されていません。")
     else:
         try:
-            # 入力日付のフォーマット簡易バリデーション
             pd.to_datetime(del_date_str)
         except ValueError:
             st.error("日付は有効な形式（例: YYYY-MM-DD）で入力してください。")
@@ -612,8 +625,7 @@ st.write(" ")
 st.markdown("#### 🔄 **保存済みパッチの冪等（べきとう）復元システム**")
 st.caption(
     "データベースを白紙初期化したり、yfinanceからフル再構築した場合、手動修正した履歴がすべて消えてしまいます。"
-    "以下のボタンを押すことで、スプレッドシートに記録された過去のすべての手動パッチ（崖・倍率）を"
-    "「新しい日付順（降順）」に自動ソートし、1dから1mのすべての時間足に対して一括で自動適用（復元）します。"
+    "以下のボタンを押すことで、スプレッドシートに記録されたすべての手動パッチ（崖・倍率）を自動ソートし一括再適用（復元）します。"
 )
 
 if st.button("🔄 保存されているすべてのパッチを一括再適用して復元", key="btn_apply_all_patches_manual", type="secondary"):
@@ -677,7 +689,7 @@ if btn_full_rebuild:
             except Exception as e:
                 st.write(f"⚠️ 既存ファイルの削除に失敗: {e}")
         
-        st.write("yfinanceからバッチダウンロードを開始します（レート制限防止のために時間がかかります）...")
+        st.write("yfinanceからバッチダウンロードを開始します...")
         
         def update_rebuild_status(msg):
             st.write(msg)

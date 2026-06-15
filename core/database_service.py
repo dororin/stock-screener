@@ -53,8 +53,6 @@ def analyze_db_update_needs(is_jp: bool = True) -> dict:
             "error": str(e),
         }
 
-# core/database_service.py より修正 (1/4)
-
 def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, is_jp: bool = True, forced_split_ratio: float = None) -> pd.DataFrame:
     """新旧DataFrameをマージし、権利落ちや手動強制分割比率などを数学的に後ろ向き調整します。"""
     if new_df is None or new_df.empty:
@@ -79,7 +77,7 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
         split_ratio = 1.0
         
         if forced_split_ratio is not None and forced_split_ratio > 0:
-            split_ratio = forced_split_ratio  # 逆数（1.0/ratio）にするのをやめ、入力値をそのまま倍率に
+            split_ratio = forced_split_ratio
             has_split = True
             
             if len(t_new) > 1:
@@ -92,10 +90,8 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
                     price_cols = ["open", "high", "low", "close"]
                     for col in price_cols:
                         if col in t_new.columns:
-                            # 割り算（/）を掛け算（*）に変更（0.1と入力されたらそのまま0.1が掛けられます）
                             t_new.loc[pre_mask, col] = t_new.loc[pre_mask, col] * forced_split_ratio
                     if "volume" in t_new.columns:
-                        # 出来高は逆数（割り算）にする
                         t_new.loc[pre_mask, "volume"] = t_new.loc[pre_mask, "volume"] / forced_split_ratio
         else:
             if len(t_new) > 1:
@@ -121,7 +117,6 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
                             
                         if est_ratio >= 1.5:
                             pre_mask = t_new["date"] < split_date
-                            # price_cols に "adj close" を追加
                             price_cols = ["open", "high", "low", "close", "adj close"]
                             for col in price_cols:
                                 if col in t_new.columns:
@@ -171,7 +166,6 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
                         apply_split = False
             
             if apply_split:
-                # price_cols に "adj close" を追加
                 price_cols = ["open", "high", "low", "close", "adj close"]
                 for col in price_cols:
                     if col in t_old.columns:
@@ -192,10 +186,8 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
     combined = combined.drop_duplicates(subset=["date", "ticker"], keep="last")
     return combined.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-# core/database_service.py より修正 (2/4)
-
 def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: bool = True, log_func=None):
-    """日足等で検知した株式分割を、短期足DB(60m, 5m, 1m)へ数学的に先行適用します。"""
+    """日足等で検知した株式分割を、短期足DB(60m, 5m, 1m)へ調整適用します。"""
     def _log(msg):
         if log_func: log_func(msg)
         else: print(msg)
@@ -232,7 +224,6 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
             
             if apply_split:
                 _log(f"  🔄 [{ticker}] {interval} に分割調整を適用中 (ratio: {split_ratio:.4f})...")
-                # price_cols に "adj close" を追加
                 price_cols = ["open", "high", "low", "close", "adj close"]
                 for col in price_cols:
                     if col in db_df.columns:
@@ -292,7 +283,6 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         if not db_df.empty:
             last_updates_map = db_df.groupby("ticker")["date"].max().to_dict()
 
-        # 3レイヤー・バケットグループ化
         active_timestamps = [pd.to_datetime(last_updates_map[t]) for t in tickers if t in last_updates_map]
         base_time = pd.Series(active_timestamps).mode()[0] if active_timestamps and not force_refetch else None
 
@@ -586,14 +576,11 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
             results[interval] = f"エラー: {str(e)}"
     return results
 
-# core/database_service.py より修正 (3/4)
-
 def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
     """配信異常などによる価格の急変（崖・負の数値など）を検出し後ろ向きスケール調整します。"""
     if df.empty:
         return df, []
     df = df.sort_values("date").reset_index(drop=True)
-    # price_cols の探索リストに "adj close" を追加
     price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in df.columns]
     repairs = []
 
@@ -636,12 +623,8 @@ def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
         })
     return df, repairs
 
-# core/database_service.py より修正 (1/2)
-
-# core/database_service.py より修正 (1/2)
-
 def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: float = 0.35) -> pd.DataFrame:
-    """全銘柄を対象に、異常価格（崖・負の値）をスキャンし、推測比率や1日前/当日の四本値を含めてリスト化します。"""
+    """全銘柄を対象に、異常価格（崖・負の値）をスキャンし、推測比率や1日前/当日の四本値を含めてリスト化します（不具合種類は除外）。"""
     try:
         db_df = load_price_db(interval, is_jp=is_jp)
     except FileNotFoundError:
@@ -673,14 +656,13 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
             boundary_rows["after_adj_close"] = float("nan")
 
         boundary_rows["pct_change"] = float("nan")
-        boundary_rows["anomaly_type"] = "負の株価（境界）"
         
         # 必要なカラムをあらかじめ確保
         for col in ["open", "high", "low", "volume"]:
             if col not in boundary_rows.columns:
                 boundary_rows[col] = float("nan")
                 
-        result_rows.append(boundary_rows[["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "open", "high", "low", "volume", "pct_change", "anomaly_type"]])
+        result_rows.append(boundary_rows[["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "open", "high", "low", "volume", "pct_change"]])
 
     # 崖（急変）チェック
     abs_close = db_df["close"].abs()
@@ -699,13 +681,12 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
             cliff_rows["after_adj_close"] = float("nan")
 
         cliff_rows["pct_change"] = pct[cliff_mask].values
-        cliff_rows["anomaly_type"] = "急変（" + (pct[cliff_mask] * 100).round(1).astype(str) + "%）"
         
         for col in ["open", "high", "low", "volume"]:
             if col not in cliff_rows.columns:
                 cliff_rows[col] = float("nan")
                 
-        result_rows.append(cliff_rows[["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "open", "high", "low", "volume", "pct_change", "anomaly_type"]])
+        result_rows.append(cliff_rows[["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "open", "high", "low", "volume", "pct_change"]])
 
     if not result_rows:
         return pd.DataFrame()
@@ -713,7 +694,6 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
     result = pd.concat(result_rows, ignore_index=True).rename(columns={"date": "cliff_date"})
     
     def aggregate_anomalies(group):
-        types = " ＆ ".join(group["anomaly_type"].unique())
         pct_vals = group["pct_change"].dropna()
         pct_val = pct_vals.iloc[0] if not pct_vals.empty else float("nan")
         
@@ -727,7 +707,6 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
         low_val = group["low"].dropna().iloc[0] if not group["low"].dropna().empty else float("nan")
         vol_val = group["volume"].dropna().iloc[0] if not group["volume"].dropna().empty else float("nan")
         
-        # 修正倍率の自動推測（当日Close / 1日前Close）
         est_multiplier = float("nan")
         if before_close_val != 0 and pd.notna(before_close_val) and pd.notna(after_close_val):
             est_multiplier = after_close_val / before_close_val
@@ -742,17 +721,14 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
             "low": low_val,
             "volume": vol_val,
             "est_multiplier": est_multiplier,
-            "pct_change": pct_val, 
-            "anomaly_type": types
+            "pct_change": pct_val
         })
         
     result = result.groupby(["ticker", "cliff_date"], as_index=False).apply(aggregate_anomalies)
     return result.sort_values(["ticker", "cliff_date"]).reset_index(drop=True)
 
-# core/database_service.py より修正 (4/4)
-
 def apply_scale_repair_with_intraday_propagation(ticker: str, is_jp: bool = True, threshold: float = 0.35, dry_run: bool = False) -> dict:
-    """指定銘柄の日足異常を修復したうえで、その倍率を分足等の短期足データベースへ一挙遡及波及させます。"""
+    """指定銘柄の日足異常を修復したうえで、その倍率を分足等の短期足データベースへ波及させます。"""
     pure_ticker = sanitize_ticker(ticker, is_jp)
     results = {}
     try:
@@ -787,7 +763,6 @@ def apply_scale_repair_with_intraday_propagation(ticker: str, is_jp: bool = True
             continue
 
         ticker_intra = ticker_intra.sort_values("date").reset_index(drop=True)
-        # price_cols の探索リストに "adj close" を追加
         price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in ticker_intra.columns]
         repairs_sorted = sorted(repairs, key=lambda x: x["cliff_date"], reverse=True)
 
@@ -819,10 +794,6 @@ def apply_scale_repair_with_intraday_propagation(ticker: str, is_jp: bool = True
     results["ticker"] = pure_ticker
     return results
 
-# core/database_service.py より修正 (2/2)
-
-# core/database_service.py より修正 (2/2)
-
 def run_database_health_scan(is_jp: bool) -> list:
     """全タイムフレームのParquetデータベースを自動スキャンし、異常陥没・高騰・段差などを診断します。"""
     anomalies = []
@@ -833,7 +804,6 @@ def run_database_health_scan(is_jp: bool) -> list:
                 continue
             df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
             
-            # チェック対象カラムの動的決定
             cols_to_check = ["close"]
             has_adj = "adj close" in df.columns
             if has_adj:
@@ -846,7 +816,6 @@ def run_database_health_scan(is_jp: bool) -> list:
                 col_label = " (Adj Close)" if p_col == "adj close" else ""
                 pct_col = "pct_adj_close" if p_col == "adj close" else "pct_close"
                 
-                # 急激な陥没（-40%以下）または急騰（+50%以上）を検知
                 anomaly_indices = df[(df[pct_col] <= -0.40) | (df[pct_col] >= 0.50)].index.tolist()
                 for i in anomaly_indices:
                     row = df.loc[i]
@@ -861,7 +830,6 @@ def run_database_health_scan(is_jp: bool) -> list:
                     if n < 2:
                         continue
                         
-                    # 近隣の各価格を対比用に取得
                     curr_close = row["close"]
                     curr_adj = row["adj close"] if has_adj else float("nan")
                     
@@ -944,10 +912,8 @@ def run_database_health_scan(is_jp: bool) -> list:
             pass
     return anomalies
 
-# core/database_service.py へ追加
-
 def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, multiplier: float, is_jp: bool = True) -> dict:
-    """指定された銘柄と崖日付、修正倍率に基づいて、1d〜1mすべての時間足の過去データ（cliff_dateより前）に一律の補正（後ろ向き調整）を強制適用します。"""
+    """指定された銘柄と崖日付、修正倍率に基づいて、1d〜1mすべての時間足に補正（後ろ向き調整）を強制適用します。"""
     pure_ticker = sanitize_ticker(ticker, is_jp)
     results = {}
     try:
@@ -971,7 +937,6 @@ def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, mul
             results[interval] = "対象データなし"
             continue
 
-        # 崖日付より過去のデータを判定
         ticker_data["date"] = pd.to_datetime(ticker_data["date"])
         pre_mask = ticker_data["date"] < target_dt
         
@@ -981,16 +946,13 @@ def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, mul
 
         price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in db_df.columns]
         
-        # 実際に補正を適用 (過去全体を一律処理)
         for col in price_cols:
             ticker_data.loc[pre_mask, col] = ticker_data.loc[pre_mask, col] * multiplier
         if "volume" in db_df.columns:
             ticker_data.loc[pre_mask, "volume"] = ticker_data.loc[pre_mask, "volume"] / multiplier
 
-        # データベースへの書き戻し
         db_df = db_df[~mask]
         
-        # 日付型を元のDBの形式に復元
         if not db_df.empty:
             if pd.api.types.is_datetime64_any_dtype(db_df["date"]):
                 ticker_data["date"] = pd.to_datetime(ticker_data["date"])
@@ -1003,9 +965,8 @@ def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, mul
         results[interval] = f"{pre_mask.sum()}件補正適用完了"
     return results
 
-
 def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
-    """スプレッドシートから修復ログ/パッチ定義一覧を読み込み、新しい順（降順）に並べ替えてParquetデータベースに一括自動適用します。"""
+    """スプレッドシートから修復ログ/パッチ定義一覧を読み込み、降順にソートしてParquetデータベースに一括自動適用します。"""
     def log(msg):
         print(msg)
         if status_callback: status_callback(msg)
@@ -1025,7 +986,6 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
     valid_patches = []
     
     for _, row in log_df.iterrows():
-        # 市場の一致を確認 (JP/US)
         if str(row.get("market", "")).strip().upper() != market_str:
             continue
         
@@ -1039,10 +999,10 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
         try:
             multiplier_val = float(multiplier_str)
             if multiplier_val <= 0 or multiplier_val == 1.0:
-                continue  # 不要な補正値はスキップ
+                continue
             cliff_dt = pd.to_datetime(cliff_date_str)
         except Exception:
-            continue  # パース失敗行はスキップ
+            continue
 
         valid_patches.append({
             "ticker": ticker,
@@ -1055,8 +1015,6 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
         log("🧊 有効な再適用対象パッチはありませんでした。")
         return 0
 
-    # 【超重要ルール】崖日付の降順（新しい日付 ➔ 古い日付の順）にソート！
-    # これにより、クレーターバグや一時的バグに対する「上げ下げ2回の一律適用」が数学的に正しく相殺されます。
     valid_patches = sorted(valid_patches, key=lambda x: x["cliff_date"], reverse=True)
 
     log(f"🛠️ [パッチ一括再適用] {len(valid_patches)}件のパッチを降順（新しい日付順）に適用します...")
@@ -1071,7 +1029,6 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
         log(f"  👉 適用中: [{t}] 崖日: {dt_str} | 比率: {mul:.6f} ({memo})")
         res = apply_forced_scale_patch_to_all_timeframes(t, dt_str, mul, is_jp=is_jp)
         
-        # 1dまたは他の時間足のどれかで実際にデータが補正されたか判定
         applied = any("件補正適用完了" in str(v) for v in res.values())
         if applied:
             success_count += 1
@@ -1082,9 +1039,8 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
     log(f"🎉 [パッチ一括再適用] 処理完了。成功: {success_count} / {len(valid_patches)} 件")
     return success_count
 
-
 def delete_data_before_date(ticker: str, limit_date_str: str, is_jp: bool = True) -> dict:
-    """指定された特定銘柄において、指定日以前（含む）のデータを1d〜1mすべての時間足から完全に物理削除します。"""
+    """指定された特定銘柄において、指定日以前（含む）のデータをすべての時間足から完全に物理削除します。"""
     pure_ticker = sanitize_ticker(ticker, is_jp)
     limit_dt = pd.to_datetime(limit_date_str)
     results = {}
@@ -1096,7 +1052,6 @@ def delete_data_before_date(ticker: str, limit_date_str: str, is_jp: bool = True
                 results[interval] = "DB空"
                 continue
             
-            # 対象銘柄でかつ指定日以前（同日含む）の行を特定して除外
             db_df["temp_date"] = pd.to_datetime(db_df["date"])
             
             mask_to_delete = (db_df["ticker"] == pure_ticker) & (db_df["temp_date"] <= limit_dt)
