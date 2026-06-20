@@ -172,96 +172,31 @@ bm_series = get_benchmark_data(bm_ticker, period_days, interval) if bm_ticker el
 # 🇯🇵 日本株モード
 # =========================================================================
 if is_jp:
-    with st.spinner("TOPIX-17 ETFデータから5大マクロ・コア指数を計算中..."):
-        macro_cores = compute_macro_cores_from_db(db_df, period_days, resample_weekly)
+    # (中略: Layer 1 マクロコア、相対強度重ね合わせ比較チャート の描画処理の後)
 
-    if macro_cores:
-        momentum_scores = {}
-        for core_name, series in macro_cores.items():
-            if not series.empty:
-                momentum_scores[core_name] = get_sector_momentum(series, days=min(5, period_days))
+    st.divider()
+
+    # ─── 中段: 業種・厳選テーマの排他切り替え表示 ───
+    st.markdown("### 📂 ミニチャート分析（切り替え表示）")
+    
+    # メイン表示を排他選択するラジオボタン
+    view_mode = st.radio(
+        "表示データの種類を選択してください",
+        ["📊 17業種ETF（絶対価格表示）", "📈 厳選テーマ (シートA)（オリジナル指数リターン率%表示）"],
+        horizontal=True,
+        key="jp_view_mode_selector"
+    )
+
+    # 1. 17業種ETF の表示ブロック
+    if view_mode == "📊 17業種ETF（絶対価格表示）":
+        st.caption(f"TOPIX-17構成ETFの絶対価格推移を表示しています。（表示期間: {period_label} / {tf_label}）")
         
-        st.markdown("### 📊 Layer 1: 5大マクロ・コア モメンタム（直近5日）")
-        core_cols = st.columns(5)
-        for i, (core_name, mom) in enumerate(momentum_scores.items()):
-            badge = "🟢" if mom >= 0 else "🔴"
-            with core_cols[i]:
-                st.metric(f"{badge} {core_name[2:]}", f"{mom:+.2f}%")
-
-        st.divider()
-
-        st.markdown(f"### 📈 相対強度（RS）重ね合わせ比較 [対象: {overlay_target}]")
-        
-        sector_index_cache = {}
-        selected_sectors = []
-
-        if overlay_target == "5大マクロ・コア":
-            for core_name, series in macro_cores.items():
-                sector_index_cache[core_name] = relativize_series(series, bm_series)
-            selected_sectors = list(sector_index_cache.keys())
-
-        elif overlay_target == "17業種 (個別)":
-            for code, name in settings.TOPIX17_NAMES.items():
-                single_series = compute_sector_index_from_df(db_df, [code], period_days, resample_weekly)
-                if not single_series.empty:
-                    sector_index_cache[f"{code} {name}"] = relativize_series(single_series, bm_series)
-            
-            all_names = list(sector_index_cache.keys())
-            default_sel = [n for n in all_names if any(k in n for k in ["自動車", "銀行", "電機・精密", "医薬品", "素材・化学"])]
-            selected_sectors = st.multiselect(
-                "表示する個別業種を選択してください（最大6つ程度を推奨）",
-                options=all_names,
-                default=default_sel[:min(5, len(default_sel))],
-                key="topix17_overlay_select"
-            )
-
-        elif overlay_target == "厳選テーマ (シートA)":
-            sectors = load_sector_master_from_sheets(is_jp)
-            for sname, tickers in sectors.items():
-                idx_series = compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly)
-                if not idx_series.empty:
-                    sector_index_cache[sname] = relativize_series(idx_series, bm_series)
-            
-            all_names = list(sector_index_cache.keys())
-            selected_sectors = st.multiselect(
-                "表示する厳選テーマを選択してください",
-                options=all_names,
-                default=all_names[:min(5, len(all_names))],
-                key="theme_overlay_select"
-            )
-
-        if sector_index_cache and selected_sectors:
-            render_lwc_rs_overlay(
-                sector_index_cache=sector_index_cache,
-                selected_sectors=selected_sectors,
-                height=450,
-                key="dynamic_overlay_lwc"
-            )
-
-        st.divider()
-
-        st.markdown(f"### 📂 17業種ETF 絶対値ミニチャート（{period_label} / {tf_label}）")
-
         TOPIX17_TO_JP_SECTOR = {
-            "1617": "食品",
-            "1618": "エネルギー",
-            "1619": "建設・インフラ",
-            "1620": None,
-            "1621": "医薬品",
-            "1622": "自動車",
-            "1623": None,
-            "1624": None,
-            "1625": "電気機器",
-            "1626": "通信",
-            "1627": None,
-            "1628": None,
-            "1629": "商社",
-            "1630": "小売",
-            "1631": "銀行",
-            "1632": "保険",
-            "1633": "不動産",
+            "1617": "食品", "1618": "エネルギー", "1619": "建設・インフラ",
+            "1621": "医薬品", "1622": "自動車", "1625": "電気機器",
+            "1626": "通信", "1629": "商社", "1630": "小売",
+            "1631": "銀行", "1632": "保険", "1633": "不動産",
         }
-
         all_etf_codes = list(settings.TOPIX17_NAMES.keys())
 
         # トグル制御用の状態をセッションに仕込む
@@ -269,68 +204,16 @@ if is_jp:
             if f"etf_visible_{_code}" not in st.session_state:
                 st.session_state[f"etf_visible_{_code}"] = True
 
-        # ─── ★修正版CSS注入: 横幅・高さの !important を外し、マウスでの伸縮を許可 ───
-        st.markdown(
-            """
-            <style>
-            /* ──────── デフォルト（PC・大画面タブレット用） ──────── */
-            div[data-testid="stPopoverBody"] {
-                resize: both !important;       /* マウスでの引き伸ばしを有効化 */
-                overflow: auto !important;      /* resize動作に必須の設定 */
-                
-                /* 
-                   ★超重要: 初期の幅と高さ。ドラッグ操作（ブラウザの書き込み）で
-                   上書きできるように、ここだけ !important を外しておきます。
-                */
-                width: 85vw;                    /* 初期の横幅 */
-                height: 500px;                  /* 初期の高さ */
-                
-                /* つぶれ防止やはみ出し防止用の制限値は !important で固定します */
-                min-width: 850px !important;
-                min-height: 400px !important;
-                max-width: 95vw !important;
-                max-height: 90vh !important;
-                padding: 20px !important;
-            }
-
-            /* ──────── スマホ用（スマホはドラッグ不可のため自動縮小） ──────── */
-            @media (max-width: 768px) {
-                div[data-testid="stPopoverBody"] {
-                    resize: none !important;
-                    width: 90vw !important;
-                    min-width: 280px !important;
-                    max-width: 95vw !important;
-                    height: auto !important;
-                    min-height: auto !important;
-                    padding: 10px !important;
-                }
-            }
-            </style>
-            """,
-            unsafe_allow_html=True
-        )
-
-        # 表示切り替え時のコールバック関数（st.rerun不要で安全に書き換えるため）
         def toggle_etf_visibility(code):
             st.session_state[f"etf_visible_{code}"] = not st.session_state[f"etf_visible_{code}"]
 
-        # 個別のETFカードと構成銘柄ポップオーバーをフラグメント（部分更新）化
         @st.fragment
         def render_etf_card_fragment(code, name):
             visible = st.session_state[f"etf_visible_{code}"]
-            
             with st.container(border=True):
                 hc1, hc2 = st.columns([5, 1])
                 vis_label = "表示" if not visible else "非表示"
-                
-                # コールバック指定で部分更新。st.rerunエラーを回避します
-                hc2.button(
-                    vis_label, 
-                    key=f"vis_{code}", 
-                    use_container_width=True, 
-                    on_click=toggle_etf_visibility, 
-                    args=(code,)
-                )
+                hc2.button(vis_label, key=f"vis_{code}", use_container_width=True, on_click=toggle_etf_visibility, args=(code,))
 
                 if visible:
                     try:
@@ -370,7 +253,6 @@ if is_jp:
                         sectors_loaded = load_sector_master_from_sheets(True)
                         constituent_codes = sectors_loaded.get(jp_sector_name, []) if jp_sector_name else []
 
-                    # ─── ポップオーバーによる構成銘柄展開 (CSSで幅広・可変化したため5列並びで表示) ───
                     if constituent_codes:
                         with st.popover(f"🔍 構成{len(constituent_codes)}銘柄の一覧", use_container_width=True):
                             st.markdown(
@@ -380,7 +262,7 @@ if is_jp:
                                 unsafe_allow_html=True
                             )
 
-                            p_cols = st.columns(5) # 広大になったため5列構成に復元
+                            p_cols = st.columns(5)
                             for s_idx, stock_code in enumerate(constituent_codes):
                                 col_to_use = p_cols[s_idx % 5]
                                 with col_to_use:
@@ -415,26 +297,80 @@ if is_jp:
                                         else:
                                             st.caption("データなし")
                 else:
-                    hc1.markdown(
-                        f"<span style='font-size:0.85rem; color:#9e9e9e;'>{code} {name}</span>",
-                        unsafe_allow_html=True
-                    )
+                    hc1.markdown(f"<span style='font-size:0.85rem; color:#9e9e9e;'>{code} {name}</span>", unsafe_allow_html=True)
 
-        CHILD_COLS = 5
         ETF_GRID_COLS = n_cols
-
-        rows_17 = [
-            all_etf_codes[i:i + ETF_GRID_COLS]
-            for i in range(0, len(all_etf_codes), ETF_GRID_COLS)
-        ]
-
-        # columnsコンテキストの内側で安全にフラグメントを呼ぶことで、再描画時の要素増殖エラーを防止
+        rows_17 = [all_etf_codes[i:i + ETF_GRID_COLS] for i in range(0, len(all_etf_codes), ETF_GRID_COLS)]
         for row_codes in rows_17:
             row_cols = st.columns(ETF_GRID_COLS)
             for ci, code in enumerate(row_codes):
                 name = settings.TOPIX17_NAMES.get(code, code)
                 with row_cols[ci]:
                     render_etf_card_fragment(code, name)
+
+    # 2. 厳選テーマ (シートA) の表示ブロック
+    else:
+        st.caption(f"スプレッドシート定義の厳選テーマを「等金額規格化」したリターン率（％）推移です。（期首＝0.0%基準）")
+        
+        sectors_loaded = load_sector_master_from_sheets(is_jp=True)
+        if not sectors_loaded:
+            st.info("厳選テーマ（シートA）のデータがスプレッドシートから読み取れませんでした。")
+        else:
+            theme_names = list(sectors_loaded.keys())
+
+            # トグル制御用の状態をセッションに仕込む
+            for t_name in theme_names:
+                if f"theme_visible_{t_name}" not in st.session_state:
+                    st.session_state[f"theme_visible_{t_name}"] = True
+
+            def toggle_theme_visibility(t_name):
+                st.session_state[f"theme_visible_{t_name}"] = not st.session_state[f"theme_visible_{t_name}"]
+
+            @st.fragment
+            def render_theme_card_fragment(t_name, tickers):
+                visible = st.session_state[f"theme_visible_{t_name}"]
+                with st.container(border=True):
+                    hc1, hc2 = st.columns([5, 1])
+                    vis_label = "表示" if not visible else "非表示"
+                    hc2.button(vis_label, key=f"theme_vis_{t_name}", use_container_width=True, on_click=toggle_theme_visibility, args=(t_name,))
+
+                    if visible:
+                        # 新規作成した値がさ株対応の等金額規格化リターン算出
+                        ret_rate, sma75, sma200, total_val = compute_theme_equal_weighted_return_rate(
+                            db_df, tickers, period_days, resample_weekly
+                        )
+
+                        if not ret_rate.empty:
+                            last_ret = ret_rate.iloc[-1]
+                            badge_t = "🟢" if last_ret >= 0 else "🔴"
+                            color_t = "#26a69a" if last_ret >= 0 else "#ef5350"
+
+                            hc1.markdown(
+                                f"<span style='font-size:0.9rem; font-weight:600; color:{color_t}'>"
+                                f"{badge_t} {t_name}</span>"
+                                f"<span style='font-size:0.8rem; color:{color_t}; margin-left:6px;'>リターン: {last_ret:+.2f}%</span>",
+                                unsafe_allow_html=True
+                            )
+
+                            # LWCにリターン率%（折れ線）、SMA、売買代金（ボリュームヒストグラム）を渡し描画
+                            render_lwc_sector_mini(
+                                ret_rate, sma_fast=sma75, sma_slow=sma200,
+                                wvf_lit=None, volume_series=total_val,  # 規格化指数のためWVF（買われすぎシグナル）はNone
+                                key=f"theme_ret_mini_{t_name}", height=150
+                            )
+                        else:
+                            st.caption("データなし")
+                    else:
+                        hc1.markdown(f"<span style='font-size:0.85rem; color:#9e9e9e;'>{t_name} (非表示)</span>", unsafe_allow_html=True)
+
+            THEME_GRID_COLS = n_cols
+            rows_theme = [theme_names[i:i + THEME_GRID_COLS] for i in range(0, len(theme_names), THEME_GRID_COLS)]
+            for row_themes in rows_theme:
+                row_cols = st.columns(THEME_GRID_COLS)
+                for ci, t_name in enumerate(row_themes):
+                    tickers = sectors_loaded[t_name]
+                    with row_cols[ci]:
+                        render_theme_card_fragment(t_name, tickers)
 
 # =========================================================================
 # 🇺🇸 米国株モード

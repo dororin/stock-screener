@@ -212,3 +212,80 @@ def compute_macro_cores_from_db(db_df: pd.DataFrame, period_days: int, resample_
         macro_cores[core_name] = core_index
         
     return macro_cores
+
+def compute_theme_equal_weighted_return_rate(
+    db_df: pd.DataFrame, 
+    tickers: list, 
+    period_days: int, 
+    resample_weekly: bool
+) -> tuple:
+    """
+    指定された構成銘柄（等金額投資）の、基準日（表示期間期首）からの
+    リターン率（％）を計算します。値がさ株に支配されないよう、期首価格で規格化します。
+    """
+    if db_df.empty or not tickers:
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+        
+    db_df = db_df.copy()
+    db_df["date"] = pd.to_datetime(db_df["date"]).dt.tz_localize(None)
+    
+    # 75SMA, 200SMAを計算するため、表示期間より365日前からデータを取得
+    end_date = db_df["date"].max()
+    fetch_start = end_date - timedelta(days=period_days + 365)
+    
+    target_df = db_df[(db_df["date"] >= fetch_start) & (db_df["ticker"].isin(tickers))].copy()
+    if target_df.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+
+    if "volume" in target_df.columns:
+        target_df["val"] = target_df["close"] * target_df["volume"]
+    else:
+        target_df["val"] = 0.0
+
+    close_pivot = target_df.pivot_table(index="date", columns="ticker", values="close").sort_index()
+    val_pivot = target_df.pivot_table(index="date", columns="ticker", values="val").sort_index()
+
+    if resample_weekly:
+        close_pivot = close_pivot.resample("W-FRI").last().ffill()
+        val_pivot = val_pivot.resample("W-FRI").sum().fillna(0)
+
+    if close_pivot.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+
+    # 規格化の基準日（表示開始日）を判定
+    display_start = end_date - timedelta(days=period_days)
+    
+    # 表示期間内の価格データを抽出
+    display_close = close_pivot[close_pivot.index >= display_start]
+    display_val = val_pivot[val_pivot.index >= display_start]
+    
+    if display_close.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+
+    # 基準日時点の株価（表示期間における各ティッカーの最初の有効価格）を100（0%）とする
+    # 途中上場（IPO）などの新規追加銘柄は、出現初日の株価を基準とします
+    base_prices = display_close.bfill().iloc[0]
+    base_prices = base_prices.apply(lambda x: x if (pd.notna(x) and x > 0) else np.nan)
+
+    # 規格化と平均算出
+    normalized_close = display_close.div(base_prices) * 100.0
+    index_series = normalized_close.mean(axis=1)
+    
+    # 基準日を 0% とするリターン率に変換
+    return_rate_series = index_series - 100.0
+
+    # リターン率時系列に対するSMA算出
+    # ※表示期間より前からデータを保持しているため、期間開始時点でもSMAが計算されます
+    # close_pivot全体を一度規格化してから表示期間にスライスします
+    all_normalized = close_pivot.div(base_prices) * 100.0 - 100.0
+    all_index_series = all_normalized.mean(axis=1)
+    
+    sma75 = all_index_series.rolling(window=75, min_periods=1).mean()
+    sma200 = all_index_series.rolling(window=200, min_periods=1).mean()
+
+    # 表示期間で再度スライスして出力
+    sma75 = sma75[sma75.index >= display_start]
+    sma200 = sma200[sma200.index >= display_start]
+    trading_val = display_val.sum(axis=1)
+
+    return return_rate_series, sma75, sma200, trading_val
