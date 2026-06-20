@@ -17,7 +17,8 @@ from core.calculator import (
     compute_sector_index_from_df,
     relativize_series,
     compute_sector_absolute_data,
-    get_benchmark_data
+    get_benchmark_data,
+    compute_theme_equal_weighted_return_rate
 )
 from utils.plotting import (
     render_lwc_rs_overlay,
