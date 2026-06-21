@@ -38,7 +38,7 @@ def load_unified_db(interval: str, is_jp: bool = True) -> pd.DataFrame:
 
 @st.fragment
 def _watchlist_ui():
-    """部分レンダリング（st.fragment）を利用した、ウォッチリストの個別登録・削除UIです [1]。"""
+    """部分レンダリング（st.fragment）を利用した、ウォッチリストの個別登録・削除UIです。"""
     st.divider()
     st.subheader("📌 ウォッチリスト")
 
@@ -173,7 +173,53 @@ bm_series = get_benchmark_data(bm_ticker, period_days, interval) if bm_ticker el
 # 🇯🇵 日本株モード
 # =========================================================================
 if is_jp:
-    # (中略: Layer 1 マクロコア、相対強度重ね合わせ比較チャート の描画処理の後)
+    # ─── 【復元】Layer 1: マクロコア、相対強度重ね合わせ比較チャートの描画処理 ───
+    overlay_series_cache = {}
+    
+    with st.spinner("重ね書きデータを算出中..."):
+        # 1. 5大マクロ・コアの算出と相対化
+        if overlay_target == "5大マクロ・コア":
+            cores = compute_macro_cores_from_db(db_df, period_days, resample_weekly)
+            for sname, idx_series in cores.items():
+                if not idx_series.empty:
+                    overlay_series_cache[sname] = relativize_series(idx_series, bm_series)
+                    
+        # 2. 17業種ETF の算出と相対化
+        elif overlay_target == "17業種 (個別)":
+            all_etf_codes = list(settings.TOPIX17_NAMES.keys())
+            for code in all_etf_codes:
+                idx_series = compute_sector_index_from_df(db_df, [code], period_days, resample_weekly)
+                if not idx_series.empty:
+                    name = settings.TOPIX17_NAMES.get(code, code)
+                    overlay_series_cache[name] = relativize_series(idx_series, bm_series)
+                    
+        # 3. 厳選テーマ (シートA) の算出と相対化
+        elif overlay_target == "厳選テーマ (シートA)":
+            sectors_loaded = load_sector_master_from_sheets(is_jp=True)
+            if sectors_loaded:
+                for t_name, tickers in sectors_loaded.items():
+                    idx_series = compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly)
+                    if not idx_series.empty:
+                        overlay_series_cache[t_name] = relativize_series(idx_series, bm_series)
+
+    # チャートの描画
+    if overlay_series_cache:
+        st.markdown(f"### 📊 セクター・テーマ相対強度（RS）重ね合わせ比較（{overlay_target}）")
+        all_target_names = list(overlay_series_cache.keys())
+        selected_targets = st.multiselect(
+            "表示するターゲットを選択",
+            options=all_target_names,
+            default=all_target_names[:min(6, len(all_target_names))],
+            key="jp_rs_overlay_multiselect"
+        )
+        render_lwc_rs_overlay(
+            sector_index_cache=overlay_series_cache,
+            selected_sectors=selected_targets,
+            height=450,
+            key="jp_rs_overlay_lwc"
+        )
+    else:
+        st.caption("重ね書きチャートのデータがありません")
 
     st.divider()
 
