@@ -212,8 +212,10 @@ def build_lwc_candle_chart(df: pd.DataFrame, sma_fast: pd.Series = None, sma_slo
 
     return {"chart": _lwc_base_options(height=height), "series": series}
 
-def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sma_slow: pd.Series = None, wvf_lit: pd.Series = None, volume_series: pd.Series = None, height: int = 160) -> dict:
-    """折れ線（セクター値など）＋移動平均2本＋合算売買代金のLWC構成定義を生成します。"""
+def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sma_slow: pd.Series = None, wvf_lit: pd.Series = None, volume_series = None, height: int = 160) -> dict:
+    """
+    折れ線（セクター値など）＋移動平均2本＋合算売買代金（または4ステージ出来高）のLWC構成定義を生成します。
+    """
     if price_series is None or price_series.empty:
         return {}
 
@@ -251,27 +253,42 @@ def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sm
             "options": {"color": "#ef5350", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
         })
 
-    if volume_series is not None and not volume_series.empty:
-        vol_times = _to_lwc_time(volume_series.index)
-        price_diff = price_series.diff()
-        
-        vol_data = []
-        for t, val, diff in zip(vol_times, volume_series.values, price_diff.values):
-            if pd.isna(val):
-                continue
-            color = "rgba(38, 166, 154, 0.25)" if (pd.isna(diff) or diff >= 0) else "rgba(239, 83, 80, 0.25)"
-            vol_data.append({"time": t, "value": float(val), "color": color})
+    # --- 出来高(Volume)オーバーレイ描画の分岐 ---
+    if volume_series is not None:
+        # パターンX: 4ステージ出来高（リスト形式の辞書データ）が直接渡された場合
+        if isinstance(volume_series, list):
+            series.append({
+                "type": "Histogram",
+                "data": volume_series,
+                "options": {
+                    "priceFormat": {"type": "volume"},
+                    "priceScaleId": "",  # overlayPriceScalesにマッピング
+                    "priceLineVisible": False,
+                    "lastValueVisible": False,
+                }
+            })
+        # パターンY: 従来の pd.Series（単純売買代金）が渡された場合
+        elif isinstance(volume_series, pd.Series) and not volume_series.empty:
+            vol_times = _to_lwc_time(volume_series.index)
+            price_diff = price_series.diff()
             
-        series.append({
-            "type": "Histogram",
-            "data": vol_data,
-            "options": {
-                "priceFormat": {"type": "volume"},
-                "priceScaleId": "",
-                "priceLineVisible": False,
-                "lastValueVisible": False,
-            }
-        })
+            vol_data = []
+            for t, val, diff in zip(vol_times, volume_series.values, price_diff.values):
+                if pd.isna(val):
+                    continue
+                color = "rgba(38, 166, 154, 0.25)" if (pd.isna(diff) or diff >= 0) else "rgba(239, 83, 80, 0.25)"
+                vol_data.append({"time": t, "value": float(val), "color": color})
+                
+            series.append({
+                "type": "Histogram",
+                "data": vol_data,
+                "options": {
+                    "priceFormat": {"type": "volume"},
+                    "priceScaleId": "",
+                    "priceLineVisible": False,
+                    "lastValueVisible": False,
+                }
+            })
 
     return {"chart": _lwc_base_options(height=height), "series": series}
 

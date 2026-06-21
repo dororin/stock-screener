@@ -1,9 +1,42 @@
 # core/calculator.py
 import pandas as pd
 import yfinance as yf
+import numpy as np  # npを明示的にインポート
+import streamlit as st  # キャッシュ処理 st.cache_data のためにインポート
 from datetime import datetime, timedelta
 from config import settings
 from data_access.local_db import load_price_db
+
+@st.cache_data(ttl=3600)
+def fetch_proxy_market_value(proxy_ticker: str, start_date: datetime, end_date: datetime) -> pd.Series:
+    """
+    市場全体の総売買代金の代理（プロキシ）として、1306.T や SPY の
+    過去売買代金（Close * Volume）をyfinanceから取得し、1時間キャッシュします。
+    """
+    try:
+        # 余裕を持って前後数日を余分に取得
+        df = yf.download(
+            proxy_ticker, 
+            start=start_date.strftime("%Y-%m-%d"), 
+            end=(end_date + timedelta(days=2)).strftime("%Y-%m-%d"), 
+            auto_adjust=True, 
+            progress=False
+        )
+        if df.empty:
+            return pd.Series(dtype=float)
+        
+        # カラム名の小文字化（MultiIndex対策含む）
+        df.columns = [str(c).lower() if not isinstance(c, tuple) else str(c[0]).lower() for c in df.columns]
+        df = df.reset_index()
+        date_col = "date" if "date" in df.columns else "datetime"
+        df = df.rename(columns={date_col: "date"})
+        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+        df = df.set_index("date").sort_index()
+        
+        # 売買代金（価格 * 出来高）の算出
+        return df["close"] * df["volume"]
+    except Exception:
+        return pd.Series(dtype=float)
 
 def compute_sector_index_from_df(db_df: pd.DataFrame, tickers: list, period_days: int, resample_weekly: bool) -> pd.Series:
     """指定された複数のティッカーの等金額分散投資指数を計算します。"""
@@ -217,26 +250,30 @@ def compute_theme_equal_weighted_return_rate(
     db_df: pd.DataFrame, 
     tickers: list, 
     period_days: int, 
-    resample_weekly: bool
+    resample_weekly: bool,
+    is_jp: bool = True  # 市場モード（日本株/米国株）を判定するため追加
 ) -> tuple:
     """
     指定された構成銘柄（等金額投資）の、基準日（表示期間期首）からの
     リターン率（％）を計算します。値がさ株に支配されないよう、期首価格で規格化します。
+    また、出来高乖離率（25日中央値）と売買代金シェア（1306/SPYプロキシ基準）から
+    4ステージ判定のLWC用出来高データを同時に生成します。
     """
     if db_df.empty or not tickers:
-        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), []
         
     db_df = db_df.copy()
     db_df["date"] = pd.to_datetime(db_df["date"]).dt.tz_localize(None)
     
-    # 75SMA, 200SMAを計算するため、表示期間より365日前からデータを取得
+    # 75SMA, 200SMAや出来高の25日中央値を正しく計算するため、表示期間より365日前からデータを取得
     end_date = db_df["date"].max()
     fetch_start = end_date - timedelta(days=period_days + 365)
     
     target_df = db_df[(db_df["date"] >= fetch_start) & (db_df["ticker"].isin(tickers))].copy()
     if target_df.empty:
-        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), []
 
+    # 各銘柄の個別売買代金（val）を計算
     if "volume" in target_df.columns:
         target_df["val"] = target_df["close"] * target_df["volume"]
     else:
@@ -250,42 +287,92 @@ def compute_theme_equal_weighted_return_rate(
         val_pivot = val_pivot.resample("W-FRI").sum().fillna(0)
 
     if close_pivot.empty:
-        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), []
 
     # 規格化の基準日（表示開始日）を判定
     display_start = end_date - timedelta(days=period_days)
     
-    # 表示期間内の価格データを抽出
+    # 表示期間内の価格データ・売買代金データを抽出
     display_close = close_pivot[close_pivot.index >= display_start]
     display_val = val_pivot[val_pivot.index >= display_start]
     
     if display_close.empty:
-        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), []
 
-    # 基準日時点の株価（表示期間における各ティッカーの最初の有効価格）を100（0%）とする
-    # 途中上場（IPO）などの新規追加銘柄は、出現初日の株価を基準とします
+    # 基準日時点の株価を100（0%）として規格化（既存ロジック）
     base_prices = display_close.bfill().iloc[0]
     base_prices = base_prices.apply(lambda x: x if (pd.notna(x) and x > 0) else np.nan)
 
-    # 規格化と平均算出
-    normalized_close = display_close.div(base_prices) * 100.0
-    index_series = normalized_close.mean(axis=1)
-    
     # 基準日を 0% とするリターン率に変換
-    return_rate_series = index_series - 100.0
-
-    # リターン率時系列に対するSMA算出
-    # ※表示期間より前からデータを保持しているため、期間開始時点でもSMAが計算されます
-    # close_pivot全体を一度規格化してから表示期間にスライスします
     all_normalized = close_pivot.div(base_prices) * 100.0 - 100.0
     all_index_series = all_normalized.mean(axis=1)
+    return_rate_series = all_index_series[all_index_series.index >= display_start]
     
+    # SMA算出
     sma75 = all_index_series.rolling(window=75, min_periods=1).mean()
     sma200 = all_index_series.rolling(window=200, min_periods=1).mean()
 
-    # 表示期間で再度スライスして出力
+    # 表示期間で再度スライス
     sma75 = sma75[sma75.index >= display_start]
     sma200 = sma200[sma200.index >= display_start]
-    trading_val = display_val.sum(axis=1)
 
-    return return_rate_series, sma75, sma200, trading_val
+    # =========================================================================
+    # 🔄 4ステージ出来高マトリクスの算出
+    # =========================================================================
+    # 1. 分母（市場総売買代金プロキシ）の取得
+    proxy_ticker = "1306.T" if is_jp else "SPY"
+    proxy_m_val = fetch_proxy_market_value(proxy_ticker, fetch_start, end_date)
+    
+    if resample_weekly and not proxy_m_val.empty:
+        proxy_m_val = proxy_m_val.resample("W-FRI").sum()
+
+    # 2. ② 出来高乖離率の平均 (VDR) の計算
+    # 各銘柄の、当日を除く過去25期間の売買代金「中央値」を算出して乖離率を出す（0除算回避）
+    vdr_df = pd.DataFrame(index=val_pivot.index)
+    for col in val_pivot.columns:
+        med = val_pivot[col].shift(1).rolling(window=25, min_periods=5).median()
+        vdr_df[col] = val_pivot[col] / med.replace(0, np.nan)
+    
+    theme_vdr = vdr_df.mean(axis=1).fillna(1.0) # テーマ内平均の乖離率
+
+    # 3. ③ 売買代金シェア (VS) の計算
+    theme_total_val = val_pivot.sum(axis=1) # テーマ構成銘柄の合計売買代金
+    if not proxy_m_val.empty:
+        # インデックスを同期
+        proxy_m_val_aligned = proxy_m_val.reindex(theme_total_val.index, method="ffill").bfill()
+        theme_vs = (theme_total_val / proxy_m_val_aligned.replace(0, np.nan)) * 100.0
+    else:
+        # 万が一プロキシ取得に失敗した場合は、合計売買代金をおおまかにスケーリングして表示
+        theme_vs = theme_total_val / 1e6
+
+    # シェアの20日移動平均 (VS_MA)
+    theme_vs_ma = theme_vs.rolling(window=20, min_periods=1).mean()
+
+    # 4. 表示期間でスライスしてマトリクス判定
+    display_vdr = theme_vdr[theme_vdr.index >= display_start]
+    display_vs = theme_vs[theme_vs.index >= display_start]
+    display_vs_ma = theme_vs_ma[theme_vs_ma.index >= display_start]
+
+    # LWC Histogram 用の辞書リスト構築
+    lwc_volume_data = []
+    for dt, vdr, vs, vs_ma in zip(display_vs.index, display_vdr, display_vs, display_vs_ma):
+        if pd.isna(vs):
+            continue
+        
+        # 4ステージ判定ロジック
+        if vdr >= 1.5 and vs >= vs_ma:
+            color = "rgba(239, 83, 80, 0.85)"      # ステージA: 赤 (初動・ブレイク)
+        elif vdr < 1.5 and vs >= vs_ma:
+            color = "rgba(38, 166, 154, 0.60)"     # ステージB: 緑 (巡航・新ステージ)
+        elif vdr < 1.5 and vs < vs_ma:
+            color = "rgba(128, 128, 128, 0.25)"    # ステージC: 灰 (冷え込み・手仕舞い)
+        else: # vdr >= 1.5 and vs < vs_ma
+            color = "rgba(255, 167, 38, 0.50)"     # ステージD: 黄 (地合い・一時的ノイズ)
+
+        lwc_volume_data.append({
+            "time": str(dt)[:10],
+            "value": float(round(vs, 4)),
+            "color": color
+        })
+
+    return return_rate_series, sma75, sma200, lwc_volume_data

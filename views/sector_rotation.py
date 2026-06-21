@@ -337,8 +337,9 @@ if is_jp:
 
                     if visible:
                         # 新規作成した値がさ株対応の等金額規格化リターン算出
+                        # 引数に `is_jp=is_jp` を渡すことで、計算ロジック側での1306/SPYの自動切替を有効化します
                         ret_rate, sma75, sma200, total_val = compute_theme_equal_weighted_return_rate(
-                            db_df, tickers, period_days, resample_weekly
+                            db_df, tickers, period_days, resample_weekly, is_jp=is_jp
                         )
 
                         if not ret_rate.empty:
@@ -354,9 +355,10 @@ if is_jp:
                             )
 
                             # LWCにリターン率%（折れ線）、SMA、売買代金（ボリュームヒストグラム）を渡し描画
+                            # 4ステージ判定による色分け情報(total_val)をvolume_seriesとして受け渡します
                             render_lwc_sector_mini(
                                 ret_rate, sma_fast=sma75, sma_slow=sma200,
-                                wvf_lit=None, volume_series=total_val,  # 規格化指数のためWVF（買われすぎシグナル）はNone
+                                wvf_lit=None, volume_series=total_val,  # 4ステージ色分けデータ(LWC用のdictリスト)
                                 key=f"theme_ret_mini_{t_name}", height=150
                             )
                         else:
