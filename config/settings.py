@@ -109,3 +109,6 @@ def setup_directories():
     return project_root, drive_path, work_path
 
 PROJECT_ROOT, DRIVE_DIR, WORK_DIR = setup_directories()
+
+# --- Solactive PCF CSV 設定 ---
+SOLACTIVE_PCF_BASE_URL = "https://www.solactive.com/downloads/etfservices/tse-pcf/single/"

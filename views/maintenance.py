@@ -259,6 +259,54 @@ with m_col2:
     
 st.divider()
 
+# --- 既存のコード（市場選択と最終更新日） ---
+m_col1, m_col2 = st.columns([1, 1])
+with m_col1:
+    market_mode = st.radio("対象市場の選択", ["日本株 🇯🇵", "米国株 🇺🇸"], horizontal=True)
+    is_jp = (market_mode == "日本株 🇯🇵")
+with m_col2:
+    last_date = get_db_last_update("1d", is_jp=is_jp)
+    st.metric(label="現在の 日足(1d) 最終更新日", value=last_date)
+    
+st.divider()
+
+# =====================================================================
+# 🔽 ここから今回追加する手動同期ボタンのコードを差し込みます
+# =====================================================================
+
+st.subheader("🔄 ETFセクター構成の同期（スプレッドシート連動）")
+st.write(
+    f"「{'sector_JP' if is_jp else 'sector_US'}」シート内のETFコードを自動スキャンし、"
+    "最新の構成銘柄リストに上書き同期します。（手動管理セクターは書き換えずに保護されます）"
+)
+if st.button("🚀 ETF構成銘柄を同期する", key="btn_sync_etf_master", use_container_width=True, type="primary"):
+    with st.spinner("スプレッドシートを更新中..."):
+        try:
+            # 新しい1枚完結の同期関数を呼び出す
+            from data_access.sheets_api import sync_etf_sectors_consolidated
+            results = sync_etf_sectors_consolidated(is_jp=is_jp)
+            
+            if "error" in results:
+                st.error(f"❌ 同期に失敗しました: {results['error']}")
+            elif "info" in results:
+                st.info(results["info"])
+            else:
+                sync_results = []
+                for theme_name, status in results.items():
+                    sync_results.append(f"• {theme_name}: {status}")
+                
+                st.success("✅ 同期が完了しました！\n\n" + "\n".join(sync_results))
+                time.sleep(1.0)
+                st.rerun()
+        except Exception as e:
+            st.error(f"❌ 同期中にエラーが発生しました: {e}")
+
+st.divider()
+
+# =====================================================================
+# 🔼 ここまで追加
+# =====================================================================
+
 # ETFマスタ管理
 render_etf_manager()
 

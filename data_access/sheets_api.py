@@ -252,3 +252,132 @@ def save_extra_tickers_to_sheets(df: pd.DataFrame):
         ws.update(rows, "A1")
     except Exception:
         pass
+
+def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
+    """
+    sector_JP (または sector_US) シートから「ETFコード」が書かれたセクターを自動検知し、
+    最新の構成銘柄をSolactiveから取得して、同一シートを部分上書き更新します。
+    手動管理されている他のセクター（自動車や電気機器など）は一切書き換えずに保護します。
+    
+    戻り値: {セクター名: 状態メッセージ} の辞書形式
+    """
+    sh = get_sector_spreadsheet()
+    if sh is None:
+        return {"error": "スプレッドシートを開けませんでした。"}
+        
+    sheet_name = "sector_JP" if is_jp else "sector_US"
+    try:
+        ws = sh.worksheet(sheet_name)
+    except Exception:
+        return {"error": f"'{sheet_name}' シートが見つかりません。"}
+        
+    # 1. 全レコードの読み込み
+    all_values = ws.get_all_values()
+    if not all_values or len(all_values) < 1:
+        return {"error": f"'{sheet_name}' シートが空です。ヘッダーを作成してください。"}
+        
+    headers = [str(h).strip() for h in all_values[0]]
+    
+    # 2. カラム位置の自動特定
+    col_sector = -1
+    col_code = -1
+    col_memo = -1
+    col_etf = -1
+    
+    for i, h in enumerate(headers):
+        if h in ["セクター名", "sector", "sector_name"]:
+            col_sector = i
+        elif h in ["銘柄コード", "code", "ticker", "コード"]:
+            col_code = i
+        elif h in ["備考", "memo"]:
+            col_memo = i
+        elif h in ["ETFコード", "etf", "etf_code"]:
+            col_etf = i
+            
+    if col_sector == -1 or col_code == -1:
+        return {"error": "必須カラム（セクター名、銘柄コード）がシート内に見つかりません。"}
+        
+    # ETFコード列がシートにない場合は、右端に自動作成します
+    if col_etf == -1:
+        headers.append("ETFコード")
+        col_etf = len(headers) - 1
+        all_values[0] = headers
+        ws.update([headers], "A1")
+        
+    # 3. データの解析（自動化したいセクターとETFのペアを抽出）
+    etf_mapping = {}  # {セクター名: ETFコード}
+    rows_data = []    # 読み込んだ元のデータを退避
+    
+    for row in all_values[1:]:
+        # 行の長さがヘッダーと合わない場合の補正
+        while len(row) < len(headers):
+            row.append("")
+            
+        sec_val = str(row[col_sector]).strip()
+        code_val = str(row[col_code]).strip()
+        memo_val = str(row[col_memo]).strip() if col_memo != -1 else ""
+        etf_val = str(row[col_etf]).strip()
+        
+        # 4桁のETFコードや、英数字(513A等)が記載されている場合のみマッピングに登録
+        if sec_val and etf_val:
+            etf_mapping[sec_val] = etf_val
+            
+        rows_data.append({
+            "sector": sec_val,
+            "code": code_val,
+            "memo": memo_val,
+            "etf": etf_val
+        })
+        
+    if not etf_mapping:
+        return {"info": "自動同期対象（ETFコードが記入されたセクター）が検出されませんでした。"}
+        
+    # 4. Solactiveからの最新データ取得とマージ処理
+    from core.collector import fetch_etf_constituents
+    
+    sync_results = {}
+    final_rows = []
+    
+    # 【ステップA】自動同期対象外（手動セクター）の行を無傷で残す
+    for r in rows_data:
+        if r["sector"] not in etf_mapping:
+            final_rows.append(r)
+            
+    # 【ステップB】自動同期対象のセクターについて、1件ずつ最新データをマージ
+    for sector_name, etf_code in etf_mapping.items():
+        constituents = fetch_etf_constituents(etf_code)
+        
+        # ダウンロードに失敗した場合の安全ガード（古いデータをそのまま復元して維持）
+        if not constituents:
+            sync_results[sector_name] = "通信エラー等のため既存データをそのまま維持"
+            for r in rows_data:
+                if r["sector"] == sector_name:
+                    final_rows.append(r)
+            continue
+            
+        # ダウンロードに成功した場合、最新の構成銘柄で展開
+        for code, name in constituents.items():
+            final_rows.append({
+                "sector": sector_name,
+                "code": code,
+                "memo": name,  # 備考欄に銘柄名を自動マッピング
+                "etf": etf_code
+            })
+        sync_results[sector_name] = f"同期成功 ({len(constituents)}銘柄)"
+        
+    # 5. スプレッドシートへの一括書き出し
+    output_values = [headers]
+    for r in final_rows:
+        row_out = [""] * len(headers)
+        row_out[col_sector] = r["sector"]
+        row_out[col_code] = r["code"]
+        if col_memo != -1:
+            row_out[col_memo] = r["memo"]
+        row_out[col_etf] = r["etf"]
+        output_values.append(row_out)
+        
+    # 衝突を避けるため、一度シートをクリアして全書き直し
+    ws.clear()
+    ws.update(output_values, "A1")
+    
+    return sync_results

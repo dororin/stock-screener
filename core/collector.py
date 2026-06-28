@@ -7,6 +7,56 @@ import yfinance as yf
 from datetime import datetime
 from config import settings
 from data_access.sheets_api import load_extra_tickers_from_sheets
+import io
+
+def fetch_etf_constituents(etf_code: str) -> dict:
+    """
+    SolactiveのPCF CSVから指定されたETFの構成銘柄（4桁コード: 銘柄名）を取得します。
+    """
+    base_url = getattr(settings, "SOLACTIVE_PCF_BASE_URL", "https://www.solactive.com/downloads/etfservices/tse-pcf/single/")
+    url = f"{base_url}{etf_code}.csv"
+    
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"❌ [fetch_etf_constituents] ダウンロード失敗 (コード: {etf_code}): {e}")
+        return {}
+    
+    try:
+        # 先頭2行（メタデータ）をスキップし、3行目をヘッダーとしてPandasで読み込む
+        df = pd.read_csv(io.StringIO(response.text), skiprows=2)
+        df.columns = [str(c).strip() for c in df.columns]
+        
+        # 'Code' と 'Name' に相当するカラムを抽出
+        code_col = None
+        name_col = None
+        for col in df.columns:
+            if col.lower() == 'code':
+                code_col = col
+            elif col.lower() == 'name':
+                name_col = col
+                
+        if not code_col or not name_col:
+            print(f"❌ [fetch_etf_constituents] 必要なカラム（Code / Name）が見つかりません。")
+            return {}
+            
+        result = {}
+        for _, row in df.iterrows():
+            code_raw = str(row[code_col]).strip()
+            # 小数点が入っている場合の除去 (例: "6723.0" -> "6723")
+            code = code_raw.split(".")[0]
+            name = str(row[name_col]).strip()
+            
+            # 英数字4桁を判定（防衛テック513A等の混在を許容するため、len=4で確認）
+            if code and len(code) == 4:
+                result[code] = name
+                
+        return result
+    except Exception as e:
+        print(f"❌ [fetch_etf_constituents] CSVパースエラー (コード: {etf_code}): {e}")
+        return {}
 
 def sanitize_ticker(ticker: str, is_jp: bool = True) -> str:
     """ティッカーシンボルを整形（サニタイズ）します。"""
