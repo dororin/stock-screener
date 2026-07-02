@@ -35,6 +35,27 @@ from core.database_service import (
     apply_all_saved_patches
 )
 
+# ── 安全なログ追記・保存ラッパー関数 ──
+def safe_append_and_save_repair_log(new_log_row: dict) -> bool:
+    """
+    スプレッドシートから既存の修復ログを一度ロードし、
+    新規ログを安全に結合（追記）した上でスプレッドシートに書き戻します。
+    """
+    try:
+        existing_df = load_repair_log_from_sheets()
+    except Exception:
+        existing_df = pd.DataFrame()
+
+    new_df = pd.DataFrame([new_log_row])
+
+    if not existing_df.empty:
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+    else:
+        combined_df = new_df
+
+    # 辞書のリストに変換して保存します
+    return save_repair_log_to_sheets(combined_df.to_dict(orient="records"))
+
 # ── 日足の最新更新日の簡易取得 ──
 def get_db_last_update(interval: str, is_jp: bool = True) -> str:
     try:
@@ -296,7 +317,6 @@ render_etf_manager()
 st.divider()
 
 # 【セクション1】 全体差分ダウンロード（自動権利落ち防衛）
-# ── 修正E/F: st.fragment化による部分更新 ＆ 同期ログのGoogleドライブ永続化 ──
 @st.fragment
 def render_full_sync_section(is_jp: bool):
     st.subheader("1️⃣ 全体差分ダウンロード（自動権利落ち防衛）")
@@ -306,7 +326,6 @@ def render_full_sync_section(is_jp: bool):
     )
 
     if st.button("🔄 全体差分ダウンロードを実行", key="btn_all_diff_update", type="primary"):
-        # 詳細ログをメモリに蓄積し、完了時に1回だけGoogleドライブへバッチアップロードする
         sync_log_lines = []
 
         status_box = st.status("📡 データベース全体差分同期中...", expanded=True)
@@ -355,23 +374,20 @@ def render_full_sync_section(is_jp: bool):
                     st.error(f"データベースの更新処理中に例外エラーが発生しました: {e}")
                     sync_log_lines.append(f"❌ エラーが発生しました: {e}")
                 finally:
-                    # ── 修正F: 蓄積した詳細ログをGoogleドライブへ1回だけバッチアップロード ──
                     try:
                         uploaded_name = upload_sync_log_to_drive(sync_log_lines, is_jp=is_jp, prefix="sync")
                         if uploaded_name:
                             st.caption(f"📝 同期ログを Google ドライブに保存しました: {uploaded_name}")
                     except Exception as log_e:
                         st.caption(f"⚠️ ログのドライブ保存に失敗しました: {log_e}")
-        # st.rerun() は廃止（部分更新フラグメントのため、ログ表示が消えずに画面上に残り続ける）
 
 render_full_sync_section(is_jp)
 
 st.divider()
 
-# ── 修正E: st.fragment化による部分更新（手動修復フォームのログ・結果表示を保持） ──
+# 【セクション3】手動ピンポイント一括安全修復
 @st.fragment
 def render_manual_repair_section(is_jp: bool):
-    # 【セクション3】手動ピンポイント一括安全修復
     st.subheader("3️⃣ 手動ピンポイント一括安全修復")
     st.write(
         "特定の銘柄においてデータの欠損や分割による不整合が発生した場合、既存データを破壊することなく、"
@@ -459,7 +475,6 @@ def render_manual_repair_section(is_jp: bool):
         
         rep_col3_btn = st.form_submit_button("🔧 安全一括修復を実行", type="primary")
 
-    # フォームが送信された直後のプログラム制御
     if rep_col3_btn:
         if not repair_confirm:
             st.error("❌ 誤動作・Enter誤送信防止用の安全ロックがかかっています。修復を実行するには、必ずフォーム内のチェックボックスをONにしてから実行してください。")
@@ -482,7 +497,7 @@ def render_manual_repair_section(is_jp: bool):
             pure_t = sanitize_ticker(rep_ticker, is_jp=is_jp)
             market_str = "JP" if is_jp else "US"
             
-            # ── パターンA: 崖日付と比率が明示的に入力された場合（手動ピンポイント一律調整） ──
+            # ── パターンA: 崖日付と比率が明示的に入力された場合（手動ピンポイント崖一律修復） ──
             if rep_date_str.strip() and rep_ratio_str.strip():
                 try:
                     multiplier = float(rep_ratio_str.strip())
@@ -518,13 +533,17 @@ def render_manual_repair_section(is_jp: bool):
                         "memo": "手動ピンポイント崖一律修復（パッチ定義）",
                     }
                     
-                    saved = save_repair_log_to_sheets([log_row])
+                    # 既存のログを破壊せずに追記保存
+                    saved = safe_append_and_save_repair_log(log_row)
                     if saved:
                         st.success("✅ パッチ定義をスプレッドシートに保存しました。次回ダウンロード・再構築時にも断絶事前チェック付きで自動適用されます。")
+                        # 画面上のログ一覧キャッシュを無効化
+                        if "repair_log_df" in st.session_state:
+                            st.session_state.repair_log_df = None
                     else:
                         st.warning("⚠️ 修復はParquetに適用されましたが、スプレッドシートへの保存に失敗しました。")
             
-            # ── パターンB: どちらも空白の場合（仕様書 4-②「個別銘柄ダウンロード・手動ピンポイント復元」） ──
+            # ── パターンB: どちらも空白の場合（個別銘柄ダウンロード復元） ──
             elif not rep_date_str.strip() and not rep_ratio_str.strip():
                 with st.spinner(f"🔧 [{pure_t}] の個別ダウンロード・手動ピンポイント復元を実行中..."):
                     results = repair_single_ticker_all_timeframes(
@@ -538,7 +557,7 @@ def render_manual_repair_section(is_jp: bool):
                         st.write(f"{icon} **{interval}**: {msg}")
                     
                     executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    save_repair_log_to_sheets([{
+                    log_row = {
                         "executed_at": executed_at,
                         "ticker": pure_t,
                         "market": market_str,
@@ -548,7 +567,12 @@ def render_manual_repair_section(is_jp: bool):
                         "after_close": "",
                         "multiplier": "",
                         "memo": "手動ピンポイント個別銘柄ダウンロード復元（1dクリーン・分足置換マージ）",
-                    }])
+                    }
+                    # 既存のログを破壊せずに追記保存
+                    safe_append_and_save_repair_log(log_row)
+                    # 画面上のログ一覧キャッシュを無効化
+                    if "repair_log_df" in st.session_state:
+                        st.session_state.repair_log_df = None
                     st.success("✅ 個別銘柄の復元および自動パッチの冪等再適用処理が完了しました。")
                     
             # ── パターンC: 片方のみ入力されている場合の安全ガード ──
@@ -599,11 +623,9 @@ if btn_delete_before:
                 icon = "✅" if "正常に" in msg else "ℹ️" if "なし" in msg else "⚠️"
                 st.write(f"{icon} **{interval}**: {msg}")
             
-            from datetime import datetime
-            from data_access.sheets_api import save_repair_log_to_sheets
             executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             market_str = "JP" if is_jp else "US"
-            save_repair_log_to_sheets([{
+            log_row = {
                 "executed_at": executed_at,
                 "ticker": pure_t,
                 "market": market_str,
@@ -613,9 +635,15 @@ if btn_delete_before:
                 "after_close": "",
                 "multiplier": "",
                 "memo": f"手動削除パッチ実行（指定日以前の全消去）",
-            }])
+            }
+            # 既存のログを破壊せずに追記保存
+            safe_append_and_save_repair_log(log_row)
+            # 画面上のログ一覧キャッシュを無効化
+            if "repair_log_df" in st.session_state:
+                st.session_state.repair_log_df = None
             st.success("✅ 削除処理とログの保存が正常に完了しました。")
 
+# ── 安全設計された「修復ログ一覧」（セッション状態保持 ＆ 列数エラー落ち防止） ──
 with st.expander("📋 修復ログ一覧", expanded=False):
     st.caption("スプレッドシートに保存された過去の修復履歴を表示します。")
     log_col1, log_col2 = st.columns([1, 1])
@@ -625,18 +653,38 @@ with st.expander("📋 修復ログ一覧", expanded=False):
         st.write(" ")
         btn_load_log = st.button("🔄 ログを読み込む", key="btn_load_log", use_container_width=True)
 
+    # セッションキーの初期化
+    if "repair_log_df" not in st.session_state:
+        st.session_state.repair_log_df = None
+
+    # ボタン押下時のみデータをロードしてセッションに退避
     if btn_load_log:
-        with st.spinner("ログを読み込み中..."):
-            log_df = load_repair_log_from_sheets()
+        with st.spinner("スプレッドシートから修復ログを読み込み中..."):
+            try:
+                log_df = load_repair_log_from_sheets()
+                if log_df is None:
+                    st.session_state.repair_log_df = pd.DataFrame()
+                else:
+                    st.session_state.repair_log_df = log_df
+            except Exception as e:
+                st.error(f"❌ スプレッドシートからのログ取得中にエラーが発生しました: {e}")
+                st.session_state.repair_log_df = pd.DataFrame()
+
+    # セッションデータが存在すれば、ページ再読み込み時（Rerun）でも常にテーブルを表示する
+    if st.session_state.repair_log_df is not None:
+        log_df = st.session_state.repair_log_df.copy()
 
         if log_df.empty:
-            st.info("修復ログがありません。")
+            st.info("ℹ️ 保存されている修復ログはありません。（スプレッドシートが空です）")
         else:
+            # 銘柄絞り込み（キャストして完全に一致を狙う）
             if log_ticker_filter.strip():
-                log_df = log_df[log_df["ticker"].astype(str).str.contains(log_ticker_filter.strip(), case=False, na=False)]
+                log_df["_ticker_str"] = log_df["ticker"].astype(str).str.strip()
+                log_df = log_df[log_df["_ticker_str"].str.contains(log_ticker_filter.strip(), case=False, na=False)]
+                log_df = log_df.drop(columns=["_ticker_str"])
 
             if log_df.empty:
-                st.info(f"「{log_ticker_filter}」のログはありません。")
+                st.info(f"🔍 「{log_ticker_filter}」に一致するログは見つかりませんでした。")
             else:
                 disp = log_df.copy()
                 if "executed_at" in disp.columns:
@@ -645,8 +693,30 @@ with st.expander("📋 修復ログ一覧", expanded=False):
                     disp["cliff_date"] = pd.to_datetime(disp["cliff_date"], errors="coerce").dt.strftime("%Y-%m-%d")
                 if "multiplier" in disp.columns:
                     disp["multiplier"] = pd.to_numeric(disp["multiplier"], errors="coerce").round(6)
-                disp.columns = ["実行日時", "銘柄", "市場", "崖日付", "適用時間足", "修正前終値", "修正後終値", "倍率", "備考"]
-                st.dataframe(disp, use_container_width=True, hide_index=True)
+
+                # 列数がズレていても絶対にクラッシュさせない安全マッピング方式
+                rename_map = {
+                    "executed_at": "実行日時",
+                    "ticker": "銘柄",
+                    "market": "市場",
+                    "cliff_date": "崖日付",
+                    "interval": "適用時間足",
+                    "before_close": "修正前終値",
+                    "after_close": "修正後終値",
+                    "multiplier": "倍率",
+                    "memo": "備考"
+                }
+                disp = disp.rename(columns=rename_map)
+                
+                # 推奨の表示構成に並び替え
+                preferred_order = ["実行日時", "銘柄", "市場", "崖日付", "適用時間足", "修正前終値", "修正後終値", "倍率", "備考"]
+                cols_to_show = [c for c in preferred_order if c in disp.columns]
+                
+                # 想定外のカラム構造でも生のカラムでフォールバックして表示
+                if not cols_to_show:
+                    cols_to_show = disp.columns.tolist()
+
+                st.dataframe(disp[cols_to_show], use_container_width=True, hide_index=True)
 
 # ── 手動パッチ全適用UIコンポーネント ──
 st.write(" ")
@@ -675,7 +745,6 @@ if st.button("🔄 保存されているすべてのパッチを一括再適用�
 st.divider()
 
 # 【セクション4】 全件一括フルダウンロード・再構築
-# ── 修正E/F: st.fragment化による部分更新 ＆ 再構築ログのGoogleドライブ永続化 ──
 @st.fragment
 def render_full_rebuild_section(is_jp: bool, market_mode: str):
     st.subheader("4️⃣ 全件一括フルダウンロード・再構築（初期化・デバッグ用）")
@@ -701,7 +770,6 @@ def render_full_rebuild_section(is_jp: bool, market_mode: str):
         )
         
     if btn_full_rebuild:
-        # 詳細ログをメモリに蓄積し、完了時に1回だけGoogleドライブへバッチアップロードする
         rebuild_log_lines = []
 
         status_box = st.status(f"📡 {market_mode} {rebuild_interval} データベースを一括クリーンビルド中...", expanded=True)
@@ -734,7 +802,6 @@ def render_full_rebuild_section(is_jp: bool, market_mode: str):
                 rebuild_log_lines.append(str(msg))
                 
             try:
-                # 内部で apply_all_saved_patches も自動的に呼び出されます
                 success = full_rebuild_all_database(
                     is_jp=is_jp, 
                     interval=rebuild_interval, 
@@ -752,14 +819,12 @@ def render_full_rebuild_section(is_jp: bool, market_mode: str):
                 st.error(f"再構築中に予期せぬエラーが発生しました: {e}")
                 rebuild_log_lines.append(f"❌ 再構築中に予期せぬエラーが発生しました: {e}")
             finally:
-                # ── 修正F: 蓄積した詳細ログをGoogleドライブへ1回だけバッチアップロード ──
                 try:
                     uploaded_name = upload_sync_log_to_drive(rebuild_log_lines, is_jp=is_jp, prefix="rebuild")
                     if uploaded_name:
                         st.caption(f"📝 再構築ログを Google ドライブに保存しました: {uploaded_name}")
                 except Exception as log_e:
                     st.caption(f"⚠️ ログのドライブ保存に失敗しました: {log_e}")
-        # st.rerun() は廃止（部分更新フラグメントのため、ログ表示が消えずに画面上に残り続ける）
 
 render_full_rebuild_section(is_jp, market_mode)
 
