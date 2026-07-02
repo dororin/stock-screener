@@ -12,7 +12,8 @@ from data_access.sheets_api import (
     load_extra_tickers_from_sheets,
     save_extra_tickers_to_sheets,
     load_repair_log_from_sheets,
-    save_repair_log_to_sheets
+    save_repair_log_to_sheets,
+    upload_sync_log_to_drive
 )
 from core.collector import (
     sync_extra_tickers_to_local,
@@ -295,239 +296,266 @@ render_etf_manager()
 st.divider()
 
 # 【セクション1】 全体差分ダウンロード（自動権利落ち防衛）
-st.subheader("1️⃣ 全体差分ダウンロード（自動権利落ち防衛）")
-st.write(
-    "最新日までの株価データを各時間足(1m, 5m, 60m, 1d)ごとに差分収集します。"
-    "配当金や株式分割などの権利落ちを自動検知すると、日足なら自動で過去全期間を再構築、短期足なら自動で価格比調整を実行します。"
-)
+# ── 修正E/F: st.fragment化による部分更新 ＆ 同期ログのGoogleドライブ永続化 ──
+@st.fragment
+def render_full_sync_section(is_jp: bool):
+    st.subheader("1️⃣ 全体差分ダウンロード（自動権利落ち防衛）")
+    st.write(
+        "最新日までの株価データを各時間足(1m, 5m, 60m, 1d)ごとに差分収集します。"
+        "配当金や株式分割などの権利落ちを自動検知すると、日足なら自動で過去全期間を再構築、短期足なら自動で価格比調整を実行します。"
+    )
 
-if st.button("🔄 全体差分ダウンロードを実行", key="btn_all_diff_update", type="primary"):
-    status_box = st.status("📡 データベース全体差分同期中...", expanded=True)
-    with status_box:
-        st.write("追加収集ティッカーのローカル同期を実行中...")
-        try:
-            sync_extra_tickers_to_local()
-            st.write("✅ ティッカーリストの同期に成功しました。")
-        except Exception as e:
-            st.write(f"⚠️ ティッカー同期スキップ（キャッシュを使用）: {e}")
-            
-        st.write("差分情報のスキャンと必要更新箇所の算出中...")
-        needs = analyze_db_update_needs(is_jp=is_jp)
-        
-        if needs.get("needs_period_update"):
-            st.write(f"⚠️ 3日以上のデータ未同期を検出（最新日: {needs['global_max_date']}）。更新を開始します...")
-        if needs.get("refetch_tickers"):
-            st.write(f"🔄 未確定データの再取得対象: {len(needs['refetch_tickers'])} 銘柄")
-        if needs.get("missing_tickers"):
-            st.write(f"➕ 新規取得対象: {len(needs['missing_tickers'])} 銘柄")
-        
-        st.write("各タイムフレームの差分取得タスクを開始します...")
-        
-        def update_status_on_screen(msg):
-            st.write(f"  * {msg}")
-            
-        with st.spinner("ダウンロード中..."):
+    if st.button("🔄 全体差分ダウンロードを実行", key="btn_all_diff_update", type="primary"):
+        # 詳細ログをメモリに蓄積し、完了時に1回だけGoogleドライブへバッチアップロードする
+        sync_log_lines = []
+
+        status_box = st.status("📡 データベース全体差分同期中...", expanded=True)
+        with status_box:
+            st.write("追加収集ティッカーのローカル同期を実行中...")
             try:
-                all_tickers = get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
-                update_price_database(
-                    is_jp=is_jp, 
-                    target_tickers=all_tickers, 
-                    status_callback=update_status_on_screen
-                )
-                
-                status_box.update(label="✅ 全体差分ダウンロード ＆ 補正適用完了！", state="complete")
-                st.success("すべてのデータベースが正常に同期され、手動修復パッチも断絶事前チェック付きで自動適用されました。")
-                time.sleep(0.5)
-                st.rerun()
+                sync_extra_tickers_to_local()
+                msg = "✅ ティッカーリストの同期に成功しました。"
+                st.write(msg); sync_log_lines.append(msg)
             except Exception as e:
-                status_box.update(label="❌ エラーが発生しました", state="error")
-                st.error(f"データベースの更新処理中に例外エラーが発生しました: {e}")
+                msg = f"⚠️ ティッカー同期スキップ（キャッシュを使用）: {e}"
+                st.write(msg); sync_log_lines.append(msg)
+
+            st.write("差分情報のスキャンと必要更新箇所の算出中...")
+            needs = analyze_db_update_needs(is_jp=is_jp)
+
+            if needs.get("needs_period_update"):
+                msg = f"⚠️ 3日以上のデータ未同期を検出（最新日: {needs['global_max_date']}）。更新を開始します..."
+                st.write(msg); sync_log_lines.append(msg)
+            if needs.get("refetch_tickers"):
+                msg = f"🔄 未確定データの再取得対象: {len(needs['refetch_tickers'])} 銘柄"
+                st.write(msg); sync_log_lines.append(msg)
+            if needs.get("missing_tickers"):
+                msg = f"➕ 新規取得対象: {len(needs['missing_tickers'])} 銘柄"
+                st.write(msg); sync_log_lines.append(msg)
+
+            st.write("各タイムフレームの差分取得タスクを開始します...")
+
+            def update_status_on_screen(msg):
+                st.write(f"  * {msg}")
+                sync_log_lines.append(str(msg))
+
+            with st.spinner("ダウンロード中..."):
+                try:
+                    all_tickers = get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
+                    update_price_database(
+                        is_jp=is_jp,
+                        target_tickers=all_tickers,
+                        status_callback=update_status_on_screen
+                    )
+
+                    status_box.update(label="✅ 全体差分ダウンロード ＆ 補正適用完了！", state="complete")
+                    st.success("すべてのデータベースが正常に同期され、手動修復パッチも断絶事前チェック付きで自動適用されました。")
+                except Exception as e:
+                    status_box.update(label="❌ エラーが発生しました", state="error")
+                    st.error(f"データベースの更新処理中に例外エラーが発生しました: {e}")
+                    sync_log_lines.append(f"❌ エラーが発生しました: {e}")
+                finally:
+                    # ── 修正F: 蓄積した詳細ログをGoogleドライブへ1回だけバッチアップロード ──
+                    try:
+                        uploaded_name = upload_sync_log_to_drive(sync_log_lines, is_jp=is_jp, prefix="sync")
+                        if uploaded_name:
+                            st.caption(f"📝 同期ログを Google ドライブに保存しました: {uploaded_name}")
+                    except Exception as log_e:
+                        st.caption(f"⚠️ ログのドライブ保存に失敗しました: {log_e}")
+        # st.rerun() は廃止（部分更新フラグメントのため、ログ表示が消えずに画面上に残り続ける）
+
+render_full_sync_section(is_jp)
 
 st.divider()
 
-# 【セクション3】手動ピンポイント一括安全修復
-st.subheader("3️⃣ 手動ピンポイント一括安全修復")
-st.write(
-    "特定の銘柄においてデータの欠損や分割による不整合が発生した場合、既存データを破壊することなく、"
-    "すべての時間足（1d, 60m, 5m, 1m）に対して治療を実行します。修正開始日と修正比率を「両方とも空欄」にして実行した場合、"
-    "1dは全歴史ダウンロード、短期足は取得限界を安全に部分置換マージ（個別銘柄ダウンロード復元）します。"
-    "保存済みの手動パッチは断絶事前チェック付きで適用されるため、既に平らな時間足には二重適用されません。"
-)
-
-with st.expander("🔍 異常データスキャン（修復対象の特定）", expanded=False):
-    st.caption("全銘柄の日足DBをスキャンして35%以上の急変箇所を検出します。")
-    if st.button("🔍 異常スキャン実行", key="btn_anomaly_scan"):
-        with st.spinner("全銘柄をスキャン中..."):
-            anomalies = scan_all_anomalies(is_jp=is_jp, interval="1d")
-        if anomalies.empty:
-            st.success("✅ 異常箇所は検出されませんでした。")
-        else:
-            st.warning(f"⚠️ {len(anomalies)}件の異常箇所を検出（{anomalies['ticker'].nunique()}銘柄）")
-            display_df = anomalies.copy()
-            if "cliff_date" in display_df.columns:
-                display_df["cliff_date"] = pd.to_datetime(display_df["cliff_date"]).dt.strftime("%Y-%m-%d")
-            
-            if "pct_change" in display_df.columns:
-                display_df["pct_change"] = display_df["pct_change"].apply(
-                    lambda x: f"{x*100:.1f}%" if pd.notna(x) else "－"
-                )
-            
-            if "est_multiplier" in display_df.columns:
-                display_df["est_multiplier"] = display_df["est_multiplier"].apply(
-                    lambda x: f"{x:.8f}".rstrip('0').rstrip('.') if pd.notna(x) else "－"
-                )
-
-            rename_map = {
-                "ticker": "銘柄",
-                "cliff_date": "崖日付",
-                "est_multiplier": "推測修正比率 (当日÷1日前)",
-                "pct_change": "変化率",
-                "before_close": "1日前 Close",
-                "after_close": "Close",
-                "before_adj_close": "1日前 Adj Close",
-                "after_adj_close": "Adj Close",
-                "open": "Open",
-                "high": "High",
-                "low": "Low",
-                "volume": "Volume"
-            }
-            display_df = display_df.rename(columns=rename_map)
-            
-            col_order = [
-                "銘柄", "崖日付", "推測修正比率 (当日÷1日前)", "変化率", 
-                "1日前 Close", "Close", "1日前 Adj Close", "Adj Close", 
-                "Open", "High", "Low", "Volume"
-            ]
-            valid_cols = [c for c in col_order if c in display_df.columns]
-            st.dataframe(display_df[valid_cols], use_container_width=True, hide_index=True)
-
-st.write(" ")
-
-# UI入力欄
-with st.form(key="safe_repair_form"):
-    col_t1, col_t2, col_t3 = st.columns(3)
-    with col_t1:
-        rep_ticker = st.text_input(
-            "銘柄コード", 
-            placeholder="例:1629（.T不要）", 
-            key="rep_ticker_box"
-        )
-    with col_t2:
-        rep_date_str = st.text_input(
-            "修正開始日", 
-            placeholder="空白で個別ダウンロード復元", 
-            key="rep_date_box"
-        )
-    with col_t3:
-        rep_ratio_str = st.text_input(
-            "修正比率", 
-            placeholder="空白で個別ダウンロード復元", 
-            key="rep_ratio_box"
-        )
-    
-    repair_confirm = st.checkbox(
-        "⚠️ 入力内容が適正であることを確認しました（Enter誤送信防止用の安全ロック解除）", 
-        value=False, 
-        key="chk_repair_confirm"
+# ── 修正E: st.fragment化による部分更新（手動修復フォームのログ・結果表示を保持） ──
+@st.fragment
+def render_manual_repair_section(is_jp: bool):
+    # 【セクション3】手動ピンポイント一括安全修復
+    st.subheader("3️⃣ 手動ピンポイント一括安全修復")
+    st.write(
+        "特定の銘柄においてデータの欠損や分割による不整合が発生した場合、既存データを破壊することなく、"
+        "すべての時間足（1d, 60m, 5m, 1m）に対して治療を実行します。修正開始日と修正比率を「両方とも空欄」にして実行した場合、"
+        "1dは全歴史ダウンロード、短期足は取得限界を安全に部分置換マージ（個別銘柄ダウンロード復元）します。"
+        "保存済みの手動パッチは断絶事前チェック付きで適用されるため、既に平らな時間足には二重適用されません。"
     )
-    
-    rep_col3_btn = st.form_submit_button("🔧 安全一括修復を実行", type="primary")
 
-# フォームが送信された直後のプログラム制御
-if rep_col3_btn:
-    if not repair_confirm:
-        st.error("❌ 誤動作・Enter誤送信防止用の安全ロックがかかっています。修復を実行するには、必ずフォーム内のチェックボックスをONにしてから実行してください。")
-        st.stop()
-
-    if not rep_ticker:
-        st.error("銘柄コードが入力されていません。")
-    else:
-        # 🛡️ 安全ガード：修正比率のゼロ以下を遮断
-        if rep_ratio_str.strip():
-            try:
-                temp_ratio = float(rep_ratio_str.strip())
-                if temp_ratio <= 0:
-                    st.error(f"❌ 危険防止のため、修正比率に 0 以下の数値（指定値: {temp_ratio}）を設定することはできません。")
-                    st.stop()
-            except ValueError:
-                st.error("修正比率には有効な数値を入力してください。")
-                st.stop()
-
-        pure_t = sanitize_ticker(rep_ticker, is_jp=is_jp)
-        market_str = "JP" if is_jp else "US"
-        
-        # ── パターンA: 崖日付と比率が明示的に入力された場合（手動ピンポイント一律調整） ──
-        if rep_date_str.strip() and rep_ratio_str.strip():
-            try:
-                multiplier = float(rep_ratio_str.strip())
-                cliff_dt = pd.to_datetime(rep_date_str.strip())
-                cliff_dt_str = cliff_dt.strftime("%Y-%m-%d")
-            except Exception as e:
-                st.error(f"崖日付、または補正倍率の形式が不正です: {e}")
-                st.stop()
+    with st.expander("🔍 異常データスキャン（修復対象の特定）", expanded=False):
+        st.caption("全銘柄の日足DBをスキャンして35%以上の急変箇所を検出します。")
+        if st.button("🔍 異常スキャン実行", key="btn_anomaly_scan"):
+            with st.spinner("全銘柄をスキャン中..."):
+                anomalies = scan_all_anomalies(is_jp=is_jp, interval="1d")
+            if anomalies.empty:
+                st.success("✅ 異常箇所は検出されませんでした。")
+            else:
+                st.warning(f"⚠️ {len(anomalies)}件の異常箇所を検出（{anomalies['ticker'].nunique()}銘柄）")
+                display_df = anomalies.copy()
+                if "cliff_date" in display_df.columns:
+                    display_df["cliff_date"] = pd.to_datetime(display_df["cliff_date"]).dt.strftime("%Y-%m-%d")
                 
-            with st.spinner(f"🔧 [{pure_t}] の {cliff_dt_str} 以前を一律 {multiplier} 倍に補正調整中..."):
-                results = apply_forced_scale_patch_to_all_timeframes(
-                    pure_t, 
-                    cliff_dt_str, 
-                    multiplier, 
-                    is_jp=is_jp
-                )
+                if "pct_change" in display_df.columns:
+                    display_df["pct_change"] = display_df["pct_change"].apply(
+                        lambda x: f"{x*100:.1f}%" if pd.notna(x) else "－"
+                    )
                 
-                st.write("### 📋 手動修復適用レポート:")
-                for interval, msg in results.items():
-                    icon = "✅" if "補正適用完了" in msg else "ℹ️" if "スキップ" in msg else "⚠️"
-                    st.write(f"{icon} **{interval}**: {msg}")
-                    
-                executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                log_row = {
-                    "executed_at": executed_at,
-                    "ticker": pure_t,
-                    "market": market_str,
-                    "cliff_date": cliff_dt_str,
-                    "interval": "all",
-                    "before_close": "", 
-                    "after_close": "",
-                    "multiplier": multiplier,
-                    "memo": "手動ピンポイント崖一律修復（パッチ定義）",
+                if "est_multiplier" in display_df.columns:
+                    display_df["est_multiplier"] = display_df["est_multiplier"].apply(
+                        lambda x: f"{x:.8f}".rstrip('0').rstrip('.') if pd.notna(x) else "－"
+                    )
+
+                rename_map = {
+                    "ticker": "銘柄",
+                    "cliff_date": "崖日付",
+                    "est_multiplier": "推測修正比率 (当日÷1日前)",
+                    "pct_change": "変化率",
+                    "before_close": "1日前 Close",
+                    "after_close": "Close",
+                    "before_adj_close": "1日前 Adj Close",
+                    "after_adj_close": "Adj Close",
+                    "open": "Open",
+                    "high": "High",
+                    "low": "Low",
+                    "volume": "Volume"
                 }
+                display_df = display_df.rename(columns=rename_map)
                 
-                saved = save_repair_log_to_sheets([log_row])
-                if saved:
-                    st.success("✅ パッチ定義をスプレッドシートに保存しました。次回ダウンロード・再構築時にも断絶事前チェック付きで自動適用されます。")
-                else:
-                    st.warning("⚠️ 修復はParquetに適用されましたが、スプレッドシートへの保存に失敗しました。")
+                col_order = [
+                    "銘柄", "崖日付", "推測修正比率 (当日÷1日前)", "変化率", 
+                    "1日前 Close", "Close", "1日前 Adj Close", "Adj Close", 
+                    "Open", "High", "Low", "Volume"
+                ]
+                valid_cols = [c for c in col_order if c in display_df.columns]
+                st.dataframe(display_df[valid_cols], use_container_width=True, hide_index=True)
+
+    st.write(" ")
+
+    # UI入力欄
+    with st.form(key="safe_repair_form"):
+        col_t1, col_t2, col_t3 = st.columns(3)
+        with col_t1:
+            rep_ticker = st.text_input(
+                "銘柄コード", 
+                placeholder="例:1629（.T不要）", 
+                key="rep_ticker_box"
+            )
+        with col_t2:
+            rep_date_str = st.text_input(
+                "修正開始日", 
+                placeholder="空白で個別ダウンロード復元", 
+                key="rep_date_box"
+            )
+        with col_t3:
+            rep_ratio_str = st.text_input(
+                "修正比率", 
+                placeholder="空白で個別ダウンロード復元", 
+                key="rep_ratio_box"
+            )
         
-        # ── パターンB: どちらも空白の場合（仕様書 4-②「個別銘柄ダウンロード・手動ピンポイント復元」） ──
-        elif not rep_date_str.strip() and not rep_ratio_str.strip():
-            with st.spinner(f"🔧 [{pure_t}] の個別ダウンロード・手動ピンポイント復元を実行中..."):
-                results = repair_single_ticker_all_timeframes(
-                    pure_t,
-                    is_jp=is_jp
-                )
-                
-                st.write("### 📋 個別銘柄復元レポート:")
-                for interval, msg in results.items():
-                    icon = "✅" if "成功" in msg or "再構築" in msg else "⚠️"
-                    st.write(f"{icon} **{interval}**: {msg}")
-                
-                executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                save_repair_log_to_sheets([{
-                    "executed_at": executed_at,
-                    "ticker": pure_t,
-                    "market": market_str,
-                    "cliff_date": "",
-                    "interval": "all",
-                    "before_close": "",
-                    "after_close": "",
-                    "multiplier": "",
-                    "memo": "手動ピンポイント個別銘柄ダウンロード復元（1dクリーン・分足置換マージ）",
-                }])
-                st.success("✅ 個別銘柄の復元および自動パッチの冪等再適用処理が完了しました。")
-                
-        # ── パターンC: 片方のみ入力されている場合の安全ガード ──
+        repair_confirm = st.checkbox(
+            "⚠️ 入力内容が適正であることを確認しました（Enter誤送信防止用の安全ロック解除）", 
+            value=False, 
+            key="chk_repair_confirm"
+        )
+        
+        rep_col3_btn = st.form_submit_button("🔧 安全一括修復を実行", type="primary")
+
+    # フォームが送信された直後のプログラム制御
+    if rep_col3_btn:
+        if not repair_confirm:
+            st.error("❌ 誤動作・Enter誤送信防止用の安全ロックがかかっています。修復を実行するには、必ずフォーム内のチェックボックスをONにしてから実行してください。")
+            st.stop()
+
+        if not rep_ticker:
+            st.error("銘柄コードが入力されていません。")
         else:
-            st.error("❌ 「修正開始日」と「修正比率」は、【両方入力する】（崖修正パッチの登録）か、【両方とも空欄にする】（個別銘柄ダウンロード復元）のいずれかのみ有効です。")
+            # 🛡️ 安全ガード：修正比率のゼロ以下を遮断
+            if rep_ratio_str.strip():
+                try:
+                    temp_ratio = float(rep_ratio_str.strip())
+                    if temp_ratio <= 0:
+                        st.error(f"❌ 危険防止のため、修正比率に 0 以下の数値（指定値: {temp_ratio}）を設定することはできません。")
+                        st.stop()
+                except ValueError:
+                    st.error("修正比率には有効な数値を入力してください。")
+                    st.stop()
+
+            pure_t = sanitize_ticker(rep_ticker, is_jp=is_jp)
+            market_str = "JP" if is_jp else "US"
+            
+            # ── パターンA: 崖日付と比率が明示的に入力された場合（手動ピンポイント一律調整） ──
+            if rep_date_str.strip() and rep_ratio_str.strip():
+                try:
+                    multiplier = float(rep_ratio_str.strip())
+                    cliff_dt = pd.to_datetime(rep_date_str.strip())
+                    cliff_dt_str = cliff_dt.strftime("%Y-%m-%d")
+                except Exception as e:
+                    st.error(f"崖日付、または補正倍率の形式が不正です: {e}")
+                    st.stop()
+                    
+                with st.spinner(f"🔧 [{pure_t}] の {cliff_dt_str} 以前を一律 {multiplier} 倍に補正調整中..."):
+                    results = apply_forced_scale_patch_to_all_timeframes(
+                        pure_t, 
+                        cliff_dt_str, 
+                        multiplier, 
+                        is_jp=is_jp
+                    )
+                    
+                    st.write("### 📋 手動修復適用レポート:")
+                    for interval, msg in results.items():
+                        icon = "✅" if "補正適用完了" in msg else "ℹ️" if "スキップ" in msg else "⚠️"
+                        st.write(f"{icon} **{interval}**: {msg}")
+                        
+                    executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    log_row = {
+                        "executed_at": executed_at,
+                        "ticker": pure_t,
+                        "market": market_str,
+                        "cliff_date": cliff_dt_str,
+                        "interval": "all",
+                        "before_close": "", 
+                        "after_close": "",
+                        "multiplier": multiplier,
+                        "memo": "手動ピンポイント崖一律修復（パッチ定義）",
+                    }
+                    
+                    saved = save_repair_log_to_sheets([log_row])
+                    if saved:
+                        st.success("✅ パッチ定義をスプレッドシートに保存しました。次回ダウンロード・再構築時にも断絶事前チェック付きで自動適用されます。")
+                    else:
+                        st.warning("⚠️ 修復はParquetに適用されましたが、スプレッドシートへの保存に失敗しました。")
+            
+            # ── パターンB: どちらも空白の場合（仕様書 4-②「個別銘柄ダウンロード・手動ピンポイント復元」） ──
+            elif not rep_date_str.strip() and not rep_ratio_str.strip():
+                with st.spinner(f"🔧 [{pure_t}] の個別ダウンロード・手動ピンポイント復元を実行中..."):
+                    results = repair_single_ticker_all_timeframes(
+                        pure_t,
+                        is_jp=is_jp
+                    )
+                    
+                    st.write("### 📋 個別銘柄復元レポート:")
+                    for interval, msg in results.items():
+                        icon = "✅" if "成功" in msg or "再構築" in msg else "⚠️"
+                        st.write(f"{icon} **{interval}**: {msg}")
+                    
+                    executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    save_repair_log_to_sheets([{
+                        "executed_at": executed_at,
+                        "ticker": pure_t,
+                        "market": market_str,
+                        "cliff_date": "",
+                        "interval": "all",
+                        "before_close": "",
+                        "after_close": "",
+                        "multiplier": "",
+                        "memo": "手動ピンポイント個別銘柄ダウンロード復元（1dクリーン・分足置換マージ）",
+                    }])
+                    st.success("✅ 個別銘柄の復元および自動パッチの冪等再適用処理が完了しました。")
+                    
+            # ── パターンC: 片方のみ入力されている場合の安全ガード ──
+            else:
+                st.error("❌ 「修正開始日」と「修正比率」は、【両方入力する】（崖修正パッチの登録）か、【両方とも空欄にする】（個別銘柄ダウンロード復元）のいずれかのみ有効です。")
+
+render_manual_repair_section(is_jp)
 
 st.write(" ")
 st.divider()
@@ -647,71 +675,93 @@ if st.button("🔄 保存されているすべてのパッチを一括再適用�
 st.divider()
 
 # 【セクション4】 全件一括フルダウンロード・再構築
-st.subheader("4️⃣ 全件一括フルダウンロード・再構築（初期化・デバッグ用）")
-st.write(
-    "既存データベースを一度完全に削除し、yfinanceの提供限界から一発でフル構築し直す「白紙初期化ボタン」です。"
-)
+# ── 修正E/F: st.fragment化による部分更新 ＆ 再構築ログのGoogleドライブ永続化 ──
+@st.fragment
+def render_full_rebuild_section(is_jp: bool, market_mode: str):
+    st.subheader("4️⃣ 全件一括フルダウンロード・再構築（初期化・デバッグ用）")
+    st.write(
+        "既存データベースを一度完全に削除し、yfinanceの提供限界から一発でフル構築し直す「白紙初期化ボタン」です。"
+    )
 
-fb_col1, fb_col2 = st.columns([2, 1])
-with fb_col1:
-    rebuild_interval = st.selectbox(
-        "一括再構築する時間足（タイムフレーム）を選択してください", 
-        ["1m", "5m", "60m", "1d"], 
-        index=3, 
-        key="rebuild_interval_select"
-    )
-with fb_col2:
-    st.write(" ")
-    st.write(" ")
-    btn_full_rebuild = st.button(
-        "💥 一括フルダウンロードを実行", 
-        use_container_width=True, 
-        type="primary"
-    )
-    
-if btn_full_rebuild:
-    status_box = st.status(f"📡 {market_mode} {rebuild_interval} データベースを一括クリーンビルド中...", expanded=True)
-    with status_box:
-        st.write("🔄 **スプレッドシートから最新ティッカーの同期を試行します**")
-        codes_in_json, sync_error = sync_extra_tickers_to_local()
-        if sync_error:
-            st.error(f"  * ❌ 同期に失敗しました: {sync_error}")
-        else:
-            st.success(f"  * ✅ 同期に成功しました。追加ティッカー数: {len(codes_in_json)} 件")
+    fb_col1, fb_col2 = st.columns([2, 1])
+    with fb_col1:
+        rebuild_interval = st.selectbox(
+            "一括再構築する時間足（タイムフレーム）を選択してください", 
+            ["1m", "5m", "60m", "1d"], 
+            index=3, 
+            key="rebuild_interval_select"
+        )
+    with fb_col2:
+        st.write(" ")
+        st.write(" ")
+        btn_full_rebuild = st.button(
+            "💥 一括フルダウンロードを実行", 
+            use_container_width=True, 
+            type="primary"
+        )
         
-        st.write("既存のParquetファイルをクリア中...")
-        filename = f"price_{'jp' if is_jp else 'us'}_{rebuild_interval}.parquet"
-        work_file = os.path.join(settings.WORK_DIR, filename)
-        if os.path.exists(work_file):
-            try:
-                os.remove(work_file)
-                st.write("🗑️ 既存ファイルを正常に削除しました。")
-            except Exception as e:
-                st.write(f"⚠️ 既存ファイルの削除に失敗: {e}")
-        
-        st.write("yfinanceからバッチダウンロードを開始します...")
-        
-        def update_rebuild_status(msg):
-            st.write(msg)
-            
-        try:
-            # 内部で apply_all_saved_patches も自動的に呼び出されます
-            success = full_rebuild_all_database(
-                is_jp=is_jp, 
-                interval=rebuild_interval, 
-                status_callback=update_rebuild_status
-            )
-            if success:
-                status_box.update(label="✅ 一括フルダウンロード ＆ 補正適用完了！", state="complete")
-                st.success(f"{rebuild_interval} データベースの再構築と、断絶事前チェックによるパッチ復元が正常に完了しました。")
-                time.sleep(0.5)
-                st.rerun()
+    if btn_full_rebuild:
+        # 詳細ログをメモリに蓄積し、完了時に1回だけGoogleドライブへバッチアップロードする
+        rebuild_log_lines = []
+
+        status_box = st.status(f"📡 {market_mode} {rebuild_interval} データベースを一括クリーンビルド中...", expanded=True)
+        with status_box:
+            st.write("🔄 **スプレッドシートから最新ティッカーの同期を試行します**")
+            codes_in_json, sync_error = sync_extra_tickers_to_local()
+            if sync_error:
+                msg = f"  * ❌ 同期に失敗しました: {sync_error}"
+                st.error(msg); rebuild_log_lines.append(msg)
             else:
-                status_box.update(label="❌ ダウンロード失敗", state="error")
-                st.error("データを取得できませんでした。")
-        except Exception as e:
-            status_box.update(label="❌ エラー発生", state="error")
-            st.error(f"再構築中に予期せぬエラーが発生しました: {e}")
+                msg = f"  * ✅ 同期に成功しました。追加ティッカー数: {len(codes_in_json)} 件"
+                st.success(msg); rebuild_log_lines.append(msg)
+            
+            st.write("既存のParquetファイルをクリア中...")
+            filename = f"price_{'jp' if is_jp else 'us'}_{rebuild_interval}.parquet"
+            work_file = os.path.join(settings.WORK_DIR, filename)
+            if os.path.exists(work_file):
+                try:
+                    os.remove(work_file)
+                    msg = "🗑️ 既存ファイルを正常に削除しました。"
+                    st.write(msg); rebuild_log_lines.append(msg)
+                except Exception as e:
+                    msg = f"⚠️ 既存ファイルの削除に失敗: {e}"
+                    st.write(msg); rebuild_log_lines.append(msg)
+            
+            st.write("yfinanceからバッチダウンロードを開始します...")
+            
+            def update_rebuild_status(msg):
+                st.write(msg)
+                rebuild_log_lines.append(str(msg))
+                
+            try:
+                # 内部で apply_all_saved_patches も自動的に呼び出されます
+                success = full_rebuild_all_database(
+                    is_jp=is_jp, 
+                    interval=rebuild_interval, 
+                    status_callback=update_rebuild_status
+                )
+                if success:
+                    status_box.update(label="✅ 一括フルダウンロード ＆ 補正適用完了！", state="complete")
+                    st.success(f"{rebuild_interval} データベースの再構築と、断絶事前チェックによるパッチ復元が正常に完了しました。")
+                else:
+                    status_box.update(label="❌ ダウンロード失敗", state="error")
+                    st.error("データを取得できませんでした。")
+                    rebuild_log_lines.append("❌ データを取得できませんでした。")
+            except Exception as e:
+                status_box.update(label="❌ エラー発生", state="error")
+                st.error(f"再構築中に予期せぬエラーが発生しました: {e}")
+                rebuild_log_lines.append(f"❌ 再構築中に予期せぬエラーが発生しました: {e}")
+            finally:
+                # ── 修正F: 蓄積した詳細ログをGoogleドライブへ1回だけバッチアップロード ──
+                try:
+                    uploaded_name = upload_sync_log_to_drive(rebuild_log_lines, is_jp=is_jp, prefix="rebuild")
+                    if uploaded_name:
+                        st.caption(f"📝 再構築ログを Google ドライブに保存しました: {uploaded_name}")
+                except Exception as log_e:
+                    st.caption(f"⚠️ ログのドライブ保存に失敗しました: {log_e}")
+        # st.rerun() は廃止（部分更新フラグメントのため、ログ表示が消えずに画面上に残り続ける）
+
+render_full_rebuild_section(is_jp, market_mode)
 
 # 健康診断UIの表示
 render_database_diagnostics_ui(is_jp=is_jp)

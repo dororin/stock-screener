@@ -2,14 +2,57 @@
 import os
 import time
 import pandas as pd
+import pytz
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from config import settings
 from data_access.local_db import load_price_db, save_price_db
 from core.collector import (
     sanitize_ticker, get_download_symbol, get_all_collection_tickers,
     get_benchmark_latest_date, parse_yfinance_batch
 )
+
+# --- yfinanceが取得可能な期間の上限（日数） ---
+YFINANCE_GAP_LIMITS = {"1m": 7, "5m": 60, "60m": 730}
+
+def get_market_localized_now(is_jp: bool = True):
+    """
+    市場モード（is_jp）に基づき、Asia/Tokyo（日本株）または America/New_York（米国株）の
+    タイムゾーンにローカライズされた現在時刻（now_tz）と、本日日付（local_today）を返します。
+    サーバーがUTC等の別タイムゾーンで動作していても、常に市場基準のローカル時刻を得られます。
+    """
+    tz = pytz.timezone("Asia/Tokyo") if is_jp else pytz.timezone("America/New_York")
+    now_tz = datetime.now(pytz.utc).astimezone(tz)
+    local_today = now_tz.date()
+    return now_tz, local_today
+
+def compute_is_finalized(date_series: pd.Series, interval: str, is_jp: bool = True) -> pd.Series:
+    """
+    時間ベースの確定（finalize）判定ロジック。
+
+    - タイムフレームが 1d の場合:
+        * データの日付が本日（local_today）より前 → 無条件で確定(True)。
+        * データの日付が本日と同じ → 実行時のローカル時刻が市場の閉場バッファ
+          （日本株: JST 16:30 / 米国株: EST 17:30）を過ぎていれば確定(True)、
+          過ぎていなければ未確定(False)。
+    - タイムフレームが 1d 以外（短期足）の場合:
+        * タイムゾーン情報を除いたローカル現在時刻（now_naive）から1時間より前のデータのみ確定(True)。
+    """
+    now_tz, local_today = get_market_localized_now(is_jp)
+    dt_series = pd.to_datetime(date_series)
+
+    if interval == "1d":
+        close_buffer_time = dt_time(16, 30) if is_jp else dt_time(17, 30)
+        today_is_finalized = now_tz.time() >= close_buffer_time
+
+        data_dates = dt_series.dt.date
+        is_finalized = data_dates < local_today
+        if today_is_finalized:
+            is_finalized = is_finalized | (data_dates == local_today)
+        return is_finalized
+    else:
+        now_naive = now_tz.replace(tzinfo=None)
+        return dt_series < (now_naive - timedelta(hours=1))
 
 def check_anomaly_need_patch(df_ticker: pd.DataFrame, cliff_date_str: str, multiplier: float, threshold: float = 0.10) -> bool:
     """
@@ -234,6 +277,17 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
     try:
         df_check = yf.download(ticker_symbol, period="5d", interval="1d", auto_adjust=False, progress=False)
         if df_check.empty: return
+
+        # --- MultiIndex問題解消: シングルティッカーでもMultiIndexカラムが返る場合がある ---
+        if isinstance(df_check.columns, pd.MultiIndex):
+            try:
+                df_check = df_check.xs(ticker_symbol, axis=1, level=1)
+            except Exception:
+                df_check.columns = df_check.columns.get_level_values(0)
+
+        # --- タイムゾーンのnaive統一: 双方のdatetimeをnaiveに揃えてから比較する ---
+        if df_check.index.tz is not None:
+            df_check.index = df_check.index.tz_localize(None)
         check_dates = df_check.index
     except Exception:
         return
@@ -247,6 +301,8 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
             if ticker_db.empty: continue
             
             ticker_db["date"] = pd.to_datetime(ticker_db["date"])
+            if ticker_db["date"].dt.tz is not None:
+                ticker_db["date"] = ticker_db["date"].dt.tz_localize(None)
             common_dates = ticker_db["date"].dt.date.isin(check_dates.date)
             
             apply_split = True
@@ -256,7 +312,13 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
                 price_db = ticker_db[ticker_db["date"] == last_common_dt]["close"].iloc[-1]
                 matching_check_row = df_check[df_check.index.date == check_date_only]
                 if not matching_check_row.empty:
-                    price_real = matching_check_row["Close"].iloc[-1]
+                    close_val = matching_check_row["Close"]
+                    # --- MultiIndex/Series混在ガード: 常にスカラー価格を安全に抽出 ---
+                    if isinstance(close_val, pd.DataFrame):
+                        close_val = close_val.iloc[:, 0]
+                    price_real = close_val.iloc[-1]
+                    if isinstance(price_real, pd.Series):
+                        price_real = price_real.iloc[-1]
                     if price_db <= (price_real * 1.1):
                         apply_split = False
             
@@ -288,7 +350,9 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         log(f"[{market_name}] 更新対象銘柄がありません。")
         return
 
-    now = datetime.now()
+    # --- 修正A: サーバーTZに依存しない、市場基準のローカライズされた現在時刻を使用 ---
+    now_tz, local_today = get_market_localized_now(is_jp)
+    now = now_tz.replace(tzinfo=None)
     suffix = ".T" if is_jp else ""
     tickers = [sanitize_ticker(t, is_jp) for t in tickers]
 
@@ -378,6 +442,27 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                     continue
                 start_date_str = start_date_dt.strftime("%Y-%m-%d")
 
+            # ── 修正D: yfinance取得可能期限切れ（デッドロック）の事前検知 ──
+            if interval in YFINANCE_GAP_LIMITS:
+                limit_days = YFINANCE_GAP_LIMITS[interval]
+                try:
+                    gap_start_date = start_date_dt.date() if hasattr(start_date_dt, "date") else None
+                except Exception:
+                    gap_start_date = None
+
+                if gap_start_date is not None:
+                    gap_days = (local_today - gap_start_date).days
+                    if gap_days > limit_days:
+                        sample_tickers = ", ".join(chunk_tickers[:5]) + ("..." if len(chunk_tickers) > 5 else "")
+                        log(
+                            f"⚠️【警告】[{interval}] {sample_tickers} の空白期間が {gap_days} 日となり、"
+                            f"yfinanceの取得可能上限（{limit_days}日）を超えたため同期できません。"
+                            f"一括再構築を実行してください。"
+                        )
+                        continue
+                    else:
+                        log(f"  ✅ [{interval}] 空白期間 {gap_days}日（上限{limit_days}日）は取得可能範囲内です。追加データを取得します。")
+
             BATCH_SIZE = 100
             for i in range(0, len(chunk_tickers), BATCH_SIZE):
                 chunk = chunk_tickers[i:i+BATCH_SIZE]
@@ -403,14 +488,19 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         if all_downloaded:
             new_combined = pd.concat(all_downloaded, ignore_index=True)
             if "date" in new_combined.columns:
-                new_combined["is_finalized"] = new_combined["date"].dt.date < now.date()
-                if interval != "1d":
-                    new_combined["is_finalized"] = new_combined["date"] < (now - timedelta(hours=1))
+                # --- 修正A: 時間ベースの確定（finalize）判定ロジックを適用 ---
+                new_combined["is_finalized"] = compute_is_finalized(new_combined["date"], interval, is_jp=is_jp)
             
             reset_tickers = []
             if interval == "1d":
-                for ticker in new_combined["ticker"].unique():
-                    t_new = new_combined[new_combined["ticker"] == ticker]
+                # --- 修正B: 確定データ（is_finalized == True）のみを権利落ち検知の対象にフィルタリング ---
+                if "is_finalized" in new_combined.columns:
+                    finalized_for_detection = new_combined[new_combined["is_finalized"] == True]
+                else:
+                    finalized_for_detection = new_combined
+
+                for ticker in finalized_for_detection["ticker"].unique():
+                    t_new = finalized_for_detection[finalized_for_detection["ticker"] == ticker]
                     has_action, has_split, split_ratio = False, False, 1.0
                     
                     if "stock splits" in t_new.columns:
@@ -507,9 +597,7 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
     if all_downloaded:
         final_df = pd.concat(all_downloaded, ignore_index=True)
         if "date" in final_df.columns:
-            final_df["is_finalized"] = final_df["date"].dt.date < now.date()
-            if interval != "1d":
-                final_df["is_finalized"] = final_df["date"] < (now - timedelta(hours=1))
+            final_df["is_finalized"] = compute_is_finalized(final_df["date"], interval, is_jp=is_jp)
         
         final_df = final_df.sort_values(["ticker", "date"]).reset_index(drop=True)
         save_price_db(final_df, interval, is_jp=is_jp)
@@ -547,9 +635,7 @@ def rebuild_single_ticker_db(ticker: str, is_jp: bool = True, interval: str = "1
         new_df = parse_yfinance_batch(df_raw, [pure_ticker], is_jp=is_jp)
         if new_df.empty: return False
         
-        new_df["is_finalized"] = new_df["date"].dt.date < now.date()
-        if interval != "1d":
-            new_df["is_finalized"] = new_df["date"] < (now - timedelta(hours=1))
+        new_df["is_finalized"] = compute_is_finalized(new_df["date"], interval, is_jp=is_jp)
             
         try:
             db_df = load_price_db(interval, is_jp=is_jp)

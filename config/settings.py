@@ -9,6 +9,9 @@ except ImportError:
 
 # --- Google Drive 共有フォルダ設定 ---
 FOLDER_ID = "1Lx-Xdsm8h20Q-ZRI91Ty7smdYVhkuoFD"
+
+# --- 同期ログ保存用 Google Drive フォルダ ---
+LOGS_FOLDER_ID = "1xKzLMQzOejLyXq_SBF8SxYq3rZG5evV0"
 if HAS_STREAMLIT:
     try:
         if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:

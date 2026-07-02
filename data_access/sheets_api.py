@@ -1,5 +1,6 @@
 # data_access/sheets_api.py
 import pandas as pd
+import pytz
 from datetime import datetime
 from google.oauth2.service_account import Credentials as SACredentials
 import gspread
@@ -35,6 +36,65 @@ def get_gspread_client():
         )
         return gspread.authorize(creds)
     except Exception:
+        return None
+
+def get_drive_service():
+    """Google Drive API（ファイルアップロード等）操作用のサービスクライアントを作成して返します。"""
+    if not HAS_STREAMLIT:
+        return None
+    try:
+        from googleapiclient.discovery import build
+        cfg = dict(st.secrets["connections"]["gsheets"])
+        sa_info = {k: cfg[k] for k in ["type", "project_id", "private_key_id", "private_key", "client_email", "client_id", "auth_uri", "token_uri"] if k in cfg}
+        if "private_key" in sa_info:
+            sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
+        creds = SACredentials.from_service_account_info(
+            sa_info,
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        print(f"❌ [sheets_api] Google Drive サービスの認証に失敗しました: {e}")
+        return None
+
+def upload_sync_log_to_drive(log_lines: list, is_jp: bool = True, prefix: str = "sync") -> str:
+    """
+    同期処理中にメモリへ蓄積された詳細ログ（文字列のリスト）を、
+    実行した市場モード（is_jp）のローカルタイムゾーン（JST/EST）の日時をファイル名に含め、
+    settings.LOGS_FOLDER_ID で指定されたGoogleドライブのフォルダへ1回だけバッチアップロードします。
+
+    ファイル名形式: {prefix}_YYYY-MM-DD_HHMMSS.log （例: sync_2026-07-02_203045.log）
+
+    戻り値: アップロードに成功した場合はファイル名の文字列、失敗またはログが空の場合は None。
+    """
+    if not log_lines:
+        return None
+
+    service = get_drive_service()
+    if service is None:
+        print("⚠️ [upload_sync_log_to_drive] Google Drive サービスが利用できないため、ログ保存をスキップしました。")
+        return None
+
+    folder_id = getattr(settings, "LOGS_FOLDER_ID", None)
+    if not folder_id:
+        print("⚠️ [upload_sync_log_to_drive] settings.LOGS_FOLDER_ID が未設定のため、ログ保存をスキップしました。")
+        return None
+
+    try:
+        from googleapiclient.http import MediaInMemoryUpload
+
+        # 同期を実行した市場モードのローカルタイムゾーンを基準に日時を算出
+        tz = pytz.timezone("Asia/Tokyo") if is_jp else pytz.timezone("America/New_York")
+        now_tz = datetime.now(pytz.utc).astimezone(tz)
+        filename = f"{prefix}_{now_tz.strftime('%Y-%m-%d_%H%M%S')}.log"
+
+        content = "\n".join(str(line) for line in log_lines)
+        file_metadata = {"name": filename, "parents": [folder_id]}
+        media = MediaInMemoryUpload(content.encode("utf-8"), mimetype="text/plain")
+        service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        return filename
+    except Exception as e:
+        print(f"⚠️ [upload_sync_log_to_drive] ログのGoogleドライブへのアップロードに失敗しました: {e}")
         return None
 
 def get_sector_spreadsheet():
