@@ -232,7 +232,7 @@ def save_watchlist_to_sheets(watchlist: dict):
 REPAIR_LOG_COLUMNS = ["executed_at", "ticker", "market", "cliff_date", "interval", "before_close", "after_close", "multiplier", "memo"]
 
 def save_repair_log_to_sheets(log_rows: list) -> bool:
-    """データ修復の実行ログをスプレッドシートに追記します。"""
+    """データ修復の実行ログをスプレッドシートに安全に追記します。"""
     if not log_rows:
         return False
     sh = get_sector_spreadsheet()
@@ -242,27 +242,19 @@ def save_repair_log_to_sheets(log_rows: list) -> bool:
         try:
             ws = sh.worksheet(settings.REPAIR_LOG_SHEET_NAME)
         except Exception:
-            ws = sh.add_worksheet(
-                title=settings.REPAIR_LOG_SHEET_NAME,
-                rows=1000,
-                cols=len(REPAIR_LOG_COLUMNS),
-            )
+            # シートが存在しない場合に新規作成し、ヘッダーを書き込み（名前付き引数でバージョン不整合を防止）
+            ws = sh.add_worksheet(title=settings.REPAIR_LOG_SHEET_NAME, rows=1000, cols=len(REPAIR_LOG_COLUMNS))
+            ws.update(values=[REPAIR_LOG_COLUMNS], range_name="A1")
 
-        existing = ws.get_all_values()
-
-        # 🛡️ シートが「存在はするがヘッダー未設定（空 or 1行目が不一致）」な場合を必ず補修する
-        header_ok = bool(existing) and [str(h).strip() for h in existing[0]] == REPAIR_LOG_COLUMNS
-        if not header_ok:
-            ws.update([REPAIR_LOG_COLUMNS], "A1")
-            # ヘッダーを書いた分、既存データの位置が変わらないよう再取得
-            existing = ws.get_all_values()
-
-        next_row = len(existing) + 1
+        # 🚨 自前で行数を数えるのをやめ、空白列のズレやライブラリの引数順序バグを100%回避するため、
+        # 🚨 Google Sheets API 本来の「末尾自動追記メソッド（append_rows）」を使用します。
         rows_to_append = [
             [str(row.get(col, "")) for col in REPAIR_LOG_COLUMNS]
             for row in log_rows
         ]
-        ws.update(rows_to_append, f"A{next_row}")
+        
+        # USER_ENTERED を指定することで、数値や日付が文字列ではなく正しいデータ型としてスプレッドシートに追記されます
+        ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
         return True
     except Exception as e:
         print(f"⚠️ 修復ログ保存エラー: {e}")
