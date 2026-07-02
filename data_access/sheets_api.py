@@ -264,19 +264,45 @@ def load_repair_log_from_sheets() -> pd.DataFrame:
         return pd.DataFrame(columns=REPAIR_LOG_COLUMNS)
     try:
         ws = sh.worksheet(settings.REPAIR_LOG_SHEET_NAME)
-        records = ws.get_all_records()
-        if not records:
+        
+        # 🚨 get_all_records() はエラーが起きやすく空白セルでロードに失敗するため、
+        # 🚨 最も安全で100%生データをロードできる get_all_values() に変更します。
+        raw_values = ws.get_all_values()
+        if not raw_values or len(raw_values) < 2:
             return pd.DataFrame(columns=REPAIR_LOG_COLUMNS)
-        df = pd.DataFrame(records)
+        
+        # 1行目をカラム名（小文字に統一）、2行目以降をデータとしてロード
+        headers = [str(h).strip().lower() for h in raw_values[0]]
+        
+        # 🛡️ 表記ブレ対策：手動入力時に「全角のアンダーバー」になっていても、半角に自動補正します
+        headers = [h.replace("executed＿at", "executed_at") for h in headers]
+        headers = [h.replace("executed_at", "executed_at") for h in headers]
+        
+        data_rows = raw_values[1:]
+        
+        # DataFrameの作成
+        df = pd.DataFrame(data_rows, columns=headers)
+        
+        # 想定外の余分な列がシートにある場合は、規定の9列のみを抽出
+        valid_cols = [c for c in REPAIR_LOG_COLUMNS if c in df.columns]
+        df = df[valid_cols]
+        
+        # Datetime変換
         if "executed_at" in df.columns:
             df["executed_at"] = pd.to_datetime(df["executed_at"], errors="coerce")
         if "cliff_date" in df.columns:
             df["cliff_date"] = pd.to_datetime(df["cliff_date"], errors="coerce")
+            
+        # 数値変換（空白セルは自動的にNaN/欠損値に変換されます）
         for col in ["before_close", "after_close", "multiplier"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+                
+        # 実行日時の降順に並べ替えて返却
         return df.sort_values("executed_at", ascending=False).reset_index(drop=True)
-    except Exception:
+    except Exception as e:
+        # 何らかのエラーが発生した場合は、静かに消さずコンソールに原因を出力します
+        print(f"❌ [load_repair_log_from_sheets] データのロードに失敗しました: {e}")
         return pd.DataFrame(columns=REPAIR_LOG_COLUMNS)
 
 # --- 追加ETF収集対象(extra_tickers)連携 ---
