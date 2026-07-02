@@ -35,27 +35,6 @@ from core.database_service import (
     apply_all_saved_patches
 )
 
-# ── 安全なログ追記・保存ラッパー関数 ──
-def safe_append_and_save_repair_log(new_log_row: dict) -> bool:
-    """
-    スプレッドシートから既存の修復ログを一度ロードし、
-    新規ログを安全に結合（追記）した上でスプレッドシートに書き戻します。
-    """
-    try:
-        existing_df = load_repair_log_from_sheets()
-    except Exception:
-        existing_df = pd.DataFrame()
-
-    new_df = pd.DataFrame([new_log_row])
-
-    if not existing_df.empty:
-        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-    else:
-        combined_df = new_df
-
-    # 辞書のリストに変換して保存します
-    return save_repair_log_to_sheets(combined_df.to_dict(orient="records"))
-
 # ── 日足の最新更新日の簡易取得 ──
 def get_db_last_update(interval: str, is_jp: bool = True) -> str:
     try:
@@ -533,8 +512,8 @@ def render_manual_repair_section(is_jp: bool):
                         "memo": "手動ピンポイント崖一律修復（パッチ定義）",
                     }
                     
-                    # 既存のログを破壊せずに追記保存
-                    saved = safe_append_and_save_repair_log(log_row)
+                    # 💡 スプレッドシート自身の末尾追記機能に、新規の1件（差分）だけを直接渡します。
+                    saved = save_repair_log_to_sheets([log_row])
                     if saved:
                         st.success("✅ パッチ定義をスプレッドシートに保存しました。次回ダウンロード・再構築時にも断絶事前チェック付きで自動適用されます。")
                         # 画面上のログ一覧キャッシュを無効化
@@ -568,8 +547,8 @@ def render_manual_repair_section(is_jp: bool):
                         "multiplier": "",
                         "memo": "手動ピンポイント個別銘柄ダウンロード復元（1dクリーン・分足置換マージ）",
                     }
-                    # 既存のログを破壊せずに追記保存
-                    safe_append_and_save_repair_log(log_row)
+                    # 💡 スプレッドシート自身の末尾追記機能に、新規の1件（差分）だけを直接渡します。
+                    save_repair_log_to_sheets([log_row])
                     # 画面上のログ一覧キャッシュを無効化
                     if "repair_log_df" in st.session_state:
                         st.session_state.repair_log_df = None
@@ -636,8 +615,8 @@ if btn_delete_before:
                 "multiplier": "",
                 "memo": f"手動削除パッチ実行（指定日以前の全消去）",
             }
-            # 既存のログを破壊せずに追記保存
-            safe_append_and_save_repair_log(log_row)
+            # 💡 スプレッドシート自身の末尾追記機能に、新規の1件（差分）だけを直接渡します。
+            save_repair_log_to_sheets([log_row])
             # 画面上のログ一覧キャッシュを無効化
             if "repair_log_df" in st.session_state:
                 st.session_state.repair_log_df = None
@@ -653,9 +632,11 @@ with st.expander("📋 修復ログ一覧", expanded=False):
         st.write(" ")
         btn_load_log = st.button("🔄 ログを読み込む", key="btn_load_log", use_container_width=True)
 
+    # セッションキーの初期化
     if "repair_log_df" not in st.session_state:
         st.session_state.repair_log_df = None
 
+    # ボタン押下時のみデータをロードしてセッションに退避
     if btn_load_log:
         with st.spinner("スプレッドシートから修復ログを読み込み中..."):
             try:
@@ -668,22 +649,14 @@ with st.expander("📋 修復ログ一覧", expanded=False):
                 st.error(f"❌ スプレッドシートからのログ取得中にエラーが発生しました: {e}")
                 st.session_state.repair_log_df = pd.DataFrame()
 
+    # セッションデータが存在すれば、ページ再読み込み時（Rerun）でも常にテーブルを表示する
     if st.session_state.repair_log_df is not None:
         log_df = st.session_state.repair_log_df.copy()
-
-        # =================【一時的なデバッグ表示】=================
-        st.info("🛠️ [デバッグ情報] スプレッドシートからロードされた生データの情報:")
-        st.write(f"・データの行数と列数 (行, 列): `{log_df.shape}`")
-        st.write("・認識された列名一覧 (ヘッダー):", list(log_df.columns))
-        if not log_df.empty:
-            st.write("・先頭データ（生データの確認）:")
-            st.dataframe(log_df.head(3), use_container_width=True)
-        st.divider()
-        # =========================================================
 
         if log_df.empty:
             st.info("ℹ️ 保存されている修復ログはありません。（スプレッドシートが空です）")
         else:
+            # 銘柄絞り込み（キャストして完全に一致を狙う）
             if log_ticker_filter.strip():
                 log_df["_ticker_str"] = log_df["ticker"].astype(str).str.strip()
                 log_df = log_df[log_df["_ticker_str"].str.contains(log_ticker_filter.strip(), case=False, na=False)]
@@ -700,6 +673,7 @@ with st.expander("📋 修復ログ一覧", expanded=False):
                 if "multiplier" in disp.columns:
                     disp["multiplier"] = pd.to_numeric(disp["multiplier"], errors="coerce").round(6)
 
+                # 列数がズレていても絶対にクラッシュさせない安全マッピング方式
                 rename_map = {
                     "executed_at": "実行日時",
                     "ticker": "銘柄",
@@ -713,9 +687,11 @@ with st.expander("📋 修復ログ一覧", expanded=False):
                 }
                 disp = disp.rename(columns=rename_map)
                 
+                # 推奨の表示構成に並び替え
                 preferred_order = ["実行日時", "銘柄", "市場", "崖日付", "適用時間足", "修正前終値", "修正後終値", "倍率", "備考"]
                 cols_to_show = [c for c in preferred_order if c in disp.columns]
                 
+                # 想定外のカラム構造でも生のカラムでフォールバックして表示
                 if not cols_to_show:
                     cols_to_show = disp.columns.tolist()
 
