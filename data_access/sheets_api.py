@@ -242,10 +242,21 @@ def save_repair_log_to_sheets(log_rows: list) -> bool:
         try:
             ws = sh.worksheet(settings.REPAIR_LOG_SHEET_NAME)
         except Exception:
-            ws = sh.add_worksheet(title=settings.REPAIR_LOG_SHEET_NAME, rows=1000, cols=len(REPAIR_LOG_COLUMNS))
-            ws.update([REPAIR_LOG_COLUMNS], "A1")
+            ws = sh.add_worksheet(
+                title=settings.REPAIR_LOG_SHEET_NAME,
+                rows=1000,
+                cols=len(REPAIR_LOG_COLUMNS),
+            )
 
         existing = ws.get_all_values()
+
+        # 🛡️ シートが「存在はするがヘッダー未設定（空 or 1行目が不一致）」な場合を必ず補修する
+        header_ok = bool(existing) and [str(h).strip() for h in existing[0]] == REPAIR_LOG_COLUMNS
+        if not header_ok:
+            ws.update([REPAIR_LOG_COLUMNS], "A1")
+            # ヘッダーを書いた分、既存データの位置が変わらないよう再取得
+            existing = ws.get_all_values()
+
         next_row = len(existing) + 1
         rows_to_append = [
             [str(row.get(col, "")) for col in REPAIR_LOG_COLUMNS]
