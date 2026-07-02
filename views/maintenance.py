@@ -653,11 +653,9 @@ with st.expander("📋 修復ログ一覧", expanded=False):
         st.write(" ")
         btn_load_log = st.button("🔄 ログを読み込む", key="btn_load_log", use_container_width=True)
 
-    # セッションキーの初期化
     if "repair_log_df" not in st.session_state:
         st.session_state.repair_log_df = None
 
-    # ボタン押下時のみデータをロードしてセッションに退避
     if btn_load_log:
         with st.spinner("スプレッドシートから修復ログを読み込み中..."):
             try:
@@ -670,14 +668,22 @@ with st.expander("📋 修復ログ一覧", expanded=False):
                 st.error(f"❌ スプレッドシートからのログ取得中にエラーが発生しました: {e}")
                 st.session_state.repair_log_df = pd.DataFrame()
 
-    # セッションデータが存在すれば、ページ再読み込み時（Rerun）でも常にテーブルを表示する
     if st.session_state.repair_log_df is not None:
         log_df = st.session_state.repair_log_df.copy()
+
+        # =================【一時的なデバッグ表示】=================
+        st.info("🛠️ [デバッグ情報] スプレッドシートからロードされた生データの情報:")
+        st.write(f"・データの行数と列数 (行, 列): `{log_df.shape}`")
+        st.write("・認識された列名一覧 (ヘッダー):", list(log_df.columns))
+        if not log_df.empty:
+            st.write("・先頭データ（生データの確認）:")
+            st.dataframe(log_df.head(3), use_container_width=True)
+        st.divider()
+        # =========================================================
 
         if log_df.empty:
             st.info("ℹ️ 保存されている修復ログはありません。（スプレッドシートが空です）")
         else:
-            # 銘柄絞り込み（キャストして完全に一致を狙う）
             if log_ticker_filter.strip():
                 log_df["_ticker_str"] = log_df["ticker"].astype(str).str.strip()
                 log_df = log_df[log_df["_ticker_str"].str.contains(log_ticker_filter.strip(), case=False, na=False)]
@@ -694,7 +700,6 @@ with st.expander("📋 修復ログ一覧", expanded=False):
                 if "multiplier" in disp.columns:
                     disp["multiplier"] = pd.to_numeric(disp["multiplier"], errors="coerce").round(6)
 
-                # 列数がズレていても絶対にクラッシュさせない安全マッピング方式
                 rename_map = {
                     "executed_at": "実行日時",
                     "ticker": "銘柄",
@@ -708,11 +713,9 @@ with st.expander("📋 修復ログ一覧", expanded=False):
                 }
                 disp = disp.rename(columns=rename_map)
                 
-                # 推奨の表示構成に並び替え
                 preferred_order = ["実行日時", "銘柄", "市場", "崖日付", "適用時間足", "修正前終値", "修正後終値", "倍率", "備考"]
                 cols_to_show = [c for c in preferred_order if c in disp.columns]
                 
-                # 想定外のカラム構造でも生のカラムでフォールバックして表示
                 if not cols_to_show:
                     cols_to_show = disp.columns.tolist()
 
