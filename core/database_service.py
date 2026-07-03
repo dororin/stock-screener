@@ -164,13 +164,6 @@ def _replace_stop_allocation_bar(df_interval: pd.DataFrame, ticker: str, day_dat
     return df_result
 
 def propagate_stop_allocation_bars_to_intraday(stop_days_df: pd.DataFrame, is_jp: bool = True, log_func=None) -> dict:
-    """
-    検出済みの「寄り付かずS高/S安（確定済）」日付リストを元に、
-    60m/5m/1m の各短期足DBへ大引け固定バーをべき等に反映（削除→置換）します。
-
-    Flow A（新規ダウンロード時の自動移植）・Flow B（既存Parquetの遡及一括修復）の
-    両方から共通で呼び出される、単一の実装源（Single Source of Truth）です。
-    """
     def _log(msg):
         if log_func: log_func(msg)
         else: print(msg)
@@ -188,19 +181,39 @@ def propagate_stop_allocation_bars_to_intraday(stop_days_df: pd.DataFrame, is_jp
             continue
 
         db_df["date"] = pd.to_datetime(db_df["date"])
+        
+        # --- 💡 修正箇所：銘柄ごとにDBに存在する「最古」と「最新」の日付範囲を把握する ---
+        db_df["date_only"] = db_df["date"].dt.date
+        limits_map = db_df.groupby("ticker")["date_only"].agg(["min", "max"]).to_dict(orient="index")
+        
         applied = 0
 
         for _, row in stop_days_df.iterrows():
-            db_df = _replace_stop_allocation_bar(
-                db_df, row["ticker"], row["date"], row["close"], row["volume"], is_jp=is_jp
-            )
-            applied += 1
+            ticker = row["ticker"]
+            day_date = pd.Timestamp(row["date"]).date()
+            
+            # 短期足DBに対象銘柄のデータが存在し、かつ該当日の比例配分が
+            # その銘柄の保持期間（最古〜最新）の範囲内である場合のみ修復処理を実行する
+            if ticker in limits_map:
+                t_min = limits_map[ticker]["min"]
+                t_max = limits_map[ticker]["max"]
+                
+                if t_min <= day_date <= t_max:
+                    db_df = _replace_stop_allocation_bar(
+                        db_df, ticker, row["date"], row["close"], row["volume"], is_jp=is_jp
+                    )
+                    applied += 1
+
+        # テンポラリ列を削除
+        db_df = db_df.drop(columns=["date_only"])
 
         if applied > 0:
             db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
             save_price_db(db_df, interval, is_jp=is_jp)
             results[interval] = applied
             _log(f"  🩹 [{interval}] ストップ高安（比例配分）バーを {applied}件 反映（置換・べき等）しました。")
+        else:
+            _log(f"  🧊 [{interval}] 保持期間内の対象がないため修復はスキップされました。")
 
     return results
 
