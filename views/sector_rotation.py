@@ -482,7 +482,7 @@ else:
             color_theme = "#26a69a" if mom >= 3.0 else "#ef5350" if mom <= -3.0 else "#9e9e9e"
 
             try:
-                sec_abs, sma75, sma200, is_wvf_lit, trading_val = compute_sector_absolute_data(db_df, tickers, period_days, resample_weekly)
+                sec_abs, sma75, sma200, is_wvf_lit, trading_val = compute_sector_absolute_data(db_df, tickers, period_days, resample_weekly, interval=interval, is_jp=is_jp)
                 wvf_active = bool(is_wvf_lit.iloc[-1]) if (is_wvf_lit is not None and not is_wvf_lit.empty) else False
             except Exception:
                 sec_abs, sma75, sma200, is_wvf_lit, trading_val = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
@@ -541,7 +541,7 @@ if custom_tickers:
                         st.rerun()
 
                     try:
-                        w_abs, w_sma75, w_sma200, w_wvf_lit, w_trading_val = compute_sector_absolute_data(db_df, [code], period_days, resample_weekly)
+                        w_abs, w_sma75, w_sma200, w_wvf_lit, w_trading_val = compute_sector_absolute_data(db_df, [code], period_days, resample_weekly, interval=interval, is_jp=is_jp)
                     except Exception:
                         w_abs, w_sma75, w_sma200, w_wvf_lit, w_trading_val = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
                     

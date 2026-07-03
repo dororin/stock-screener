@@ -15,6 +15,21 @@ from core.collector import (
 # --- yfinanceが取得可能な期間の上限（日数） ---
 YFINANCE_GAP_LIMITS = {"1m": 7, "5m": 60, "60m": 730}
 
+# --- 東証: 取引時間延伸（2024年11月5日、arrowhead4.0稼働）の境界日 ---
+# この日以降、大引け（取引終了時刻）は 15:00 → 15:30 に変更されている（クロージング・オークション導入）。
+TSE_EXTENDED_HOURS_DATE = pd.Timestamp("2024-11-05")
+
+def get_jp_session_close_time(date) -> dt_time:
+    """
+    指定日における東証の大引け時刻を返します。
+    2024/11/5以降: 15:30（クロージング・オークション導入後）
+    2024/11/5より前: 15:00（旧終了時刻）
+    """
+    d = pd.Timestamp(date).normalize()
+    if d >= TSE_EXTENDED_HOURS_DATE:
+        return dt_time(15, 30)
+    return dt_time(15, 0)
+
 def get_market_localized_now(is_jp: bool = True):
     """
     市場モード（is_jp）に基づき、Asia/Tokyo（日本株）または America/New_York（米国株）の
@@ -53,6 +68,167 @@ def compute_is_finalized(date_series: pd.Series, interval: str, is_jp: bool = Tr
     else:
         now_naive = now_tz.replace(tzinfo=None)
         return dt_series < (now_naive - timedelta(hours=1))
+
+def detect_allocation_stop_days(df_1d: pd.DataFrame) -> pd.DataFrame:
+    """
+    日足(1d)データから「寄り付かずストップ高/安（比例配分）」の日付を検出します（仕様書アプローチA）。
+
+    判定式:
+        is_allocation_stop = (Open == High == Low == Close) AND (Volume > 0) AND (Close != 前日Close)
+
+    未確定データ安全ガード:
+        is_finalized 列が存在する場合、is_finalized == True の行のみを対象とします。
+        （まだ確定していない当日データは、次回同期以降 is_finalized == True に切り替わってから
+          初めて検出対象となります。）
+
+    戻り値: columns = ["ticker", "date", "close", "volume"]
+    """
+    empty_result = pd.DataFrame(columns=["ticker", "date", "close", "volume"])
+    if df_1d is None or df_1d.empty:
+        return empty_result
+
+    df = df_1d.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    if "is_finalized" in df.columns:
+        df = df[df["is_finalized"] == True].reset_index(drop=True)
+    if df.empty:
+        return empty_result
+
+    # 前日Closeは「銘柄ごとの直前の確定済みレコード」を基準にする
+    df["prev_close"] = df.groupby("ticker")["close"].shift(1)
+
+    is_allocation_stop = (
+        (df["open"] == df["high"]) &
+        (df["high"] == df["low"]) &
+        (df["low"] == df["close"]) &
+        (df["volume"] > 0) &
+        df["prev_close"].notna() &
+        (df["close"] != df["prev_close"])
+    )
+
+    result = df.loc[is_allocation_stop, ["ticker", "date", "close", "volume"]].reset_index(drop=True)
+    return result
+
+def _build_synthetic_15h_bar_row(schema_cols: list, ticker: str, day_date, close_price: float, volume: float, is_jp: bool = True) -> dict:
+    """
+    短期足DBの既存スキーマ(schema_cols)に合わせ、大引け固定の1本分のバー行を組み立てます。
+    日本株の場合、2024/11/5の取引時間延伸を踏まえ、日付に応じて15:00/15:30を自動判定します。
+    """
+    if is_jp:
+        close_t = get_jp_session_close_time(day_date)
+        bar_datetime = pd.Timestamp(day_date).normalize() + pd.Timedelta(hours=close_t.hour, minutes=close_t.minute)
+    else:
+        bar_datetime = pd.Timestamp(day_date).normalize() + pd.Timedelta(hours=16)
+    row = {}
+    for col in schema_cols:
+        c = str(col).lower()
+        if c == "date":
+            row[col] = bar_datetime
+        elif c == "ticker":
+            row[col] = ticker
+        elif c in ("open", "high", "low", "close", "adj close"):
+            row[col] = close_price
+        elif c == "volume":
+            row[col] = volume
+        elif c == "is_finalized":
+            row[col] = True
+        elif c in ("dividends", "stock splits"):
+            row[col] = 0.0
+        else:
+            row[col] = None
+    return row
+
+def _replace_stop_allocation_bar(df_interval: pd.DataFrame, ticker: str, day_date, close_price: float, volume: float, is_jp: bool = True) -> pd.DataFrame:
+    """
+    指定ティッカー・指定日の既存レコード（取引時間帯全体）を一度全削除してから、
+    大引け固定（日本株: 2024/11/5以降15:30・それ以前は15:00）の1本のバーに置換します。
+
+    ※ 単純追記(append)ではなく「削除→再構築」方式にすることで、
+      同一日が同期のたびに何度再処理されても最終結果が変わらない（べき等）ようにしています。
+    """
+    if df_interval.empty:
+        schema_cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
+        new_row = _build_synthetic_15h_bar_row(schema_cols, ticker, day_date, close_price, volume, is_jp=is_jp)
+        return pd.DataFrame([new_row])
+
+    day_only = pd.Timestamp(day_date).normalize()
+    dt_series = pd.to_datetime(df_interval["date"])
+
+    target_mask = (df_interval["ticker"] == ticker) & (dt_series.dt.normalize() == day_only)
+    df_cleaned = df_interval[~target_mask].copy()
+
+    new_row = _build_synthetic_15h_bar_row(df_interval.columns.tolist(), ticker, day_date, close_price, volume, is_jp=is_jp)
+    df_result = pd.concat([df_cleaned, pd.DataFrame([new_row])], ignore_index=True)
+    return df_result
+
+def propagate_stop_allocation_bars_to_intraday(stop_days_df: pd.DataFrame, is_jp: bool = True, log_func=None) -> dict:
+    """
+    検出済みの「寄り付かずS高/S安（確定済）」日付リストを元に、
+    60m/5m/1m の各短期足DBへ大引け固定バーをべき等に反映（削除→置換）します。
+
+    Flow A（新規ダウンロード時の自動移植）・Flow B（既存Parquetの遡及一括修復）の
+    両方から共通で呼び出される、単一の実装源（Single Source of Truth）です。
+    """
+    def _log(msg):
+        if log_func: log_func(msg)
+        else: print(msg)
+
+    results = {"60m": 0, "5m": 0, "1m": 0}
+    if stop_days_df is None or stop_days_df.empty:
+        return results
+
+    for interval in ["60m", "5m", "1m"]:
+        try:
+            db_df = load_price_db(interval, is_jp=is_jp)
+        except FileNotFoundError:
+            continue
+        if db_df.empty:
+            continue
+
+        db_df["date"] = pd.to_datetime(db_df["date"])
+        applied = 0
+
+        for _, row in stop_days_df.iterrows():
+            db_df = _replace_stop_allocation_bar(
+                db_df, row["ticker"], row["date"], row["close"], row["volume"], is_jp=is_jp
+            )
+            applied += 1
+
+        if applied > 0:
+            db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
+            save_price_db(db_df, interval, is_jp=is_jp)
+            results[interval] = applied
+            _log(f"  🩹 [{interval}] ストップ高安（比例配分）バーを {applied}件 反映（置換・べき等）しました。")
+
+    return results
+
+def repair_stop_allocation_bars_full(is_jp: bool = True, status_callback=None) -> dict:
+    """
+    既存Parquetの1d全履歴から「寄り付かずS高/S安（確定済）」日付を再スキャンし、
+    60m/5m/1mの該当日を「大引け固定バー1本のみ」の状態に一括で書き換え修復します（仕様書フローB）。
+    """
+    def log(msg):
+        print(msg)
+        if status_callback: status_callback(msg)
+
+    try:
+        db_1d = load_price_db("1d", is_jp=is_jp)
+    except FileNotFoundError:
+        log("❌ 1d データベースが見つかりません。")
+        return {}
+
+    stop_days_df = detect_allocation_stop_days(db_1d)
+    if stop_days_df.empty:
+        log("🧊 確定済みの「寄り付かずS高/S安」日は検出されませんでした。")
+        return {}
+
+    log(f"🔍 確定済みの比例配分日を {len(stop_days_df)}件 検出しました。短期足の一括修復を開始します...")
+    results = propagate_stop_allocation_bars_to_intraday(stop_days_df, is_jp=is_jp, log_func=log)
+    total = sum(results.values())
+    log(f"🎉 一括修復完了（合計 {total}件）。60m: {results.get('60m', 0)}件 / 5m: {results.get('5m', 0)}件 / 1m: {results.get('1m', 0)}件")
+    return results
 
 def check_anomaly_need_patch(df_ticker: pd.DataFrame, cliff_date_str: str, multiplier: float, threshold: float = 0.10) -> bool:
     """
@@ -532,6 +708,18 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                 db_df = merge_price_data(db_df, new_combined, interval, is_jp=is_jp)
                 save_price_db(db_df, interval, is_jp=is_jp)
                 log(f"  ✅ {interval} データベース更新完了。")
+
+                # --- 追加: ストップ高安（寄り付かず比例配分）バーの自動移植（未確定データ安全ガード付き） ---
+                if interval == "1d":
+                    try:
+                        updated_tickers = set(new_combined["ticker"].unique())
+                        db_1d_scope = db_df[db_df["ticker"].isin(updated_tickers)]
+                        stop_days_df = detect_allocation_stop_days(db_1d_scope)
+                        if not stop_days_df.empty:
+                            log(f"🚨 [S高/S安自動検知] 確定済み比例配分日を {len(stop_days_df)}件 検出。短期足へバーを自動移植します。")
+                            propagate_stop_allocation_bars_to_intraday(stop_days_df, is_jp=is_jp, log_func=log)
+                    except Exception as e:
+                        log(f"⚠️ ストップ高安バーの自動移植処理中にエラーが発生しました: {e}")
         else:
             log(f"  🧊 追加データはありません。")
 

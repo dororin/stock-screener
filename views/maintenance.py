@@ -32,7 +32,8 @@ from core.database_service import (
     full_rebuild_all_database,
     run_database_health_scan,
     apply_forced_scale_patch_to_all_timeframes,
-    apply_all_saved_patches
+    apply_all_saved_patches,
+    repair_stop_allocation_bars_full
 )
 
 # ── 日足の最新更新日の簡易取得 ──
@@ -119,6 +120,34 @@ def render_etf_manager():
                 st.rerun()
         else:
             st.caption("登録されている追加ETFはありません。")
+
+# ── ストップ高安（寄り付かず比例配分）バー一括修復コンポーネント ──
+def render_stop_allocation_repair_ui(is_jp: bool):
+    st.divider()
+    st.subheader("🩹 ストップ高安（寄り付かず比例配分）バー修復")
+    st.write(
+        "日足が「寄り付かずS高/S安（比例配分）」で確定している日について、"
+        "yfinanceの制限により短期足(60m/5m/1m)から消失している大引けバー"
+        "（日本株: 2024/11/5以降は15:30・それ以前は15:00）を自己生成・修復します。"
+        "未確定（当日中でまだ市場バッファ時間を過ぎていない等）のデータは自動的にスキップされ、"
+        "確定後に初めて処理対象となります（安全ガード）。何度実行しても結果は変わりません（べき等）。"
+    )
+    if st.button("🩹 ストップ高安バーを一括修復", key="btn_repair_stop_allocation", type="secondary"):
+        status_box = st.status("📡 ストップ高安バーの一括修復中...", expanded=True)
+        with status_box:
+            def update_status(msg):
+                st.write(msg)
+            try:
+                results = repair_stop_allocation_bars_full(is_jp=is_jp, status_callback=update_status)
+                total = sum(results.values()) if results else 0
+                if total > 0:
+                    status_box.update(label=f"✅ {total}件のバーを修復しました。", state="complete")
+                    st.success("短期足データベースのストップ高安バー修復が完了しました。")
+                else:
+                    status_box.update(label="🧊 修復対象はありませんでした。", state="complete")
+            except Exception as e:
+                status_box.update(label="❌ エラーが発生しました", state="error")
+                st.error(f"修復中にエラーが発生しました: {e}")
 
 # ── データベース健康診断コンポーネント ──
 def render_database_diagnostics_ui(is_jp: bool):
@@ -806,6 +835,9 @@ def render_full_rebuild_section(is_jp: bool, market_mode: str):
                     st.caption(f"⚠️ ログのドライブ保存に失敗しました: {log_e}")
 
 render_full_rebuild_section(is_jp, market_mode)
+
+# ストップ高安バー修復UIの表示
+render_stop_allocation_repair_ui(is_jp=is_jp)
 
 # 健康診断UIの表示
 render_database_diagnostics_ui(is_jp=is_jp)
