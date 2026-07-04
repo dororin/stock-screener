@@ -194,8 +194,9 @@ def check_processed_data_health(old_df: pd.DataFrame, new_df: pd.DataFrame) -> l
 
 def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataFrame:
     """
-    メモリ上で株式分割（stock splits）および崖を検知し、過去データを後方修正します。
-    (案A: stock splits カラムの値があり、かつ価格に実際の未調整の崖が存在する場合のみ1/splitsを適用します)
+    メモリ上で配信された株式分割情報（stock splits）に基づき、
+    実際の価格が未調整である場合（崖が残っている場合）のみ過去データを後方修正します。
+    マーカー（stock splits値）が存在しない急落に対する自動比率推測補正は行いません。
     """
     if df_ticker.empty or len(df_ticker) < 2:
         return df_ticker
@@ -208,7 +209,7 @@ def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataF
         if not split_events.empty:
             for idx in sorted(split_events.index, reverse=True):
                 if idx == 0:
-                    continue  # 分割日の前日データ（idx-1）がない場合は比率判定ができないためスルー
+                    continue  # 分割日の前日データ（idx-1）がない場合は比率判定ができないためスキップ
                 
                 split_val = df.loc[idx, "stock splits"]
                 if split_val <= 0:
@@ -220,12 +221,11 @@ def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataF
                 if pd.isna(pre_close) or pd.isna(post_close) or pre_close <= 0 or post_close <= 0:
                     continue
                 
-                # 分割前日と当日の実際の落差比率を算出
+                # 分割前日と当日の実際の価格比率を算出
                 actual_ratio = pre_close / post_close
                 
-                # 【案Aのコア条件】
-                # 実際の比率が、配信された分割比率（split_val）に一定の許容範囲（15%以内）で近いかどうかをチェック
-                # 比率が近ければ「データは未調整（崖がある）」とみなして過去データ（:idx-1）を後方補正
+                # 実際の価格落差が、配信された分割比率（split_val）に一定の許容範囲（15%以内）で近いかどうかを検証
+                # 比率が近ければ「崖が残っている（未調整）」とみなし、明示されたsplit_valを用いて後方補正を適用
                 if abs(actual_ratio - split_val) / split_val <= 0.15:
                     ratio = 1.0 / split_val
                     for col in price_cols:
@@ -233,40 +233,8 @@ def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataF
                     if "volume" in df.columns:
                         df.loc[:idx-1, "volume"] = df.loc[:idx-1, "volume"] / ratio
                 else:
-                    # 実際の落差が分割比率とかけ離れている場合（すでにyfinanceで調整済みであり落差が1.0付近の場合など）は
-                    # 二重調整を防止するため補正は行わずスルーします。
+                    # すでに調整済み、または比率が合致しない場合は二重調整防止のため補正は行わない
                     pass
-
-    # --- マーカーはないが、40%以上の急落（崖）がある場合の落差自動推測ロジック ---
-    pct_changes = df["close"].pct_change()
-    anomaly_mask = pct_changes <= -0.40
-    if anomaly_mask.any():
-        for idx in sorted(pct_changes[anomaly_mask].index, reverse=True):
-            if idx == 0:
-                continue
-            pre_close = df.loc[idx - 1, "close"]
-            post_close = df.loc[idx, "close"]
-            if pd.isna(pre_close) or pd.isna(post_close) or pre_close <= 0 or post_close <= 0:
-                continue
-            
-            raw_ratio = pre_close / post_close
-            
-            # 上記の前半処理で既に分割調整が適用済み（実際の落差比率が1.4未満に埋められた状態）である場合、
-            # この急落推測ロジックでの多重適用を防ぐためスキップします。
-            if raw_ratio < 1.4:
-                continue
-                
-            common_ratios = [1.5, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
-            est_ratio = min(common_ratios, key=lambda x: abs(x - raw_ratio))
-            if abs(est_ratio - raw_ratio) / raw_ratio > 0.15:
-                est_ratio = float(round(raw_ratio))
-                
-            if est_ratio >= 1.5:
-                ratio = 1.0 / est_ratio
-                for col in price_cols:
-                    df.loc[:idx-1, col] = df.loc[:idx-1, col] * ratio
-                if "volume" in df.columns:
-                    df.loc[:idx-1, "volume"] = df.loc[:idx-1, "volume"] / ratio
 
     return df
 
