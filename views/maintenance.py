@@ -31,13 +31,12 @@ from core.database_service import (
     apply_forced_scale_patch_to_all_timeframes,
     apply_all_saved_patches,
     repair_stop_allocation_bars_full,
-    rebuild_active_from_raw  # 追加
+    rebuild_active_from_raw
 )
 
 # ── 日足の最新更新日の簡易取得 ──
 def get_db_last_update(interval: str, is_jp: bool = True) -> str:
     try:
-        # 画面に表示する最終更新日はActive(実行用)DB基準
         df = load_price_db(interval, is_jp=is_jp, is_raw=False)
         if df.empty:
             return "不明"
@@ -78,9 +77,9 @@ def render_etf_manager():
                         col_add_left, col_add_right = st.columns([4, 1])
                         col_add_left.write(f"{code_str}　{name_str}")
                         if already:
-                            col_add_right.button("✅ 登録済", key=f"etf_add_btn_{code_str}", disabled=True, use_container_width=True)
+                            col_add_right.button("✅ 登録済", key=f"etf_add_btn_{code_str}", disabled=True, width='stretch')
                         else:
-                            if col_add_right.button("追加", key=f"etf_add_btn_{code_str}", use_container_width=True):
+                            if col_add_right.button("追加", key=f"etf_add_btn_{code_str}", width='stretch'):
                                 new_row = pd.DataFrame([{"code": code_str, "name": name_str, "memo": ""}])
                                 df = pd.concat([df, new_row], ignore_index=True)
                                 save_extra_tickers_to_sheets(df)
@@ -126,7 +125,7 @@ def render_stop_allocation_repair_ui(is_jp: bool):
     st.subheader("🩹 ストップ高安（寄り付かず比例配分）バー修復")
     st.write(
         "日足が「寄り付かずS高/S安（比例配分）」で確定している日について、"
-        "短期足(60m/5m/1m)から消失している大引けバーをRawデータからクリーンリビルドして再構築します。"
+        "短期足(60m/5m/1m)から消失している大引けバーをRawデータから加工リビルドして再構成します。"
     )
     if st.button("🩹 ストップ高安バーを一括修復", key="btn_repair_stop_allocation", type="secondary"):
         status_box = st.status("📡 ストップ高安バー修復に伴うActiveリビルド中...", expanded=True)
@@ -184,7 +183,7 @@ def render_database_diagnostics_ui(is_jp: bool):
         base_date = pd.to_datetime(detected_dates[0])
         
         try:
-            df_full = load_price_db(interval, is_jp=is_jp, is_raw=False) # ActiveDBをロード
+            df_full = load_price_db(interval, is_jp=is_jp, is_raw=False)
             df_ticker = df_full[df_full["ticker"] == ticker].copy()
             df_ticker["date"] = pd.to_datetime(df_ticker["date"])
             df_ticker = df_ticker.sort_values("date").reset_index(drop=True)
@@ -417,7 +416,6 @@ def render_manual_repair_section(is_jp: bool, dry_run_flag: bool):
             pure_t = sanitize_ticker(rep_ticker, is_jp=is_jp)
             market_str = "JP" if is_jp else "US"
             
-            # ── パターンA: 崖修正パッチの登録 ──
             if rep_date_str.strip() and rep_ratio_str.strip():
                 try:
                     multiplier = float(rep_ratio_str.strip())
@@ -437,14 +435,12 @@ def render_manual_repair_section(is_jp: bool, dry_run_flag: bool):
                     }
                     save_repair_log_to_sheets([log_row])
                     
-                    # 決定論的加工パイプラインで反映・検証
                     st.write("🔄 加工検証（Activeのバックビルド）を走らせています...")
                     for interval in settings.TIMEFRAMES:
                         rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run_flag)
                         
                     st.success("✅ パッチ定義が正常に保存され、加工検証が終了しました。")
             
-            # ── パターンB: 個別ダウンロード復元 ──
             elif not rep_date_str.strip() and not rep_ratio_str.strip():
                 with st.spinner(f"🔧 [{pure_t}] のRawデータ部分ダウンロード及びActive再生成中..."):
                     results = repair_single_ticker_all_timeframes(pure_t, is_jp=is_jp)

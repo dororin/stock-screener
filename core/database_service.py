@@ -152,25 +152,21 @@ def check_anomaly_need_patch(df_ticker: pd.DataFrame, cliff_date_str: str, multi
 # =====================================================================
 
 def check_processed_data_health(old_df: pd.DataFrame, new_df: pd.DataFrame) -> list:
-    """新旧のActiveデータを比較し、不審な変化（行数激減、極端な価格ジャンプなど）を検知します。"""
     alerts = []
     if old_df is None or old_df.empty or new_df is None or new_df.empty:
         return alerts
 
-    # 1. 総行数減少チェック
     old_cnt = len(old_df)
     new_cnt = len(new_df)
-    if new_cnt < old_cnt * 0.95:  # 5%以上の行数減少
+    if new_cnt < old_cnt * 0.95:
         alerts.append(f"⚠️ [行数激減] 行数が減少しています: {old_cnt:,} ➔ {new_cnt:,} (減少率: {(1 - new_cnt/old_cnt)*100:.1f}%)")
 
-    # 2. 銘柄数の減少チェック
     old_tickers = set(old_df["ticker"].unique())
     new_tickers = set(new_df["ticker"].unique())
     missing_tickers = old_tickers - new_tickers
     if missing_tickers:
         alerts.append(f"⚠️ [銘柄喪失] 以下の銘柄がデータから消失しています: {list(missing_tickers)[:10]}")
 
-    # 3. 極端な価格変化（加工バグによる1円化や巨大化など）の検知
     common_tickers = old_tickers & new_tickers
     if common_tickers:
         sample_tickers = list(common_tickers)[:30]
@@ -185,7 +181,6 @@ def check_processed_data_health(old_df: pd.DataFrame, new_df: pd.DataFrame) -> l
         )
         if not merged.empty:
             merged["ratio"] = merged["close_new"] / merged["close_old"]
-            # 10倍以上の高騰または10分の1以下の暴落（バグの可能性大）
             crazy_changes = merged[(merged["ratio"] >= 10.0) | (merged["ratio"] <= 0.1)]
             if not crazy_changes.empty:
                 sample_crazy = crazy_changes.iloc[0]
@@ -198,14 +193,12 @@ def check_processed_data_health(old_df: pd.DataFrame, new_df: pd.DataFrame) -> l
     return alerts
 
 def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataFrame:
-    """1つの銘柄の時系列データを読み込み、過去に遡って株式分割の調整（逆向きスケール）を決定論的に一括適用します。"""
     if df_ticker.empty or len(df_ticker) < 2:
         return df_ticker
         
     df = df_ticker.sort_values("date").reset_index(drop=True)
     price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in df.columns]
     
-    # 1. 明示的な 'stock splits' 列による調整
     if "stock splits" in df.columns:
         split_events = df[(df["stock splits"] > 0) & (df["stock splits"] != 1.0)]
         if not split_events.empty:
@@ -217,7 +210,6 @@ def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataF
                 if "volume" in df.columns:
                     df.loc[:idx-1, "volume"] = df.loc[:idx-1, "volume"] / ratio
 
-    # 2. 'stock splits' に現れない急激な崖（自動検知：例: -40%以下の急落）の調整
     pct_changes = df["close"].pct_change()
     anomaly_mask = pct_changes <= -0.40
     if anomaly_mask.any():
@@ -242,7 +234,6 @@ def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataF
     return df
 
 def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True) -> pd.DataFrame:
-    """メモリ上のDataFrameに対して、保存済みの手動パッチ（スプレッドシートの修復ログ）を一括適用します。"""
     try:
         from data_access.sheets_api import load_repair_log_from_sheets
         log_df = load_repair_log_from_sheets()
@@ -255,7 +246,6 @@ def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True) -> pd.DataFr
     market_str = "JP" if is_jp else "US"
     df_result = df.copy()
     
-    # 崖日時でソートして過去に遡って適用（干渉を防ぐため最新パッチから適用）
     log_df["parsed_date"] = pd.to_datetime(log_df["cliff_date"], errors="coerce")
     log_df = log_df.dropna(subset=["parsed_date"]).sort_values("parsed_date", ascending=False)
 
@@ -275,7 +265,6 @@ def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True) -> pd.DataFr
         if not mask.any():
             continue
 
-        # すでに調整済みの崖かどうかの断絶事前チェック（二重適用を完全防止）
         ticker_data = df_result[mask].copy()
         if not check_anomaly_need_patch(ticker_data, cliff_date, multiplier):
             continue
@@ -291,7 +280,6 @@ def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True) -> pd.DataFr
     return df_result
 
 def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intra_active: pd.DataFrame, is_jp: bool = True) -> pd.DataFrame:
-    """メモリ上で、1dのストップ高安（比例配分）日を検出し、短期足DataFrameにバーを移植（置換）します。"""
     if df_intra_active.empty:
         return df_intra_active
 
@@ -321,46 +309,34 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
     return df_intra
 
 def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = False, status_callback=None) -> bool:
-    """
-    不変のRaw（生） Parquetデータベースを読み込み、クレンジング・分割調整・パッチ適用を
-    すべてメモリ上で行って完璧なActiveデータベースを再構築（Transform）します。
-    Dry Run時には健康診断を実行し、問題がなければディスクに保存します（Dry Run時はスキップ）。
-    """
     def log(msg):
         print(msg)
         if status_callback: status_callback(msg)
 
-    log(f"🏗️ [{interval}] RawデータからActiveデータのビルドを開始します...")
+    log(f"🏗️ [{interval}] RawデータからActiveデータの加工ビルドを開始します...")
     
-    # 1. Rawデータの読み込み
     df_raw = load_price_db(interval, is_jp=is_jp, is_raw=True)
     if df_raw.empty:
-        log("❌ Rawデータベースファイルが存在しないか、空です。")
+        log("❌ Rawデータベースファイルが空、または検出されません。")
         return False
 
-    # 2. 基本クレンジング & 確定フラグ付与
     df_raw["is_finalized"] = compute_is_finalized(df_raw["date"], interval, is_jp=is_jp)
 
-    # 3. 株式分割調整（決定論的バックワードスケール）を一括適用
     processed_parts = []
     for ticker, group in df_raw.groupby("ticker"):
         adjusted_group = adjust_ticker_splits_backward_in_memory(group)
         processed_parts.append(adjusted_group)
     df_processed = pd.concat(processed_parts, ignore_index=True)
 
-    # 4. スプレッドシートから取得した手動パッチのメモリ上適用
     df_processed = apply_saved_patches_to_df(df_processed, is_jp=is_jp)
 
-    # 5. 短期足の場合、1dアクティブから「ストップ高安（比例配分）バー」を自動移植
     if interval != "1d":
         try:
-            # 移植元の1d Activeをロード
             df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False)
             df_processed = propagate_stop_allocation_bars_in_memory(df_1d_active, df_processed, is_jp=is_jp)
         except Exception as e:
             log(f"⚠️ ストップ高安バーの自動移植はスキップされました: {e}")
 
-    # 6. 健康チェック（新旧 Active の比較アサーション）
     try:
         df_old_active = load_price_db(interval, is_jp=is_jp, is_raw=False)
     except FileNotFoundError:
@@ -368,23 +344,29 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
 
     alerts = check_processed_data_health(df_old_active, df_processed)
     if alerts:
-        log("💥 【警告】健康診断チェックで異常が検出されました:")
+        log("💥 【警告】ビルド後の健康診断チェックで異常を検出しました:")
         for alert in alerts:
             log(f"   {alert}")
-        
-        # 深刻なエラー（価格異常など）がDry Run中に検出された場合は構築を安全に中断
         if any("🚨" in a for a in alerts):
-            log("🛑 深刻な異常データが検出されたため、データの破壊を未然に防止すべく処理を強制中断しました。")
+            log("🛑 深刻なデータ不整合（ジャンプなど）を検出したため、破損防止のため同期を強制中断しました。")
             return False
 
-    # 7. 保存（Dry Run時はスキップ）
     if dry_run:
-        log("🧪 [DRY RUN] 正常に加工検証を通過しました。ファイルへの書き込みはスキップされました。")
+        log("🧪 [DRY RUN] 加工・検証を正常に通過。ファイル上書きはスキップ（安全検証モード）。")
         return True
     else:
         df_processed = df_processed.sort_values(["ticker", "date"]).reset_index(drop=True)
-        save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False)
-        log(f"✅ Activeデータベースの構築が正常に完了し、保存されました。({len(df_processed):,}件)")
+        # Googleドライブへの保存成否とエラーメッセージを受け取る
+        cloud_success, cloud_msg = save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False)
+        
+        if cloud_success:
+            log(f"✅ [{interval}] ActiveデータベースをGoogleドライブへ正常に保存しました。")
+        else:
+            log(f"⚠️ 【重要警告】[{interval}] Googleドライブへの同期に失敗しました（一時的にローカルフォルダに保存）。")
+            log(f"   ❌ エラー詳細: {cloud_msg}")
+            if "storageQuotaExceeded" in cloud_msg or "storage quota" in cloud_msg.lower():
+                log("   💡 【解決方法】サービスアカウントのストレージ容量制限（0GB）に衝突しています。")
+                log("      事前に同名ファイルをあなたのGoogleアカウントからアップロードして、所有者をご自身に変更してください。")
         return True
 
 # =====================================================================
@@ -392,7 +374,6 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
 # =====================================================================
 
 def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None):
-    """yfinanceから最新の差分データをダウンロードし、未加工のRawデータベースへ単純マージして保存します。"""
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
     
@@ -430,7 +411,7 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
             log(f"  🔍 ベンチマーク最新: {bm_last_date} | Raw DB最新: {db_max_date}")
             if bm_last_date is not None:
                 if bm_last_date <= db_max_date:
-                    log(f"  ✨ 最新状態のため、この時間足のデータ収集はスキップします。")
+                    log(f"  ✨ 最新状態のため、差分ダウンロードはスキップします。")
                     continue
 
         last_updates_map = {}
@@ -494,7 +475,6 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                     continue
                 start_date_str = start_date_dt.strftime("%Y-%m-%d")
 
-            # yfinance取得可能期限切れの事前検知
             if interval in YFINANCE_GAP_LIMITS:
                 limit_days = YFINANCE_GAP_LIMITS[interval]
                 try:
@@ -508,8 +488,7 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                         sample_tickers = ", ".join(chunk_tickers[:5]) + ("..." if len(chunk_tickers) > 5 else "")
                         log(
                             f"⚠️【警告】[{interval}] {sample_tickers} の空白期間が {gap_days} 日となり、"
-                            f"yfinanceの取得可能上限（{limit_days}日）を超えたため差分同期できません。"
-                            f"後から一括再構築を実行してください。"
+                            f"yfinanceの上限（{limit_days}日）を超えたため差分同期できません。手動リビルドを行ってください。"
                         )
                         continue
 
@@ -538,34 +517,30 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
         if all_downloaded:
             new_combined = pd.concat(all_downloaded, ignore_index=True)
             if not df_raw_db.empty:
-                # 重複のない単純なマージ
                 df_raw_db = pd.concat([df_raw_db, new_combined], ignore_index=True)
                 df_raw_db = df_raw_db.drop_duplicates(subset=["date", "ticker"], keep="last")
             else:
                 df_raw_db = new_combined
             
             df_raw_db = df_raw_db.sort_values(["ticker", "date"]).reset_index(drop=True)
-            save_price_db(df_raw_db, interval, is_jp=is_jp, is_raw=True)
-            log(f"  📥 Rawデータ差分保存完了。({len(new_combined):,}件追加)")
+            # RawDBの保存
+            cloud_success, cloud_msg = save_price_db(df_raw_db, interval, is_jp=is_jp, is_raw=True)
+            if cloud_success:
+                log(f"  📥 Rawデータ差分保存完了。({len(new_combined):,}件追加)")
+            else:
+                log(f"  ⚠️ [Raw保存警告] Googleドライブへの同期に失敗しました（ローカルのみ）。エラー: {cloud_msg}")
         else:
-            log(f"  🧊 yfinanceからの追加データはありません。")
+            log(f"  🧊 yfinanceからの差分データはありません。")
 
 def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None, dry_run: bool = False):
-    """
-    【一元化された同期フロー】
-    1. 最新データを安全な未加工のRaw Parquetに差分同期（ダウンロード＆単純マージ保存）。
-    2. 決定論的加工パイプラインを走らせ、加工済みのActive Parquetを構築・検証・保存。
-    """
     def log(msg):
         print(msg)
         if status_callback: status_callback(msg)
 
-    # 1. Rawデータの単純ダウンロードと蓄積
-    log("📡 1. yfinanceからのRawデータ収集を開始します...")
+    log("📡 1. yfinanceからのRawデータ差分取得を開始します...")
     update_raw_database(is_jp=is_jp, target_tickers=target_tickers, force_refetch=force_refetch, status_callback=status_callback)
 
-    # 2. 各タイムフレームの加工・健康診断・Active保存
-    log("🛠️ 2. RawデータからのActiveデータベース一括再構築と検証を開始します...")
+    log("🛠️ 2. RawデータからActiveデータベース一括加工・検証ビルドを開始します...")
     for interval in settings.TIMEFRAMES:
         rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, status_callback=status_callback)
 
@@ -574,7 +549,6 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
 # =====================================================================
 
 def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_callback=None, dry_run: bool = False) -> bool:
-    """指定市場の該当時間足Rawデータを完全新規取得し、その後ActiveデータをTransform構築します。"""
     def log(msg):
         print(msg)
         if status_callback: status_callback(msg)
@@ -629,11 +603,12 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
         final_df = pd.concat(all_downloaded, ignore_index=True)
         final_df = final_df.sort_values(["ticker", "date"]).reset_index(drop=True)
         
-        # Rawデータとして保存
-        save_price_db(final_df, interval, is_jp=is_jp, is_raw=True)
-        log("📥 Rawデータベースのフル構築が成功しました。続いてActiveデータのビルドと検証に入ります。")
+        cloud_success, cloud_msg = save_price_db(final_df, interval, is_jp=is_jp, is_raw=True)
+        if cloud_success:
+            log("📥 Rawデータベースのフル構築に成功しました。続いてActiveデータのビルドと検証に入ります。")
+        else:
+            log(f"⚠️ [Raw保存警告] RawデータのGoogleドライブ同期に失敗しました。エラー: {cloud_msg}")
         
-        # RawデータからActiveデータを生成
         return rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, status_callback=status_callback)
     
     return False
@@ -643,12 +618,6 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
 # =====================================================================
 
 def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, multiplier: float, is_jp: bool = True) -> dict:
-    """
-    注意: この関数は、手動パッチ定義をスプレッドシート等に保存する際、
-    ローカルのParquet（Active）に直接「先行適用」する場合にのみ使用されます。
-    新設計では、パッチ定義が保存されると、次回の `rebuild_active_from_raw` にて
-    RawデータからActiveがクリーンビルドされる段階で自動かつ安全に適用されます。
-    """
     if multiplier <= 0:
         return {"error": f"処理を中断しました。倍率に 0 以下の数値（{multiplier}）は指定できません。"}
 
@@ -707,7 +676,6 @@ def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, mul
     return results
 
 def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
-    """スプレッドシートのパッチログに基づき、各時間足のActive Parquetを一括クリーンリビルドして安全にパッチを完全復元します。"""
     def log(msg):
         print(msg)
         if status_callback: status_callback(msg)
@@ -716,7 +684,6 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
     
     success_count = 0
     for interval in settings.TIMEFRAMES:
-        # メモリ上で無加工Rawから手動パッチを適用したActiveを生成し、上書き保存する
         success = rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False, status_callback=status_callback)
         if success:
             success_count += 1
@@ -725,7 +692,6 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
     return success_count
 
 def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_split_ratio: float = None) -> dict:
-    """指定された特定銘柄の1d〜1mすべての時間足をRawデータベースから部分置換ダウンロードし、Activeをリビルド修復します。"""
     pure_ticker = sanitize_ticker(ticker, is_jp)
     symbol = get_download_symbol(pure_ticker, is_jp)
     now = datetime.now()
@@ -733,7 +699,6 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
 
     for interval in ["1d", "60m", "5m", "1m"]:
         try:
-            # 1. 既存のRawデータをロード
             try:
                 raw_db = load_price_db(interval, is_jp=is_jp, is_raw=True)
             except FileNotFoundError:
@@ -745,7 +710,6 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
             elif interval == "60m": start_date_dt = now - timedelta(days=718)
             else: start_date_dt = datetime(2016, 1, 1)
 
-            # 2. yfinanceから完全新規（または期間一杯）ダウンロード
             df_raw = yf.download(symbol, start=start_date_dt.strftime("%Y-%m-%d"), interval=interval, auto_adjust=False, actions=True, progress=False)
             if df_raw.empty:
                 results[interval] = "新規データ空（置換なし）"
@@ -755,7 +719,6 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
                 results[interval] = "パース結果空（置換なし）"
                 continue
 
-            # 3. Rawデータ上で部分置換マージを実行
             if not old_raw.empty:
                 new_dates = pd.to_datetime(new_df["date"])
                 old_raw["date_dt"] = pd.to_datetime(old_raw["date"])
@@ -771,10 +734,10 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
             raw_db = pd.concat([raw_db, merged_raw], ignore_index=True)
             raw_db = raw_db.sort_values(["ticker", "date"]).reset_index(drop=True)
             
-            # 4. Rawとして保存
+            # Rawとして保存
             save_price_db(raw_db, interval, is_jp=is_jp, is_raw=True)
             
-            # 5. Active側へTransformを適用してActiveを上書き保存
+            # Activeを再構築
             rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False)
             results[interval] = f"個別ダウンロード・Active再生成成功 ({len(merged_raw):,}件)"
         except Exception as e:
@@ -783,14 +746,12 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
     return results
 
 def delete_data_before_date(ticker: str, limit_date_str: str, is_jp: bool = True) -> dict:
-    """指定された特定銘柄において、指定日以前（含む）のデータをRaw/Activeすべての時間足から完全に物理削除します。"""
     pure_ticker = sanitize_ticker(ticker, is_jp)
     limit_dt = pd.to_datetime(limit_date_str)
     results = {}
 
     for interval in ["1d", "60m", "5m", "1m"]:
         try:
-            # Rawデータの物理削除
             df_raw = load_price_db(interval, is_jp=is_jp, is_raw=True)
             if not df_raw.empty:
                 df_raw["temp_date"] = pd.to_datetime(df_raw["date"])
@@ -800,9 +761,10 @@ def delete_data_before_date(ticker: str, limit_date_str: str, is_jp: bool = True
                     df_raw = df_raw[~mask_to_delete].copy()
                     df_raw = df_raw.drop(columns=["temp_date"])
                     df_raw = df_raw.sort_values(["ticker", "date"]).reset_index(drop=True)
+                    # Rawデータの保存
                     save_price_db(df_raw, interval, is_jp=is_jp, is_raw=True)
                     
-                    # 削除したRawをベースにActiveをクリーン再構成
+                    # 削除されたRawからActiveを再構築
                     rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False)
                     results[interval] = f"Raw/Activeから {deleted_count:,} 件を正常物理削除"
                 else:
@@ -817,11 +779,10 @@ def delete_data_before_date(ticker: str, limit_date_str: str, is_jp: bool = True
     return results
 
 # =====================================================================
-# 🔍 診断関連関数群（従来関数の互換性維持：Active DBを対象に動作）
+# 🔍 診断関連関数群
 # =====================================================================
 
 def repair_stop_allocation_bars_full(is_jp: bool = True, status_callback=None) -> dict:
-    """Activeデータベースに対して、比例配分日の大引け固定バーの修復を一括で再構成します。"""
     def log(msg):
         print(msg)
         if status_callback: status_callback(msg)
@@ -831,14 +792,14 @@ def repair_stop_allocation_bars_full(is_jp: bool = True, status_callback=None) -
     for interval in ["60m", "5m", "1m"]:
         success = rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False, status_callback=status_callback)
         if success:
-            results[interval] = 1 # 便宜上の正常修復完了コード
+            results[interval] = 1 
     return results
 
 def run_database_health_scan(is_jp: bool) -> list:
     anomalies = []
     for interval in ["1d", "60m", "5m", "1m"]:
         try:
-            df = load_price_db(interval, is_jp=is_jp, is_raw=False) # 成果物Activeを診断
+            df = load_price_db(interval, is_jp=is_jp, is_raw=False) 
             if df.empty:
                 continue
             df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
@@ -953,7 +914,7 @@ def run_database_health_scan(is_jp: bool) -> list:
 
 def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: float = 0.35) -> pd.DataFrame:
     try:
-        db_df = load_price_db(interval, is_jp=is_jp, is_raw=False) # ActiveDBをスキャン
+        db_df = load_price_db(interval, is_jp=is_jp, is_raw=False) 
     except FileNotFoundError:
         return pd.DataFrame()
     if db_df.empty:
@@ -1049,7 +1010,7 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
 
 def analyze_db_update_needs(is_jp: bool = True) -> dict:
     try:
-        db_df = load_price_db("1d", is_jp=is_jp, is_raw=True) # NeedsはRawデータ基準で判定
+        db_df = load_price_db("1d", is_jp=is_jp, is_raw=True) 
         all_tickers = get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
         today = datetime.now().date()
 

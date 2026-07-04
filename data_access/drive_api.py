@@ -6,12 +6,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from config import settings
 
 def get_drive_service():
-    """
-    環境（Streamlitか、Kaggle/Colab/ローカルスクリプトか）を判別し、
-    Google Drive APIサービスインスタンスを返します。
-    """
     if not settings.HAS_STREAMLIT:
-        # ローカル/スクリプト実行時
         try:
             import toml
             secrets_path = os.path.join(settings.PROJECT_ROOT, ".streamlit", "secrets.toml")
@@ -25,7 +20,6 @@ def get_drive_service():
             pass
         return None
 
-    # Streamlit Cloud環境
     try:
         import streamlit as st
         if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
@@ -41,7 +35,6 @@ def get_drive_service():
     return None
 
 def download_from_drive_api(filename: str, local_path: str) -> bool:
-    """指定されたファイルをGoogle Driveからダウンロードし、ローカルに保存します。"""
     service = get_drive_service()
     if not service or not settings.FOLDER_ID:
         return False
@@ -63,15 +56,16 @@ def download_from_drive_api(filename: str, local_path: str) -> bool:
     except Exception:
         return False
 
-def upload_to_drive_api(filename: str, local_path: str) -> bool:
-    """指定されたローカルファイルをGoogle Driveにアップロード（または上書き）します。"""
+def upload_to_drive_api(filename: str, local_path: str) -> tuple[bool, str]:
+    """
+    指定されたローカルファイルをGoogle Driveにアップロード（または上書き）します。
+    戻り値: (成功成否のbool値, 処理メッセージまたは例外エラー詳細文字列)
+    """
     service = get_drive_service()
     if not service:
-        print("⚠️ [Drive API] Google Drive サービスインスタンスの作成に失敗しました。認証情報(secrets)を確認してください。")
-        return False
+        return False, "Google Drive サービスインスタンスの作成に失敗しました。secrets定義を確認してください。"
     if not settings.FOLDER_ID:
-        print("⚠️ [Drive API] FOLDER_ID が設定されていません。")
-        return False
+        return False, "FOLDER_ID（共有フォルダID）が設定されていません。"
         
     try:
         query = f"name='{filename}' and '{settings.FOLDER_ID}' in parents and trashed=false"
@@ -82,15 +76,12 @@ def upload_to_drive_api(filename: str, local_path: str) -> bool:
         if items:
             file_id = items[0]['id']
             service.files().update(fileId=file_id, media_body=media).execute()
-            print(f"☁️ [Drive API] 既存ファイル {filename} を正常に上書き（update）しました。")
+            return True, "既存ファイルを正常に上書き（update）しました。"
         else:
             file_metadata = {'name': filename, 'parents': [settings.FOLDER_ID]}
             service.files().create(body=file_metadata, media_body=media).execute()
-            print(f"☁️ [Drive API] 新規ファイル {filename} を正常に作成（create）しました。")
-        return True
+            return True, "新規ファイルを正常に作成（create）しました。"
     except Exception as e:
-        # ⚠️ 例外を隠さず、Streamlitのログ（黒い画面）に具体的なエラー内容を書き出す
-        print(f"❌ [Drive API] Google Driveへのアップロード中にエラーが発生しました: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        return False, str(e)
