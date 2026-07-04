@@ -1108,6 +1108,227 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
     result = result.groupby(["ticker", "cliff_date"], as_index=False).apply(aggregate_anomalies)
     return result.sort_values(["ticker", "cliff_date"]).reset_index(drop=True)
 
+# =====================================================================
+# 🌐 TradingView 照合付き統合スキャン ＆ 一括自動修復エンジン
+# =====================================================================
+
+_TV_CLIENT_FALLBACK = None  # Streamlit実行環境外（バッチ処理等）での簡易シングルトン用フォールバック
+
+def _create_tv_client_instance():
+    """tvDatafeedクライアントの実インスタンス生成処理（ログイン試行はここでのみ発生）。"""
+    try:
+        from tvDatafeed import TvDatafeed
+        return TvDatafeed()
+    except Exception:
+        return False
+
+if settings.HAS_STREAMLIT:
+    import streamlit as st
+
+    @st.cache_resource(show_spinner=False)
+    def _get_tv_client_cached():
+        """
+        Streamlitの st.cache_resource でTradingView接続オブジェクトをキャッシュ化（シングルトン化）します。
+        画面操作のたびにスクリプトが再実行（リラン）されても、ここで一度確立した接続は
+        プロセス内で使い回されるため、ログイン試行過多によるアカウント一時ロックや
+        読み込み遅延を防止します。
+        """
+        return _create_tv_client_instance()
+
+def _get_tv_client():
+    """
+    tvdatafeed クライアントを取得します（匿名・遅延データ取得）。
+    Streamlit環境では @st.cache_resource によりキャッシュされたインスタンスを再利用し、
+    それ以外（バッチスクリプト等）ではモジュールレベルの簡易シングルトンで代用します。
+    """
+    if settings.HAS_STREAMLIT:
+        return _get_tv_client_cached()
+
+    global _TV_CLIENT_FALLBACK
+    if _TV_CLIENT_FALLBACK is None:
+        _TV_CLIENT_FALLBACK = _create_tv_client_instance()
+    return _TV_CLIENT_FALLBACK
+
+# --- yfinance ⇔ TradingView シンボル表現の対応マッピング ---
+# yfinance側で使われる特殊表記（ハイフン区切りの種類株、指数の^プレフィックスなど）を
+# TradingView側の表記・取引所へ変換するためのルール。
+JP_INDEX_TICKER_TV_MAP = {
+    "^N225": {"symbol": "NI225", "exchange": "TVC"},
+    "1306.T": {"symbol": "1306", "exchange": "TSE"},
+}
+US_INDEX_TICKER_TV_MAP = {
+    "^GSPC": {"symbol": "SPX", "exchange": "TVC"},
+    "^NDX": {"symbol": "NDX", "exchange": "NASDAQ"},
+    "^DJI": {"symbol": "DJI", "exchange": "TVC"},
+}
+# yfinanceのハイフン区切り種類株（例: BRK-B, BF-B）はTradingViewではドット区切り（BRK.B）
+US_SHARE_CLASS_HYPHEN_PATTERN = True  # 下の関数内でハイフン→ドット変換として一律処理
+
+def map_ticker_to_tv_symbol(ticker: str, is_jp: bool = True) -> dict:
+    """
+    yfinance表記のティッカーを、TradingView(tvdatafeed)が要求する
+    {"symbol":..., "exchange":...} 形式へ変換します。
+    個別の対応関係が判明していない銘柄は、フォールバックの推測ルールを適用します。
+    """
+    raw_ticker = str(ticker).strip()
+
+    # 1. 指数・ベンチマーク（^プレフィックス）の個別マッピング
+    index_map = JP_INDEX_TICKER_TV_MAP if is_jp else US_INDEX_TICKER_TV_MAP
+    if raw_ticker in index_map:
+        return index_map[raw_ticker]
+
+    pure_ticker = sanitize_ticker(raw_ticker, is_jp)
+
+    if is_jp:
+        # 日本株・日本ETF: 数字コードはyfinance/TradingViewでほぼ共通表記のため、TSE固定でそのまま利用
+        return {"symbol": pure_ticker, "exchange": "TSE"}
+
+    # 2. 米国株の種類株表記変換: yfinanceの "BRK-B" 形式 → TradingViewの "BRK.B" 形式
+    tv_symbol = pure_ticker.replace("-", ".") if "-" in pure_ticker else pure_ticker
+
+    return {"symbol": tv_symbol, "exchange": None}  # exchangeはNone＝候補を順に試す
+
+def fetch_tv_close_price(ticker: str, cliff_date, is_jp: bool = True):
+    """
+    TradingViewの非公式API（tvdatafeed）を用いて、指定銘柄・指定日の
+    正しい終値（Close）をピンポイントで取得します。取得できない場合は None を返します。
+    """
+    tv = _get_tv_client()
+    if not tv:
+        return None
+
+    try:
+        from tvDatafeed import Interval as TvInterval
+    except Exception:
+        return None
+
+    try:
+        target_date = pd.Timestamp(cliff_date).normalize()
+    except Exception:
+        return None
+
+    mapped = map_ticker_to_tv_symbol(ticker, is_jp)
+    symbol = mapped["symbol"]
+    fixed_exchange = mapped.get("exchange")
+    exchange_candidates = [fixed_exchange] if fixed_exchange else ["NASDAQ", "NYSE", "AMEX"]
+    days_back = int(max((pd.Timestamp.now().normalize() - target_date).days + 30, 60))
+
+    for exchange in exchange_candidates:
+        try:
+            hist = tv.get_hist(symbol=symbol, exchange=exchange, interval=TvInterval.in_daily, n_bars=days_back)
+        except Exception:
+            continue
+        if hist is None or hist.empty:
+            continue
+        hist = hist.copy()
+        hist.index = pd.to_datetime(hist.index).normalize()
+        if target_date in hist.index:
+            try:
+                return float(hist.loc[target_date, "close"])
+            except Exception:
+                continue
+    return None
+
+def scan_and_diagnose_cliffs_with_tv(is_jp: bool = True, interval: str = "1d") -> pd.DataFrame:
+    """
+    「段差（Cliff）検出」と「TradingViewを用いた終値照合」を一本化した統合スキャン関数。
+    yfinanceの推測倍率（est_multiplier）に加え、TradingViewの正しい終値との比較から
+    「真の倍率（true_multiplier）」を自動算出します。
+    画面をシンプルにするため、当日の四本値（Open/High/Low）および変化率は結果から除外します。
+    """
+    base_df = scan_all_anomalies(is_jp=is_jp, interval=interval)
+    if base_df.empty:
+        return base_df
+
+    result = base_df.copy()
+    result["tv_close"] = float("nan")
+    result["true_multiplier"] = float("nan")
+
+    for idx, row in result.iterrows():
+        ticker = row["ticker"]
+        cliff_date = row["cliff_date"]
+        after_close = row.get("after_close", float("nan"))
+
+        tv_close = fetch_tv_close_price(ticker, cliff_date, is_jp=is_jp)
+        if tv_close is None or pd.isna(after_close) or after_close == 0:
+            continue
+
+        result.at[idx, "tv_close"] = tv_close
+        result.at[idx, "true_multiplier"] = tv_close / after_close
+
+    drop_cols = [c for c in ["open", "high", "low", "pct_change"] if c in result.columns]
+    result = result.drop(columns=drop_cols)
+    return result.sort_values(["ticker", "cliff_date"]).reset_index(drop=True)
+
+def apply_bulk_selected_patches(patches: list, is_jp: bool = True, status_callback=None) -> dict:
+    """
+    統合スキャンのテーブルでチェックされた複数パッチ（[{"ticker","cliff_date","multiplier"}, ...]）を
+    ループで一括本番適用します。
+
+    各銘柄・時間足への適用直前に既存の check_anomaly_need_patch() による
+    二重適用防止判定が自動的に働くため（apply_forced_scale_patch_to_all_timeframes内部）、
+    すでに修復済みと判定されたものは自動でスキップされ、修復ログにも記録されません。
+    """
+    def log(msg):
+        print(msg)
+        if status_callback: status_callback(msg)
+
+    market_str = "JP" if is_jp else "US"
+    repaired_count = 0
+    skipped_count = 0
+    log_rows = []
+
+    for patch in patches:
+        ticker = patch.get("ticker")
+        cliff_date = patch.get("cliff_date")
+        multiplier = patch.get("multiplier")
+
+        if not ticker or not cliff_date or multiplier is None or pd.isna(multiplier) or multiplier <= 0:
+            log(f"⚠️ [{ticker}] 真の倍率が取得できていないため、この行はスキップしました。")
+            skipped_count += 1
+            continue
+
+        pure_t = sanitize_ticker(ticker, is_jp)
+        try:
+            cliff_dt_str = pd.to_datetime(cliff_date).strftime("%Y-%m-%d")
+        except Exception:
+            log(f"⚠️ [{ticker}] 崖日付が不正なためスキップしました。")
+            skipped_count += 1
+            continue
+
+        log(f"🔧 [{pure_t}] {cliff_dt_str} の一括修復パッチを判定・適用中（倍率: {multiplier:.6f}）...")
+        results = apply_forced_scale_patch_to_all_timeframes(pure_t, cliff_dt_str, multiplier, is_jp=is_jp)
+
+        applied_intervals = [iv for iv, msg in results.items() if "補正適用完了" in str(msg)]
+
+        if applied_intervals:
+            repaired_count += 1
+            log(f"   ✅ 適用完了 ({', '.join(applied_intervals)})")
+            log_rows.append({
+                "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ticker": pure_t,
+                "market": market_str,
+                "cliff_date": cliff_dt_str,
+                "interval": ",".join(applied_intervals),
+                "before_close": "",
+                "after_close": "",
+                "multiplier": multiplier,
+                "memo": "統合スキャン・一括自動修復（TradingView照合）",
+            })
+        else:
+            skipped_count += 1
+            log(f"   ⏭️ スキップ（すでに修復済み、または対象データなし）")
+
+    if log_rows:
+        try:
+            from data_access.sheets_api import save_repair_log_to_sheets
+            save_repair_log_to_sheets(log_rows)
+            log(f"📝 実際に修復が実行された {len(log_rows)} 件のみをrepair_logへ記録しました。")
+        except Exception as e:
+            log(f"⚠️ 修復ログの保存に失敗しました: {e}")
+
+    return {"repaired": repaired_count, "skipped": skipped_count}
+
 def analyze_db_update_needs(is_jp: bool = True) -> dict:
     try:
         db_df = load_price_db("1d", is_jp=is_jp, is_raw=True) 

@@ -16,3 +16,6 @@ pandas-datareader
 pyarrow
 fastparquet
 streamlit-lightweight-charts
+websocket-client
+# 安定版のGitHubリポジトリから直接指定（Selenium依存が取り除かれた最新のフォーク版が推奨されます）
+git+https://github.com/rongardF/tvdatafeed.git

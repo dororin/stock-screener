@@ -32,7 +32,9 @@ from core.database_service import (
     apply_all_saved_patches,
     repair_stop_allocation_bars_full,
     rebuild_active_from_raw,
-    test_forced_scale_patch_in_memory  # 追加
+    test_forced_scale_patch_in_memory,  # 追加
+    scan_and_diagnose_cliffs_with_tv,   # 追加：統合スキャン（TradingView照合）
+    apply_bulk_selected_patches         # 追加：チェックボックス選択パッチの一括本番適用
 )
 
 # ── 日足の最新更新日の簡易取得 ──
@@ -163,7 +165,93 @@ def render_stop_allocation_repair_ui(is_jp: bool):
                 status_box.update(label="❌ エラーが発生しました", state="error")
                 st.error(f"修復中にエラー: {e}")
 
-# ── データベース健康診断コンポーネント ──
+# ── 🔍 統合データスキャン（TradingView自動照合・チェックボックス一括修復）コンポーネント ──
+def render_unified_scan_and_repair_ui(is_jp: bool):
+    st.divider()
+    st.subheader("🔍 統合データスキャン（自動検出 → TradingView照合 → 一括自動修復）")
+    st.write(
+        "「異常データスキャン」と「データベース健康診断」を統合。日足の段差・マイナス転換を自動検出し、"
+        "TradingViewの正しい終値と自動照合して「真の倍率」を算出します。"
+        "チェックボックスで選択した行だけを、ワンクリックで安全に一括本番修復できます。"
+    )
+
+    if st.button("🔍 統合スキャンを実行", key="btn_unified_scan", type="primary", use_container_width=True):
+        with st.spinner("段差検出とTradingViewデータ照合を実行中..."):
+            st.session_state.unified_scan_result = scan_and_diagnose_cliffs_with_tv(is_jp=is_jp, interval="1d")
+        st.success("統合スキャンが完了しました。")
+
+    result_df = st.session_state.get("unified_scan_result")
+    if result_df is None:
+        return
+
+    if result_df.empty:
+        st.success("✅ データベース内に未調整の不整合（崖・バグ）は1件も検出されませんでした。")
+        return
+
+    st.warning(f"⚠️ {len(result_df)}件の異常箇所を検出（{result_df['ticker'].nunique()}銘柄）")
+
+    display_df = result_df.copy()
+    display_df["選択"] = False
+    if "cliff_date" in display_df.columns:
+        display_df["cliff_date"] = pd.to_datetime(display_df["cliff_date"]).dt.strftime("%Y-%m-%d")
+
+    # TradingViewで取得できなかった行はチェックボックス選択を不可にする（安全対策）
+    unresolved_mask = display_df["true_multiplier"].isna()
+
+    rename_map = {
+        "選択": "選択",
+        "ticker": "銘柄",
+        "cliff_date": "崖日付",
+        "before_close": "1日前 Close",
+        "after_close": "当日 Close",
+        "before_adj_close": "1日前 Adj Close",
+        "after_adj_close": "当日 Adj Close",
+        "volume": "出来高",
+        "tv_close": "TV Close",
+        "est_multiplier": "推測倍率(est_multiplier)",
+        "true_multiplier": "真の倍率(true_multiplier)",
+    }
+    display_df = display_df.rename(columns=rename_map)
+    ordered_cols = [c for c in rename_map.values() if c in display_df.columns]
+    display_df = display_df[ordered_cols]
+
+    edited_df = st.data_editor(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        disabled=[c for c in ordered_cols if c != "選択"],
+        column_config={
+            "選択": st.column_config.CheckboxColumn("選択", help="TV Closeが取得できていない行は選択できません"),
+        },
+        key="unified_scan_editor",
+    )
+
+    # TV Closeが取得できなかった行は強制的に選択解除（誤操作防止）
+    edited_df.loc[unresolved_mask.values, "選択"] = False
+
+    selected_rows = edited_df[edited_df["選択"] == True]
+    st.caption(f"現在 {len(selected_rows)} 件が選択されています。")
+
+    if st.button("🚀 選択したパッチをすべて本番適用（一括実行）", key="btn_bulk_apply_selected", type="primary", use_container_width=True, disabled=selected_rows.empty):
+        patches = [
+            {"ticker": r["銘柄"], "cliff_date": r["崖日付"], "multiplier": r["真の倍率(true_multiplier)"]}
+            for _, r in selected_rows.iterrows()
+        ]
+        status_box = st.status("📡 選択パッチの一括本番適用を実行中...", expanded=True)
+        with status_box:
+            def update_bulk_status(msg):
+                st.write(msg)
+            summary = apply_bulk_selected_patches(patches, is_jp=is_jp, status_callback=update_bulk_status)
+            status_box.update(
+                label=f"🎉 完了：{summary['repaired']}件修復、{summary['skipped']}件スキップ",
+                state="complete"
+            )
+        st.success(f"✅ {summary['repaired']}件修復、{summary['skipped']}件スキップしました。")
+        del st.session_state["unified_scan_result"]
+        time.sleep(1.0)
+        st.rerun()
+
+# ── データベース健康診断コンポーネント（旧・参考保持） ──
 def render_database_diagnostics_ui(is_jp: bool):
     st.divider()
     st.subheader("📊 データベース健康診断 (段差・不具合検出)")
@@ -474,40 +562,19 @@ render_full_sync_section(is_jp)
 
 st.divider()
 
-# 【セクション3】手動ピンポイント一括安全修復
+# 🔍 メイン：統合スキャン・自動修復エリア
+render_unified_scan_and_repair_ui(is_jp=is_jp)
+
+st.divider()
+
+# 【セクション3】手動ピンポイント一括安全修復（非常用オーバーライド：TradingView API停止時のバックアップ）
 @st.fragment
 def render_manual_repair_section(is_jp: bool):
-    st.subheader("3️⃣ 手動ピンポイント一括安全修復")
     st.write(
-        "特定の銘柄においてデータの欠損が発生した場合、Rawデータベースからクリーンダウンロード復元し, "
-        "最新のTransform加工を通じてActiveを一元的に再構成します。"
+        "TradingView APIが停止している等の非常時に備え、従来の手動ピンポイント一括安全修復フォームを"
+        "バックアップとして残しています。特定の銘柄においてデータの欠損が発生した場合、"
+        "Rawデータベースからクリーンダウンロード復元し、最新のTransform加工を通じてActiveを一元的に再構成します。"
     )
-
-    with st.expander("🔍 異常データスキャン（Active DB対象）", expanded=False):
-        st.caption("全銘柄の日足ActiveDBをスキャンして35%以上の急変箇所を検出します。")
-        if st.button("🔍 異常スキャン実行", key="btn_anomaly_scan"):
-            with st.spinner("全Active銘柄をスキャン中..."):
-                anomalies = scan_all_anomalies(is_jp=is_jp, interval="1d")
-            if anomalies.empty:
-                st.success("✅ 異常箇所は検出されませんでした。")
-            else:
-                st.warning(f"⚠️ {len(anomalies)}件の異常箇所を検出（{anomalies['ticker'].nunique()}銘柄）")
-                display_df = anomalies.copy()
-                if "cliff_date" in display_df.columns:
-                    display_df["cliff_date"] = pd.to_datetime(display_df["cliff_date"]).dt.strftime("%Y-%m-%d")
-                if "pct_change" in display_df.columns:
-                    display_df["pct_change"] = display_df["pct_change"].apply(lambda x: f"{x*100:.1f}%" if pd.notna(x) else "－")
-                if "est_multiplier" in display_df.columns:
-                    display_df["est_multiplier"] = display_df["est_multiplier"].apply(lambda x: f"{x:.8f}".rstrip('0').rstrip('.') if pd.notna(x) else "－")
-
-                rename_map = {
-                    "ticker": "銘柄", "cliff_date": "崖日付", "est_multiplier": "推測修正比率 (当日÷1日前)", "pct_change": "変化率",
-                    "before_close": "1日前 Close", "after_close": "Close", "before_adj_close": "1日前 Adj Close", "after_adj_close": "Adj Close"
-                }
-                display_df = display_df.rename(columns=rename_map)
-                st.dataframe(display_df[[c for c in rename_map.values() if c in display_df.columns]], use_container_width=True, hide_index=True)
-
-    st.write(" ")
 
     with st.form(key="safe_repair_form"):
         col_t1, col_t2, col_t3 = st.columns(3)
@@ -643,8 +710,6 @@ def render_manual_repair_section(is_jp: bool):
                     for interval, msg in results.items():
                         st.write(f" **{interval}**: {msg}")
                     st.success("✅ 個別ダウンロード本番適用が正常に完了しました。")
-
-render_manual_repair_section(is_jp)
 
 # ── 指定日以前データ部分削除パッチUI ──
 st.markdown("#### 🗑️ 指定日以前データ一括物理削除パッチ")
@@ -811,5 +876,8 @@ render_full_rebuild_section(is_jp, market_mode)
 # ストップ高安バー修復UIの表示
 render_stop_allocation_repair_ui(is_jp=is_jp)
 
-# 健康診断UIの表示
-render_database_diagnostics_ui(is_jp=is_jp)
+st.divider()
+
+# ── 非常用オーバーライドエリア（バックアップ：手動ピンポイント一括安全修復） ──
+with st.expander("⚙️ 手動修復（非常用・TradingView API停止時）", expanded=False):
+    render_manual_repair_section(is_jp)
