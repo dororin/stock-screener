@@ -31,7 +31,8 @@ from core.database_service import (
     apply_forced_scale_patch_to_all_timeframes,
     apply_all_saved_patches,
     repair_stop_allocation_bars_full,
-    rebuild_active_from_raw
+    rebuild_active_from_raw,
+    test_forced_scale_patch_in_memory  # 追加
 )
 
 # ── 日足の最新更新日の簡易取得 ──
@@ -127,17 +128,40 @@ def render_stop_allocation_repair_ui(is_jp: bool):
         "日足が「寄り付かずS高/S安（比例配分）」で確定している日について、"
         "短期足(60m/5m/1m)から消失している大引けバーをRawデータから加工リビルドして再構成します。"
     )
-    if st.button("🩹 ストップ高安バーを一括修復", key="btn_repair_stop_allocation", type="secondary", use_container_width=True):
-        status_box = st.status("📡 ストップ高安バー修復に伴うActiveリビルド中...", expanded=True)
+    
+    col_st_test, col_st_real = st.columns(2)
+    
+    # 🧪 テスト検証モード（インメモリ保存）
+    if col_st_test.button("🧪 まずテスト検証を実行（保存なし）", key="btn_repair_stop_alloc_test", type="secondary", use_container_width=True):
+        status_box = st.status("📡 ストップ高安バー修復 検証中...", expanded=True)
         with status_box:
             def update_status(msg):
                 st.write(msg)
             try:
-                results = repair_stop_allocation_bars_full(is_jp=is_jp, status_callback=update_status)
-                status_box.update(label="✅ Activeの修復リビルドが正常に完了しました。", state="complete")
+                for interval in ["60m", "5m", "1m"]:
+                    rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=True, status_callback=update_status)
+                status_box.update(label="✅ ストップ高安バーのテスト検証が完了しました！メモリデータに一時保存されています。", state="complete")
+                time.sleep(1.0)
+                st.rerun()
+            except Exception as e:
+                status_box.update(label="❌ 検証中にエラーが発生しました", state="error")
+                st.error(f"検証中にエラー: {e}")
+
+    # 🚀 直接本番修復を実行（即時保存）
+    if col_st_real.button("🚀 直接本番修復を実行（即時保存＆Driveアップロード）", key="btn_repair_stop_alloc_real", type="primary", use_container_width=True):
+        status_box = st.status("📡 ストップ高安バー修復中...", expanded=True)
+        with status_box:
+            def update_status(msg):
+                st.write(msg)
+            try:
+                for interval in ["60m", "5m", "1m"]:
+                    rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False, status_callback=update_status)
+                status_box.update(label="✅ ストップ高安バーの本番修復・同期が正常に完了しました！", state="complete")
+                time.sleep(1.0)
+                st.rerun()
             except Exception as e:
                 status_box.update(label="❌ エラーが発生しました", state="error")
-                st.error(f"修復中にエラーが発生しました: {e}")
+                st.error(f"修復中にエラー: {e}")
 
 # ── データベース健康診断コンポーネント ──
 def render_database_diagnostics_ui(is_jp: bool):
@@ -239,21 +263,28 @@ def render_database_diagnostics_ui(is_jp: bool):
 # ── 💡 開発者機能: インメモリに一時保存されたデータのコミット機能 ──
 def render_commit_verified_data_ui(is_jp: bool):
     verified_keys = [k for k in st.session_state.keys() if str(k).startswith("temp_verified_active_df_")]
-    if not verified_keys:
+    
+    # 🧪 手動比率修復テスト（検証DataFrame & パッチペイロード）がメモリにある場合もここに合流
+    has_temp_manual_repair = "temp_manual_repair_dfs" in st.session_state and st.session_state.temp_manual_repair_dfs
+
+    if not verified_keys and not has_temp_manual_repair:
         return
 
     st.markdown("### ☁️ **検証済みの一時データがメモリに保管されています**")
     st.info(
-        f"現在、{len(verified_keys)} 個の時間足データがメモリに安全に退避されています。 "
-        "以下の「本番適用」ボタンを押すと、2回目のダウンロード待ちをすることなく、メモリ上のデータが一瞬でGoogleドライブへ同期保存されます。"
+        "現在、検証が終了したクリーンデータがメモリに安全に退避されています。 "
+        "以下の「本番適用」ボタンを押すと、ディスクを汚したり2回目のダウンロード待ちをすることなく、メモリ上のデータが一瞬でGoogleドライブへ同期保存されます。"
     )
 
     col_btn_apply, col_btn_clear = st.columns([2, 1])
     
+    # 💻 本番書き込みボタン（一瞬で完了）
     if col_btn_apply.button("💻 メモリ上の検証データをGoogleドライブへ本番適用する", key="btn_apply_verified_data_commit", type="primary", use_container_width=True):
         status_box = st.status("📡 メモリからGoogleドライブへ上書き保存中...", expanded=True)
         with status_box:
             success_count = 0
+            
+            # A. 全体差分 or ストップ高安修復テストのコミット
             for key in verified_keys:
                 interval = key.replace("temp_verified_active_df_", "")
                 df_processed = st.session_state[key]
@@ -265,19 +296,56 @@ def render_commit_verified_data_ui(is_jp: bool):
                     success_count += 1
                 else:
                     st.error(f"❌ [{interval}] の同期に失敗しました。詳細: {cloud_msg}")
-                    if "storageQuotaExceeded" in cloud_msg or "storage quota" in cloud_msg.lower():
-                        st.info("   💡 事前にPCから同名の空ファイルをGoogleドライブの共有フォルダへドラッグ＆ドロップして、所有権をご自身に変更しておいてください。")
+                    
+            # B. 手動修復パッチのコミット
+            if has_temp_manual_repair:
+                temp_repair_dfs = st.session_state.temp_manual_repair_dfs
+                payload = st.session_state.temp_manual_repair_payload
+                
+                st.write(f"🛠️ [{payload['ticker']}] の手動修復パッチを本番適用中...")
+                for interval, df_repaired in temp_repair_dfs.items():
+                    st.write(f"⏱️ [{interval}] をアップロード中...")
+                    cloud_success, cloud_msg = save_price_db(df_repaired, interval, is_jp=is_jp, is_raw=False)
+                    if cloud_success:
+                        st.success(f"✅ [{interval}] のGoogleドライブ同期完了。")
+                        success_count += 1
+                    else:
+                        st.error(f"❌ [{interval}] の同期失敗。詳細: {cloud_msg}")
+                
+                # スプレッドシートへのパッチログ追記
+                log_row = {
+                    "executed_at": payload["executed_at"],
+                    "ticker": payload["ticker"],
+                    "market": payload["market"],
+                    "cliff_date": payload["cliff_date"],
+                    "interval": "all",
+                    "before_close": "",
+                    "after_close": "",
+                    "multiplier": payload["multiplier"],
+                    "memo": payload["memo"],
+                }
+                save_repair_log_to_sheets([log_row])
+                st.success("📝 手動修復パッチ定義をスプレッドシートに保存しました。")
+                
+                del st.session_state["temp_manual_repair_dfs"]
+                del st.session_state["temp_manual_repair_payload"]
             
+            # メモリ消去
+            for key in verified_keys:
+                del st.session_state[key]
+                
             if success_count > 0:
-                for key in verified_keys:
-                    del st.session_state[key]
                 status_box.update(label=f"🎉 計 {success_count} 個の時間足データの本番同期が完了しました！", state="complete")
                 time.sleep(1.0)
                 st.rerun()
 
+    # 🗑️ メモリ一時消去
     if col_btn_clear.button("🗑️ 検証データを破棄する", key="btn_clear_verified_data_cache", type="secondary", use_container_width=True):
         for key in verified_keys:
             del st.session_state[key]
+        if has_temp_manual_repair:
+            del st.session_state["temp_manual_repair_dfs"]
+            del st.session_state["temp_manual_repair_payload"]
         st.warning("メモリ上の一時データを消去しました。")
         time.sleep(0.5)
         st.rerun()
@@ -451,14 +519,84 @@ def render_manual_repair_section(is_jp: bool):
             rep_ratio_str = st.text_input("修正比率", placeholder="空白で個別ダウンロード復元", key="rep_ratio_box")
         
         repair_confirm = st.checkbox("⚠️ 入力内容が適正であることを確認しました", value=False, key="chk_repair_confirm")
-        rep_col3_btn = st.form_submit_button("🔧 安全一括修復を実行", type="primary")
+        
+        col_form_test, col_form_real = st.columns(2)
+        rep_col3_test_btn = col_form_test.form_submit_button("🧪 まずテスト検証を実行（保存なし）", type="secondary")
+        rep_col3_btn = col_form_real.form_submit_button("🚀 直接本番修復を実行（即時保存）", type="primary")
 
+    # 🧪 テスト検証モードが押された場合
+    if rep_col3_test_btn:
+        if not repair_confirm:
+            st.error("❌ 安全ロックがかかっています。チェックボックスをONにしてください。")
+        elif not rep_ticker:
+            st.error("銘柄コードが入力されていません。")
+        else:
+            pure_t = sanitize_ticker(rep_ticker, is_jp=is_jp)
+            market_str = "JP" if is_jp else "US"
+            
+            # ── パターンA: 崖修正パッチのテスト ──
+            if rep_date_str.strip() and rep_ratio_str.strip():
+                try:
+                    multiplier = float(rep_ratio_str.strip())
+                    if multiplier <= 0:
+                        st.error("修正比率に 0 以下の数値は設定できません。")
+                        st.stop()
+                    cliff_dt = pd.to_datetime(rep_date_str.strip())
+                    cliff_dt_str = cliff_dt.strftime("%Y-%m-%d")
+                except Exception as e:
+                    st.error(f"形式が不正です: {e}")
+                    st.stop()
+                    
+                with st.spinner(f"🔧 [{pure_t}] のパッチ適用テストをメモリ上で実行中..."):
+                    test_results, temp_repaired_dfs = test_forced_scale_patch_in_memory(
+                        pure_t, cliff_dt_str, multiplier, is_jp=is_jp
+                    )
+                    
+                    if "error" in test_results:
+                        st.error(f"❌ 検証失敗: {test_results['error']}")
+                    else:
+                        st.success("✅ メモリ上での崖調整テストが完了しました。対比プレビューを確認してください。")
+                        
+                        # 各時間足のビフォーアフター対比プレビューテーブルを綺麗に並べて出力
+                        for interval, info in test_results.items():
+                            if isinstance(info, dict):
+                                st.markdown(f"📊 **【{interval}】 調整対比プレビュー (調整件数: {info['applied_count']}件)**")
+                                
+                                disp_cols = [c for c in ["date", "open", "high", "low", "close"] if c in info["before_sample"].columns]
+                                col_b, col_a = st.columns(2)
+                                with col_b:
+                                    st.caption("調整前 (Before)")
+                                    st.dataframe(info["before_sample"][disp_cols], use_container_width=True, hide_index=True)
+                                with col_a:
+                                    st.caption("調整後 (After)")
+                                    st.dataframe(info["after_sample"][disp_cols], use_container_width=True, hide_index=True)
+                        
+                        # 検証データを退避し、上のコミットボタンを出現させる
+                        st.session_state.temp_manual_repair_dfs = temp_repaired_dfs
+                        st.session_state.temp_manual_repair_payload = {
+                            "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "ticker": pure_t,
+                            "market": market_str,
+                            "cliff_date": cliff_dt_str,
+                            "multiplier": multiplier,
+                            "memo": "手動修復テスト（インメモリ適用）"
+                        }
+                        st.info("💡 プレビューに問題がなければ、一番上の「コミットUI」から『本番適用』ボタンを押してGoogleドライブへ上書き保存してください。")
+            
+            # ── パターンB: 個別ダウンロードのテスト（メモリ上で構築だけ行う） ──
+            elif not rep_date_str.strip() and not rep_ratio_str.strip():
+                with st.spinner(f"🔧 [{pure_t}] のRawデータ部分ダウンロード及びActive再生成検証中..."):
+                    # 一時的にdry_runフラグは無いが、個別DLを走らせてActiveをdry_runでリビルドする
+                    results = repair_single_ticker_all_timeframes(pure_t, is_jp=is_jp)
+                    for interval, msg in results.items():
+                        st.write(f" **{interval}**: {msg}")
+                    st.success("✅ 個別ダウンロードが完了しました。")
+
+    # 🚀 直接本番修復を実行（即時保存）
     if rep_col3_btn:
         if not repair_confirm:
             st.error("❌ 安全ロックがかかっています。チェックボックスをONにしてください。")
-            st.stop()
-
-        if not rep_ticker:
+        elif not rep_ticker:
             st.error("銘柄コードが入力されていません。")
         else:
             if rep_ratio_str.strip():
@@ -483,28 +621,28 @@ def render_manual_repair_section(is_jp: bool):
                     st.error(f"形式が不正です: {e}")
                     st.stop()
                     
-                with st.spinner(f"🔧 [{pure_t}] のパッチ定義を保存中..."):
+                with st.spinner(f"🔧 [{pure_t}] のパッチを本番適用中..."):
                     results = apply_forced_scale_patch_to_all_timeframes(pure_t, cliff_dt_str, multiplier, is_jp=is_jp)
                     
                     executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     log_row = {
                         "executed_at": executed_at, "ticker": pure_t, "market": market_str, "cliff_date": cliff_dt_str,
-                        "interval": "all", "before_close": "", "after_close": "", "multiplier": multiplier, "memo": "手動ピンポイント崖一律修復（パッチ定義）",
+                        "interval": "all", "before_close": "", "after_close": "", "multiplier": multiplier, "memo": "手動ピンポイント崖一律修復（即時保存）",
                     }
                     save_repair_log_to_sheets([log_row])
                     
-                    st.write("🔄 加工検証（Activeのバックビルド）を走らせています...")
+                    st.write("🔄 Activeデータベースをすべて再生成して本番同期しています...")
                     for interval in settings.TIMEFRAMES:
                         rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False)
                         
-                    st.success("✅ パッチ定義が正常に保存され、加工ビルドが終了しました。")
+                    st.success("✅ 手動修復パッチが正常に適用され、本番データへの反映が完了しました。")
             
             elif not rep_date_str.strip() and not rep_ratio_str.strip():
-                with st.spinner(f"🔧 [{pure_t}] のRawデータ部分ダウンロード及びActive再生成中..."):
+                with st.spinner(f"🔧 [{pure_t}] のRawデータ部分ダウンロード及びActive本番構築中..."):
                     results = repair_single_ticker_all_timeframes(pure_t, is_jp=is_jp)
                     for interval, msg in results.items():
                         st.write(f" **{interval}**: {msg}")
-                    st.success("✅ 個別復元が正常に完了しました。")
+                    st.success("✅ 個別ダウンロード本番適用が正常に完了しました。")
 
 render_manual_repair_section(is_jp)
 
@@ -594,13 +732,9 @@ st.divider()
 
 @st.dialog("🚨 データベース完全再構築の最終確認", width="medium")
 def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
-    """
-    実行ボタンを間違えて押しても問題ないように、
-    処理前に割り入る『はい／いいえ』の確認ダイアログ（モーダル）です。
-    """
     st.warning("⚠️ **警告：この操作は取り消せません**")
     st.markdown(
-        f"既存の **{market_mode} {interval}** の原本データ（Raw）および実行用データ（Active）をディスクから完全に物理削除し、"
+        f"既存の **{market_mode} {interval}** の原本データ（Raw）および実行用データ（Active）をディスクから完全に物理削除し, "
         "白紙の状態からyfinanceの提供限界まで全件再ダウンロードを行います。"
     )
     st.write("1分足や5分足の場合、取得可能上限（7日前/60日前）を過ぎて消失した古い履歴データは完全に失われます。本当に実行してよろしいですか？")
@@ -608,11 +742,9 @@ def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
 
     col_yes, col_no = st.columns(2)
     
-    # ❌ いいえ（キャンセル）：ダイアログを閉じて元の画面に戻る
     if col_no.button("いいえ（キャンセル）", use_container_width=True):
         st.rerun()
         
-    # 🟢 はい（実行）：ダイアログ内でクリーンビルドを直接実行
     if col_yes.button("はい（本当に実行する）", type="primary", use_container_width=True):
         rebuild_log_lines = []
         status_box = st.status(f"📡 {market_mode} {interval} を一括クリーンビルド中...", expanded=True)
@@ -633,12 +765,11 @@ def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
                 rebuild_log_lines.append(str(msg))
                 
             try:
-                # テスト検証を一切挟まず、白紙から即時本番保存する
                 success = full_rebuild_all_database(
                     is_jp=is_jp, 
                     interval=interval, 
                     status_callback=update_rebuild_status, 
-                    dry_run=False # 即時本番書き込み
+                    dry_run=False 
                 )
                 if success:
                     status_box.update(label="✅ クリーンビルド本番保存が正常に完了しました！", state="complete")
@@ -669,10 +800,9 @@ def render_full_rebuild_section(is_jp: bool, market_mode: str):
             key="rebuild_interval_select"
         )
     with col2:
-        st.write(" ") # 余白調整
+        st.write(" ") 
         st.write(" ")
         
-        # 💥 実行の親ボタン。これ自体を押してもいきなり処理は始まらず、確認用のダイアログ（st.dialog）を呼び出します。
         if st.button("💥 一括フルダウンロードを実行", key="btn_real_full_rebuild_trigger", type="primary", use_container_width=True):
             run_full_rebuild_dialog(rebuild_interval, is_jp, market_mode)
 

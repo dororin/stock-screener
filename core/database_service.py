@@ -356,11 +356,9 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         log("✨ [白紙構築] 新旧データの整合性比較、および過去パッチの干渉をスキップしてクリーン処理します。")
 
     if dry_run:
-        # 💡 [インメモリ・コミット]: Dry Run時はParquet上書き保存をスキップし、検証済みデータをStreamlit Session Stateに直接保持する
         log(f"🧪 [DRY RUN] {interval} 加工・アサーション検証を正常に通過。")
         if settings.HAS_STREAMLIT:
             import streamlit as st
-            # 出来上がったクリーンなデータをメモリ上に退避
             st.session_state[f"temp_verified_active_df_{interval}"] = df_processed
             log(f"   💾 検証済みデータを一時メモリに格納しました。画面から「本番適用」できます。")
         return True
@@ -377,6 +375,87 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
                 log("   💡 【解決方法】サービスアカウントのストレージ容量制限（0GB）に衝突しています。")
                 log("      事前に同名ファイルをあなたのGoogleアカウントからアップロードして、所有者をご自身に変更してください。")
         return True
+
+# =====================================================================
+# 🧪 開発検証: 手動パッチのメモリ上適用シミュレーション
+# =====================================================================
+
+def test_forced_scale_patch_in_memory(ticker: str, cliff_date_str: str, multiplier: float, is_jp: bool = True) -> tuple:
+    """
+    手動パッチ（cliff_date / multiplier）を、実際のParquetを書き換えることなく
+    すべてメモリ上でシミュレーション実行し、検証結果と仮の加工後DataFrameを返します。
+    """
+    pure_ticker = sanitize_ticker(ticker, is_jp)
+    results = {}
+    st_temp_dfs = {}
+    
+    try:
+        target_dt = pd.to_datetime(cliff_date_str)
+    except Exception as e:
+        return {"error": f"崖日付のパース失敗: {e}"}, {}
+
+    for interval in ["1d", "60m", "5m", "1m"]:
+        try:
+            db_df = load_price_db(interval, is_jp=is_jp, is_raw=False)
+        except FileNotFoundError:
+            results[interval] = "DBなし"
+            continue
+        if db_df.empty:
+            results[interval] = "データ空"
+            continue
+
+        mask = db_df["ticker"] == pure_ticker
+        ticker_data = db_df[mask].copy()
+        if ticker_data.empty:
+            results[interval] = "対象データなし"
+            continue
+
+        need_apply = check_anomaly_need_patch(ticker_data, cliff_date_str, multiplier)
+        if not need_apply:
+            results[interval] = "適用不要（既に調整済み、または落差がありません）"
+            continue
+
+        ticker_data["date"] = pd.to_datetime(ticker_data["date"])
+        pre_mask = ticker_data["date"] < target_dt
+        if not pre_mask.any():
+            results[interval] = "対象期間（崖日より過去）のデータなし"
+            continue
+
+        price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in db_df.columns]
+        
+        # プレビュー対比用の前後の3行サンプルを切り出し
+        sample_before = ticker_data[pre_mask].tail(3).copy()
+        
+        # メモリ上で安全に適用
+        for col in price_cols:
+            ticker_data.loc[pre_mask, col] = ticker_data.loc[pre_mask, col] * multiplier
+        if "volume" in db_df.columns:
+            ticker_data.loc[pre_mask, "volume"] = ticker_data.loc[pre_mask, "volume"] / multiplier
+
+        sample_after = ticker_data[pre_mask].tail(3).copy()
+        
+        # 既存DBから該当銘柄を一旦抜いて、メモリ上で再結合
+        db_df_new = db_df[~mask].copy()
+        
+        if not db_df_new.empty:
+            if pd.api.types.is_datetime64_any_dtype(db_df_new["date"]):
+                ticker_data["date"] = pd.to_datetime(ticker_data["date"])
+            else:
+                ticker_data["date"] = ticker_data["date"].dt.strftime("%Y-%m-%d %H:%M:%S" if interval != "1d" else "%Y-%m-%d")
+        
+        db_df_new = pd.concat([db_df_new, ticker_data], ignore_index=True)
+        db_df_new = db_df_new.sort_values(["ticker", "date"]).reset_index(drop=True)
+        
+        # 一時保持用辞書にセット
+        st_temp_dfs[interval] = db_df_new
+        
+        results[interval] = {
+            "applied_count": pre_mask.sum(),
+            "before_sample": sample_before,
+            "after_sample": sample_after
+        }
+        
+    return results, st_temp_dfs
 
 # =====================================================================
 # 📥 Rawデータ更新 ＆ 統合同期システム
