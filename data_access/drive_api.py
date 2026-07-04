@@ -66,8 +66,13 @@ def download_from_drive_api(filename: str, local_path: str) -> bool:
 def upload_to_drive_api(filename: str, local_path: str) -> bool:
     """指定されたローカルファイルをGoogle Driveにアップロード（または上書き）します。"""
     service = get_drive_service()
-    if not service or not settings.FOLDER_ID:
+    if not service:
+        print("⚠️ [Drive API] Google Drive サービスインスタンスの作成に失敗しました。認証情報(secrets)を確認してください。")
         return False
+    if not settings.FOLDER_ID:
+        print("⚠️ [Drive API] FOLDER_ID が設定されていません。")
+        return False
+        
     try:
         query = f"name='{filename}' and '{settings.FOLDER_ID}' in parents and trashed=false"
         results = service.files().list(q=query, fields="files(id, name)").execute()
@@ -77,9 +82,15 @@ def upload_to_drive_api(filename: str, local_path: str) -> bool:
         if items:
             file_id = items[0]['id']
             service.files().update(fileId=file_id, media_body=media).execute()
+            print(f"☁️ [Drive API] 既存ファイル {filename} を正常に上書き（update）しました。")
         else:
             file_metadata = {'name': filename, 'parents': [settings.FOLDER_ID]}
             service.files().create(body=file_metadata, media_body=media).execute()
+            print(f"☁️ [Drive API] 新規ファイル {filename} を正常に作成（create）しました。")
         return True
-    except Exception:
+    except Exception as e:
+        # ⚠️ 例外を隠さず、Streamlitのログ（黒い画面）に具体的なエラー内容を書き出す
+        print(f"❌ [Drive API] Google Driveへのアップロード中にエラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
         return False
