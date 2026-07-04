@@ -6,7 +6,6 @@ import streamlit as st  # キャッシュ処理 st.cache_data のためにイン
 from datetime import datetime, timedelta
 from config import settings
 from data_access.local_db import load_price_db
-from core.database_service import get_jp_session_close_time as _get_jp_session_close_time
 
 @st.cache_data(ttl=3600)
 def fetch_proxy_market_value(proxy_ticker: str, start_date: datetime, end_date: datetime) -> pd.Series:
@@ -150,67 +149,6 @@ def relativize_series(idx_series: pd.Series, bm_series: pd.Series) -> pd.Series:
     rel = rel / rel.iloc[0] * 100
     return rel
 
-def _generate_intraday_time_grid(trading_dates, freq_minutes: int, is_jp: bool = True) -> pd.DatetimeIndex:
-    """
-    実在する営業日の集合(trading_dates)を基準に、完全な定刻の取引時間グリッドを生成します（仕様書 4-1）。
-    ・日本株: 9:00〜11:30 / 12:30〜大引け（昼休みを除外）
-      大引け時刻は日付に応じて自動判定します（2024/11/5のarrowhead4.0稼働に伴う取引時間延伸）:
-        - 2024/11/5以降: 15:30
-        - それより前     : 15:00
-      （yfinanceの取得可能上限の関係で、60m足は当面この境界日をまたぐ期間を含み得るため必要な分岐です）
-    ・米国株: 9:30〜16:00（昼休みなし）
-    休日を新規に作り出さないよう、実際にDBへ存在する営業日のみを対象とします。
-    """
-    if len(trading_dates) == 0:
-        return pd.DatetimeIndex([])
-
-    freq = f"{freq_minutes}min"
-    all_slots = []
-    for d in trading_dates:
-        day = pd.Timestamp(d).normalize()
-        if is_jp:
-            close_t = _get_jp_session_close_time(day)
-            close_delta = pd.Timedelta(hours=close_t.hour, minutes=close_t.minute)
-
-            morning = pd.date_range(day + pd.Timedelta(hours=9), day + pd.Timedelta(hours=11, minutes=30), freq=freq)
-            afternoon = pd.date_range(day + pd.Timedelta(hours=12, minutes=30), day + close_delta, freq=freq)
-            # freqの刻み次第では境界時刻(11:30引け前 / 大引け)がステップに乗らず脱落するため、
-            # 実データ（大引け固定の合成バー含む）を確実に拾えるよう明示的に含める
-            boundary = pd.DatetimeIndex([day + pd.Timedelta(hours=11, minutes=30), day + close_delta])
-            all_slots.append(morning)
-            all_slots.append(afternoon)
-            all_slots.append(boundary)
-        else:
-            session = pd.date_range(day + pd.Timedelta(hours=9, minutes=30), day + pd.Timedelta(hours=16), freq=freq)
-            boundary = pd.DatetimeIndex([day + pd.Timedelta(hours=16)])
-            all_slots.append(session)
-            all_slots.append(boundary)
-
-    combined = set()
-    for s in all_slots:
-        combined.update(s)
-    return pd.DatetimeIndex(sorted(combined))
-
-def continuize_intraday_grid(close_pivot: pd.DataFrame, volume_pivot: pd.DataFrame, interval: str, is_jp: bool = True) -> tuple:
-    """
-    短期足（60m/5m/1m）のみを対象に、時間軸を営業時間の完全な定刻グリッドへ連続化します（仕様書 4）。
-    ・株価(Close): 直近の既知の価格で前方補完(ffill)
-    ・出来高(Volume): 0埋め
-    1d（日足）の場合は連続化不要のため、何もせずそのまま返します。
-    """
-    freq_map = {"60m": 60, "5m": 5, "1m": 1}
-    if interval not in freq_map or close_pivot.empty:
-        return close_pivot, volume_pivot
-
-    trading_dates = pd.Series(close_pivot.index).dt.normalize().unique()
-    full_grid = _generate_intraday_time_grid(trading_dates, freq_map[interval], is_jp=is_jp)
-    if len(full_grid) == 0:
-        return close_pivot, volume_pivot
-
-    close_continuous = close_pivot.reindex(full_grid).ffill()
-    volume_continuous = volume_pivot.reindex(full_grid).fillna(0.0)
-    return close_continuous, volume_continuous
-
 def compute_sector_absolute_data(db_df: pd.DataFrame, tickers: list, period_days: int, resample_weekly: bool, interval: str = "1d", is_jp: bool = True) -> tuple:
     """指定された構成群から絶対価格平均、移動平均、WVF、合算売買代金などを一挙算出します。"""
     if db_df.empty:
@@ -225,9 +163,6 @@ def compute_sector_absolute_data(db_df: pd.DataFrame, tickers: list, period_days
 
     close_pivot = target_df.pivot_table(index="date", columns="ticker", values="close").sort_index()
     volume_pivot = target_df.pivot_table(index="date", columns="ticker", values="volume").sort_index()
-
-    # --- 追加: 短期足の時間軸連続化（仕様書 4） SMA/WVF算出直前のメモリ上でのみ適用 ---
-    close_pivot, volume_pivot = continuize_intraday_grid(close_pivot, volume_pivot, interval=interval, is_jp=is_jp)
 
     if resample_weekly:
         close_pivot = close_pivot.resample("W-FRI").last()
@@ -364,7 +299,7 @@ def compute_theme_equal_weighted_return_rate(
     if display_close.empty:
         return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), []
 
-    # 基準日時点の株価を100（0%）として規格化（既存ロジック）
+    # 基準日時点の株価を100（0%）として規格化
     base_prices = display_close.bfill().iloc[0]
     base_prices = base_prices.apply(lambda x: x if (pd.notna(x) and x > 0) else np.nan)
 
@@ -392,7 +327,7 @@ def compute_theme_equal_weighted_return_rate(
         proxy_m_val = proxy_m_val.resample("W-FRI").sum()
 
     # 2. ② 出来高乖離率の平均 (VDR) の計算
-    # 各銘柄の、当日を除く過去25期間の売買代金「中央値」を算出して乖離率を出す（0除算回避）
+    # 各銘柄の、当日を除く過去25期間の売買代金「中央値」を算出して乖離率を出す
     vdr_df = pd.DataFrame(index=val_pivot.index)
     for col in val_pivot.columns:
         med = val_pivot[col].shift(1).rolling(window=25, min_periods=5).median()
