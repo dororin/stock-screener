@@ -7,7 +7,7 @@ import streamlit as st
 import re
 
 from config import settings
-from data_access.local_db import load_price_db
+from data_access.local_db import load_price_db, save_price_db # save_price_dbをインポート
 from data_access.sheets_api import (
     load_extra_tickers_from_sheets,
     save_extra_tickers_to_sheets,
@@ -236,12 +236,63 @@ def render_database_diagnostics_ui(is_jp: bool):
             ]
             st.dataframe(df_view[cols_to_disp], use_container_width=True, hide_index=True)
 
+# ── 💡 開発者機能: インメモリに一時保存されたデータのコミット機能 ──
+def render_commit_verified_data_ui(is_jp: bool):
+    """検証済みのインメモリ一時データが存在する場合、本番書き込み（Google Driveアップロード）を行うボタンを出動させます"""
+    verified_keys = [k for k in st.session_state.keys() if str(k).startswith("temp_verified_active_df_")]
+    if not verified_keys:
+        return
+
+    st.markdown("### ☁️ **検証済みの一時データがメモリに保管されています**")
+    st.info(
+        f"現在、{len(verified_keys)} 個の時間足データがメモリに安全に退避されています。 "
+        "以下の「本番適用」ボタンを押すと、2回目のダウンロード待ちをすることなく、メモリ上のデータが一瞬でGoogleドライブへ同期保存されます。"
+    )
+
+    col_btn_apply, col_btn_clear = st.columns([2, 1])
+    
+    # 💻 本番書き込みボタン（一瞬で完了）
+    if col_btn_apply.button("💻 メモリ上の検証データをGoogleドライブへ本番適用する", key="btn_apply_verified_data_commit", type="primary", width='stretch'):
+        status_box = st.status("📡 メモリからGoogleドライブへ上書き保存中...", expanded=True)
+        with status_box:
+            success_count = 0
+            for key in verified_keys:
+                interval = key.replace("temp_verified_active_df_", "")
+                df_processed = st.session_state[key]
+                st.write(f"⏱️ [{interval}] をGoogleドライブにアップロード中...")
+                
+                # 本番書き込み保存の実行
+                cloud_success, cloud_msg = save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False)
+                if cloud_success:
+                    st.success(f"✅ [{interval}] のGoogleドライブ同期が正常に完了しました。")
+                    success_count += 1
+                else:
+                    st.error(f"❌ [{interval}] の同期に失敗しました。詳細: {cloud_msg}")
+                    if "storageQuotaExceeded" in cloud_msg or "storage quota" in cloud_msg.lower():
+                        st.info("   💡 事前にPCから同名の空ファイルをGoogleドライブの共有フォルダへドラッグ＆ドロップして、所有権をご自身に変更しておいてください。")
+            
+            if success_count > 0:
+                # 適用し終えたメモリ用キャッシュを綺麗に消去
+                for key in verified_keys:
+                    del st.session_state[key]
+                status_box.update(label=f"🎉 計 {success_count} 個の時間足データの本番同期が完了しました！", state="complete")
+                time.sleep(1.0)
+                st.rerun()
+
+    # 🗑️ メモリ一時消去
+    if col_btn_clear.button("🗑️ 検証データを破棄する", key="btn_clear_verified_data_cache", type="secondary", width='stretch'):
+        for key in verified_keys:
+            del st.session_state[key]
+        st.warning("メモリ上の一時データを消去しました。")
+        time.sleep(0.5)
+        st.rerun()
+
 # =====================================================================
-# 🛠️ メイン画面描画処理
+# 🛠️ メイン画面描画
 # =====================================================================
 
 st.title("🗄️ データベース管理・保守センター")
-st.caption("Raw / Activeの2層分離設計を搭載した安全な管理システムです。")
+st.caption("Raw / Activeの2層分離設計を搭載した、安全で再描画のないデータ管理システムです。")
 
 m_col1, m_col2 = st.columns([1, 1])
 with m_col1:
@@ -253,19 +304,14 @@ with m_col2:
     
 st.divider()
 
-# 🔬 安全アサーション & 開発検証制御用ウィジェット
-st.subheader("🧪 データベースビルド検証コントロール")
-use_dry_run = st.checkbox(
-    "**Dry Run（検証のみ：価格加工後に健康チェックを行い、Parquet保存をスキップ）**", 
-    value=True, 
-    help="チェックをONにしておくと、バグ等で壊れた成果物Activeデータがディスクに保存されるのを未然に防止できます。"
-)
+# 💡 インメモリ・コミット用のUI表示（検証データが存在するときのみ現れます）
+render_commit_verified_data_ui(is_jp)
 
 st.divider()
 
 # 🔄 ETF構成銘柄の同期（1枚完結・統合版）
 st.subheader("🔄 ETFセクター構成の同期（スプレッドシート連動）")
-if st.button("🚀 ETF構成銘柄を同期する", key="btn_sync_etf_master", use_container_width=True, type="primary"):
+if st.button("🚀 ETF構成銘柄を同期する", key="btn_sync_etf_master", width='stretch', type="primary"):
     with st.spinner("スプレッドシートを更新中..."):
         try:
             from data_access.sheets_api import sync_etf_sectors_consolidated
@@ -290,67 +336,84 @@ st.divider()
 
 # 【セクション1】 全体差分ダウンロード（自動権利落ち防衛）
 @st.fragment
-def render_full_sync_section(is_jp: bool, dry_run_flag: bool):
-    st.subheader("1️⃣ 全体差分ダウンロード＆自動Active再構築")
+def render_full_sync_section(is_jp: bool):
+    st.subheader("1️⃣ 全体差分ダウンロード＆自動Active構築")
     st.write(
-        "最新データまでRawデータベースを安全に差分収集した上で、"
-        "メモリ上で一括変換・検証を行い、Activeデータベースを再構築します。"
+        "最新データまでRawデータベースを安全に差分ダウンロードします。 "
+        "以下のボタンで、保存を伴う「本番同期」か、メモリ上で安全チェックを行う「テスト検証」かを選択できます。"
     )
 
-    if st.button("🔄 全体差分ダウンロードを実行", key="btn_all_diff_update", type="primary"):
+    col_btn_test, col_btn_real = st.columns(2)
+    
+    # 🧪 テスト検証モード
+    if col_btn_test.button("🧪 まずテスト検証を実行（保存なし）", key="btn_test_diff_update", type="secondary", width='stretch'):
         sync_log_lines = []
-        status_box = st.status("📡 データベース全体差分同期中...", expanded=True)
+        status_box = st.status("📡 データベース全体差分 テスト検証中...", expanded=True)
         with status_box:
-            st.write("追加収集ティッカーのローカル同期を実行中...")
+            st.write("追加ティッカーのローカル同期を実行中...")
             try:
                 sync_extra_tickers_to_local()
-                msg = "✅ ティッカーリストの同期に成功しました。"
-                st.write(msg); sync_log_lines.append(msg)
+                st.write("✅ ティッカーリストの同期に成功しました。")
             except Exception as e:
-                msg = f"⚠️ ティッカー同期スキップ（キャッシュを使用）: {e}"
-                st.write(msg); sync_log_lines.append(msg)
-
-            st.write("差分情報のスキャンと必要更新箇所の算出中...")
-            needs = analyze_db_update_needs(is_jp=is_jp)
-
-            if needs.get("needs_period_update"):
-                msg = f"⚠️ 3日以上のデータ未同期を検出（最新日: {needs['global_max_date']}）。"
-                st.write(msg); sync_log_lines.append(msg)
+                st.write(f"⚠️ ティッカー同期スキップ（キャッシュを使用）: {e}")
 
             def update_status_on_screen(msg):
                 st.write(f"  * {msg}")
                 sync_log_lines.append(str(msg))
 
-            with st.spinner("同期・構築中..."):
+            with st.spinner("同期検証中..."):
                 try:
                     all_tickers = get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
                     update_price_database(
                         is_jp=is_jp,
                         target_tickers=all_tickers,
                         status_callback=update_status_on_screen,
-                        dry_run=dry_run_flag
+                        dry_run=True # Dry Runを強制ON
                     )
-
-                    status_box.update(label="🎉 データベース同期・ビルドタスク完了！", state="complete")
+                    status_box.update(label="🎉 テスト検証が正常に完了しました！メモリデータに一時保存されています。", state="complete")
+                    time.sleep(1.0)
+                    st.rerun() # 適用ボタンを出現させるために再描画
                 except Exception as e:
-                    status_box.update(label="❌ エラーが発生しました", state="error")
-                    st.error(f"データベースの更新処理中に例外エラーが発生しました: {e}")
-                    sync_log_lines.append(f"❌ エラーが発生しました: {e}")
-                finally:
-                    try:
-                        uploaded_name = upload_sync_log_to_drive(sync_log_lines, is_jp=is_jp, prefix="sync")
-                        if uploaded_name:
-                            st.caption(f"📝 同期ログを Google ドライブに保存しました: {uploaded_name}")
-                    except Exception as log_e:
-                        st.caption(f"⚠️ ログのドライブ保存に失敗しました: {log_e}")
+                    status_box.update(label="❌ 検証エラーが発生しました", state="error")
+                    st.error(f"検証中に例外エラーを検知しました: {e}")
 
-render_full_sync_section(is_jp, use_dry_run)
+    # 💻 本番同期モード（即時保存）
+    if col_btn_real.button("🚀 直接本番同期（即時保存＆Driveアップロード）", key="btn_real_diff_update", type="primary", width='stretch'):
+        sync_log_lines = []
+        status_box = st.status("📡 データベース全体差分 本番同期中...", expanded=True)
+        with status_box:
+            st.write("追加ティッカーの同期を実行中...")
+            try:
+                sync_extra_tickers_to_local()
+                st.write("✅ ティッカーリストの同期成功。")
+            except Exception as e:
+                st.write(f"⚠️ ティッカー同期スキップ: {e}")
+
+            def update_status_on_screen(msg):
+                st.write(f"  * {msg}")
+                sync_log_lines.append(str(msg))
+
+            with st.spinner("ダウンロード同期中..."):
+                try:
+                    all_tickers = get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
+                    update_price_database(
+                        is_jp=is_jp,
+                        target_tickers=all_tickers,
+                        status_callback=update_status_on_screen,
+                        dry_run=False # 即時書き込み
+                    )
+                    status_box.update(label="🎉 本番同期タスクが全て正常に完了しました！", state="complete")
+                except Exception as e:
+                    status_box.update(label="❌ 同期中にエラーが発生しました", state="error")
+                    st.error(f"同期中にエラーを検知しました: {e}")
+
+render_full_sync_section(is_jp)
 
 st.divider()
 
 # 【セクション3】手動ピンポイント一括安全修復
 @st.fragment
-def render_manual_repair_section(is_jp: bool, dry_run_flag: bool):
+def render_manual_repair_section(is_jp: bool):
     st.subheader("3️⃣ 手動ピンポイント一括安全修復")
     st.write(
         "特定の銘柄においてデータの欠損が発生した場合、Rawデータベースからクリーンダウンロード復元し、"
@@ -407,7 +470,7 @@ def render_manual_repair_section(is_jp: bool, dry_run_flag: bool):
                 try:
                     temp_ratio = float(rep_ratio_str.strip())
                     if temp_ratio <= 0:
-                        st.error(f"❌ 危険防止のため、修正比率に 0 以下の数値は設定できません。")
+                        st.error("❌ 危険防止のため、修正比率に 0 以下の数値は設定できません。")
                         st.stop()
                 except ValueError:
                     st.error("修正比率には有効な数値を入力してください。")
@@ -437,9 +500,9 @@ def render_manual_repair_section(is_jp: bool, dry_run_flag: bool):
                     
                     st.write("🔄 加工検証（Activeのバックビルド）を走らせています...")
                     for interval in settings.TIMEFRAMES:
-                        rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run_flag)
+                        rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False) # 保存ありで反映
                         
-                    st.success("✅ パッチ定義が正常に保存され、加工検証が終了しました。")
+                    st.success("✅ パッチ定義が正常に保存され、加工ビルドが終了しました。")
             
             elif not rep_date_str.strip() and not rep_ratio_str.strip():
                 with st.spinner(f"🔧 [{pure_t}] のRawデータ部分ダウンロード及びActive再生成中..."):
@@ -448,7 +511,7 @@ def render_manual_repair_section(is_jp: bool, dry_run_flag: bool):
                         st.write(f" **{interval}**: {msg}")
                     st.success("✅ 個別復元が正常に完了しました。")
 
-render_manual_repair_section(is_jp, use_dry_run)
+render_manual_repair_section(is_jp)
 
 # ── 指定日以前データ部分削除パッチUI ──
 st.markdown("#### 🗑️ 指定日以前データ一括物理削除パッチ")
@@ -534,23 +597,57 @@ st.divider()
 
 # 【セクション4】 全件一括フルダウンロード・再構築
 @st.fragment
-def render_full_rebuild_section(is_jp: bool, market_mode: str, dry_run_flag: bool):
+def render_full_rebuild_section(is_jp: bool, market_mode: str):
     st.subheader("4️⃣ 全件一括フルダウンロード・再構築（Rawもクリア）")
     st.write(
-        "既存のRawおよびActiveデータベースを削除し、yfinanceの提供限界から一発でクリーンビルドし直します。"
+        "既存のRawおよびActiveデータベースを削除し、yfinanceの提供限界から一発でクリーンビルドし直します。 "
+        "テスト検証をして確認した後に本番適用するか、直接ダウンロード・即時保存するか選べます。"
     )
 
-    fb_col1, fb_col2 = st.columns([2, 1])
+    fb_col1, fb_col2 = st.columns(2)
     with fb_col1:
         rebuild_interval = st.selectbox(
             "一括再構築する時間足（タイムフレーム）を選択", ["1m", "5m", "60m", "1d"], index=3, key="rebuild_interval_select"
         )
     with fb_col2:
+        st.write(" ") # 余白調整
         st.write(" ")
-        st.write(" ")
-        btn_full_rebuild = st.button("💥 一括フルダウンロードを実行", use_container_width=True, type="primary")
-        
-    if btn_full_rebuild:
+
+    col_fb_test, col_fb_real = st.columns(2)
+    
+    # 🧪 フル再構築テスト
+    if col_fb_test.button("🧪 フル再構築テストを実行（保存なし）", key="btn_test_full_rebuild", type="secondary", width='stretch'):
+        rebuild_log_lines = []
+        status_box = st.status(f"📡 {market_mode} {rebuild_interval} データベースを一括テスト検証中...", expanded=True)
+        with status_box:
+            st.write("既存のParquetファイルをクリア中...")
+            for is_raw_target in [True, False]:
+                from data_access.local_db import get_db_filename
+                filename = get_db_filename(rebuild_interval, is_jp, is_raw=is_raw_target)
+                work_file = os.path.join(settings.WORK_DIR, filename)
+                if os.path.exists(work_file):
+                    os.remove(work_file)
+            
+            def update_rebuild_status(msg):
+                st.write(msg)
+                rebuild_log_lines.append(str(msg))
+                
+            try:
+                success = full_rebuild_all_database(
+                    is_jp=is_jp, interval=rebuild_interval, status_callback=update_rebuild_status, dry_run=True # Dry Runを強制ON
+                )
+                if success:
+                    status_box.update(label="✅ フル構築テスト検証に成功しました！メモリデータに一時保存されています。", state="complete")
+                    time.sleep(1.0)
+                    st.rerun() # 適用ボタンを出すために再描画
+                else:
+                    status_box.update(label="❌ ビルド中にエラーを検出しました。", state="error")
+            except Exception as e:
+                status_box.update(label="❌ エラー発生", state="error")
+                st.error(f"再構築中に予期せぬエラーが発生しました: {e}")
+
+    # 💻 フル再構築本番（即時保存）
+    if col_fb_real.button("🚀 フル構築ダウンロード＆本番適用（即時保存）", key="btn_real_full_rebuild", type="primary", width='stretch'):
         rebuild_log_lines = []
         status_box = st.status(f"📡 {market_mode} {rebuild_interval} データベースを一括クリーンビルド中...", expanded=True)
         with status_box:
@@ -568,17 +665,17 @@ def render_full_rebuild_section(is_jp: bool, market_mode: str, dry_run_flag: boo
                 
             try:
                 success = full_rebuild_all_database(
-                    is_jp=is_jp, interval=rebuild_interval, status_callback=update_rebuild_status, dry_run=dry_run_flag
+                    is_jp=is_jp, interval=rebuild_interval, status_callback=update_rebuild_status, dry_run=False # 即時書き込み
                 )
                 if success:
-                    status_box.update(label="✅ 一括クリーンビルド検証完了！", state="complete")
+                    status_box.update(label="✅ クリーンビルド本番保存が正常に完了しました！", state="complete")
                 else:
-                    status_box.update(label="❌ ビルド中に検証に失敗しました。Activeは上書きされませんでした。", state="error")
+                    status_box.update(label="❌ ダウンロードまたは構築失敗", state="error")
             except Exception as e:
                 status_box.update(label="❌ エラー発生", state="error")
                 st.error(f"再構築中に予期せぬエラーが発生しました: {e}")
 
-render_full_rebuild_section(is_jp, market_mode, use_dry_run)
+render_full_rebuild_section(is_jp, market_mode)
 
 # UI拡張パーツ
 render_stop_allocation_repair_ui(is_jp=is_jp)

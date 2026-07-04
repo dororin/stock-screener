@@ -1,5 +1,4 @@
-# core/database_service.py のフルコード
-
+# core/database_service.py
 import os
 import time
 import pandas as pd
@@ -149,7 +148,7 @@ def check_anomaly_need_patch(df_ticker: pd.DataFrame, cliff_date_str: str, multi
     return False
 
 # =====================================================================
-# 🛠️ 新設計: Raw & Active 2層同期およびアサーション検証エンジン
+# 🛠️ Raw & Active 2層同期およびアサーション検証エンジン
 # =====================================================================
 
 def check_processed_data_health(old_df: pd.DataFrame, new_df: pd.DataFrame) -> list:
@@ -329,7 +328,6 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         processed_parts.append(adjusted_group)
     df_processed = pd.concat(processed_parts, ignore_index=True)
 
-    # 💡 skip_assertionがTrue（白紙フル再構築）の場合は、過去の古い手動パッチの強制適用もスキップする
     if not skip_assertion:
         df_processed = apply_saved_patches_to_df(df_processed, is_jp=is_jp)
 
@@ -340,7 +338,6 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         except Exception as e:
             log(f"⚠️ ストップ高安バーの自動移植はスキップされました: {e}")
 
-    # 💡 skip_assertionがTrue（白紙フル再構築）の場合は、古いActiveとの健康比較を完全にスキップして、ダウンロードデータのみでクリーン構築する
     if not skip_assertion:
         try:
             df_old_active = load_price_db(interval, is_jp=is_jp, is_raw=False)
@@ -356,10 +353,16 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
                 log("🛑 深刻なデータ不整合（ジャンプなど）を検出したため、破損防止のため同期を強制中断しました。")
                 return False
     else:
-        log("✨ [白紙構築] 新旧データの整合性比較、および過去パッチ適用をスキップしてクリーン保存します。")
+        log("✨ [白紙構築] 新旧データの整合性比較、および過去パッチの干渉をスキップしてクリーン処理します。")
 
     if dry_run:
-        log("🧪 [DRY RUN] 加工・検証を正常に通過。ファイル上書きはスキップ（安全検証モード）。")
+        # 💡 [インメモリ・コミット]: Dry Run時はParquet上書き保存をスキップし、検証済みデータをStreamlit Session Stateに直接保持する
+        log(f"🧪 [DRY RUN] {interval} 加工・アサーション検証を正常に通過。")
+        if settings.HAS_STREAMLIT:
+            import streamlit as st
+            # 出来上がったクリーンなデータをメモリ上に退避
+            st.session_state[f"temp_verified_active_df_{interval}"] = df_processed
+            log(f"   💾 検証済みデータを一時メモリに格納しました。画面から「本番適用」できます。")
         return True
     else:
         df_processed = df_processed.sort_values(["ticker", "date"]).reset_index(drop=True)
@@ -545,7 +548,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
     log("📡 1. yfinanceからのRawデータ差分取得を開始します...")
     update_raw_database(is_jp=is_jp, target_tickers=target_tickers, force_refetch=force_refetch, status_callback=status_callback)
 
-    log("🛠️ 2. RawデータからActiveデータベース一括加工・検証ビルスを開始します...")
+    log("🛠️ 2. RawデータからActiveデータベース一括加工・検証ビルドを開始します...")
     for interval in settings.TIMEFRAMES:
         rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, skip_assertion=False, status_callback=status_callback)
 
@@ -614,13 +617,12 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
         else:
             log(f"⚠️ [Raw保存警告] RawデータのGoogleドライブ同期に失敗しました。エラー: {cloud_msg}")
         
-        # 💡 白紙フル構築の際は、skip_assertion=True を渡して古い比較チェック・過去パッチの干渉をスキップする
         return rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, skip_assertion=True, status_callback=status_callback)
     
     return False
 
 # =====================================================================
-# 🩹 手動修復と一括パッチ適用（古いParquetを壊さず、Rawマスタへ書き戻す形にリファクタ）
+# 🩹 手動修復と一括パッチ適用
 # =====================================================================
 
 def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, multiplier: float, is_jp: bool = True) -> dict:
@@ -740,10 +742,8 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
             raw_db = pd.concat([raw_db, merged_raw], ignore_index=True)
             raw_db = raw_db.sort_values(["ticker", "date"]).reset_index(drop=True)
             
-            # Rawとして保存
             save_price_db(raw_db, interval, is_jp=is_jp, is_raw=True)
             
-            # Activeを再構築
             rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False)
             results[interval] = f"個別ダウンロード・Active再生成成功 ({len(merged_raw):,}件)"
         except Exception as e:
@@ -767,10 +767,8 @@ def delete_data_before_date(ticker: str, limit_date_str: str, is_jp: bool = True
                     df_raw = df_raw[~mask_to_delete].copy()
                     df_raw = df_raw.drop(columns=["temp_date"])
                     df_raw = df_raw.sort_values(["ticker", "date"]).reset_index(drop=True)
-                    # Rawデータの保存
                     save_price_db(df_raw, interval, is_jp=is_jp, is_raw=True)
                     
-                    # 削除されたRawからActiveを再構築
                     rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False)
                     results[interval] = f"Raw/Activeから {deleted_count:,} 件を正常物理削除"
                 else:
@@ -933,7 +931,7 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
     negative_mask = db_df["close"] < 0
     shifted_neg_mask_for_pos = db_df.groupby("ticker")["close"].apply(lambda x: (x < 0).shift(1, fill_value=True)).reset_index(level=0, drop=True)
     pos_to_neg = negative_mask & (~shifted_neg_mask_for_pos)
-    shifted_neg_mask_for_neg = db_df.groupby("ticker")["close"].apply(lambda x: (x < 0).shift(1, fill_value=False)).reset_index(level=0, drop=True)
+    shifted_neg_mask_for_neg = df_neg_shift = db_df.groupby("ticker")["close"].apply(lambda x: (x < 0).shift(1, fill_value=False)).reset_index(level=0, drop=True)
     neg_to_pos = (~negative_mask) & shifted_neg_mask_for_neg
     boundary_mask = pos_to_neg | neg_to_pos
     
