@@ -7,7 +7,7 @@ import streamlit as st
 import re
 
 from config import settings
-from data_access.local_db import load_price_db, save_price_db # save_price_dbをインポート
+from data_access.local_db import load_price_db, save_price_db
 from data_access.sheets_api import (
     load_extra_tickers_from_sheets,
     save_extra_tickers_to_sheets,
@@ -77,9 +77,9 @@ def render_etf_manager():
                         col_add_left, col_add_right = st.columns([4, 1])
                         col_add_left.write(f"{code_str}　{name_str}")
                         if already:
-                            col_add_right.button("✅ 登録済", key=f"etf_add_btn_{code_str}", disabled=True, width='stretch')
+                            col_add_right.button("✅ 登録済", key=f"etf_add_btn_{code_str}", disabled=True, use_container_width=True)
                         else:
-                            if col_add_right.button("追加", key=f"etf_add_btn_{code_str}", width='stretch'):
+                            if col_add_right.button("追加", key=f"etf_add_btn_{code_str}", use_container_width=True):
                                 new_row = pd.DataFrame([{"code": code_str, "name": name_str, "memo": ""}])
                                 df = pd.concat([df, new_row], ignore_index=True)
                                 save_extra_tickers_to_sheets(df)
@@ -127,7 +127,7 @@ def render_stop_allocation_repair_ui(is_jp: bool):
         "日足が「寄り付かずS高/S安（比例配分）」で確定している日について、"
         "短期足(60m/5m/1m)から消失している大引けバーをRawデータから加工リビルドして再構成します。"
     )
-    if st.button("🩹 ストップ高安バーを一括修復", key="btn_repair_stop_allocation", type="secondary"):
+    if st.button("🩹 ストップ高安バーを一括修復", key="btn_repair_stop_allocation", type="secondary", use_container_width=True):
         status_box = st.status("📡 ストップ高安バー修復に伴うActiveリビルド中...", expanded=True)
         with status_box:
             def update_status(msg):
@@ -145,7 +145,7 @@ def render_database_diagnostics_ui(is_jp: bool):
     st.subheader("📊 データベース健康診断 (段差・不具合検出)")
     st.write("各時間足(1d, 60m, 5m, 1m)を巡回し、価格データの断絶や一時的な配信バグを高速スキャンします。")
     
-    if st.button("🔍 データベース健康診断を実行", key="btn_run_health_check", type="primary"):
+    if st.button("🔍 データベース健康診断を実行", key="btn_run_health_check", type="primary", use_container_width=True):
         with st.spinner("データベースの整合性をフルスキャン中..."):
             st.session_state.detected_anomalies = run_database_health_scan(is_jp)
             st.success("健康診断が完了しました。")
@@ -238,7 +238,6 @@ def render_database_diagnostics_ui(is_jp: bool):
 
 # ── 💡 開発者機能: インメモリに一時保存されたデータのコミット機能 ──
 def render_commit_verified_data_ui(is_jp: bool):
-    """検証済みのインメモリ一時データが存在する場合、本番書き込み（Google Driveアップロード）を行うボタンを出動させます"""
     verified_keys = [k for k in st.session_state.keys() if str(k).startswith("temp_verified_active_df_")]
     if not verified_keys:
         return
@@ -251,8 +250,7 @@ def render_commit_verified_data_ui(is_jp: bool):
 
     col_btn_apply, col_btn_clear = st.columns([2, 1])
     
-    # 💻 本番書き込みボタン（一瞬で完了）
-    if col_btn_apply.button("💻 メモリ上の検証データをGoogleドライブへ本番適用する", key="btn_apply_verified_data_commit", type="primary", width='stretch'):
+    if col_btn_apply.button("💻 メモリ上の検証データをGoogleドライブへ本番適用する", key="btn_apply_verified_data_commit", type="primary", use_container_width=True):
         status_box = st.status("📡 メモリからGoogleドライブへ上書き保存中...", expanded=True)
         with status_box:
             success_count = 0
@@ -261,7 +259,6 @@ def render_commit_verified_data_ui(is_jp: bool):
                 df_processed = st.session_state[key]
                 st.write(f"⏱️ [{interval}] をGoogleドライブにアップロード中...")
                 
-                # 本番書き込み保存の実行
                 cloud_success, cloud_msg = save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False)
                 if cloud_success:
                     st.success(f"✅ [{interval}] のGoogleドライブ同期が正常に完了しました。")
@@ -272,15 +269,13 @@ def render_commit_verified_data_ui(is_jp: bool):
                         st.info("   💡 事前にPCから同名の空ファイルをGoogleドライブの共有フォルダへドラッグ＆ドロップして、所有権をご自身に変更しておいてください。")
             
             if success_count > 0:
-                # 適用し終えたメモリ用キャッシュを綺麗に消去
                 for key in verified_keys:
                     del st.session_state[key]
                 status_box.update(label=f"🎉 計 {success_count} 個の時間足データの本番同期が完了しました！", state="complete")
                 time.sleep(1.0)
                 st.rerun()
 
-    # 🗑️ メモリ一時消去
-    if col_btn_clear.button("🗑️ 検証データを破棄する", key="btn_clear_verified_data_cache", type="secondary", width='stretch'):
+    if col_btn_clear.button("🗑️ 検証データを破棄する", key="btn_clear_verified_data_cache", type="secondary", use_container_width=True):
         for key in verified_keys:
             del st.session_state[key]
         st.warning("メモリ上の一時データを消去しました。")
@@ -311,7 +306,7 @@ st.divider()
 
 # 🔄 ETF構成銘柄の同期（1枚完結・統合版）
 st.subheader("🔄 ETFセクター構成の同期（スプレッドシート連動）")
-if st.button("🚀 ETF構成銘柄を同期する", key="btn_sync_etf_master", width='stretch', type="primary"):
+if st.button("🚀 ETF構成銘柄を同期する", key="btn_sync_etf_master", use_container_width=True, type="primary"):
     with st.spinner("スプレッドシートを更新中..."):
         try:
             from data_access.sheets_api import sync_etf_sectors_consolidated
@@ -346,7 +341,7 @@ def render_full_sync_section(is_jp: bool):
     col_btn_test, col_btn_real = st.columns(2)
     
     # 🧪 テスト検証モード
-    if col_btn_test.button("🧪 まずテスト検証を実行（保存なし）", key="btn_test_diff_update", type="secondary", width='stretch'):
+    if col_btn_test.button("🧪 まずテスト検証を実行（保存なし）", key="btn_test_diff_update", type="secondary", use_container_width=True):
         sync_log_lines = []
         status_box = st.status("📡 データベース全体差分 テスト検証中...", expanded=True)
         with status_box:
@@ -372,13 +367,13 @@ def render_full_sync_section(is_jp: bool):
                     )
                     status_box.update(label="🎉 テスト検証が正常に完了しました！メモリデータに一時保存されています。", state="complete")
                     time.sleep(1.0)
-                    st.rerun() # 適用ボタンを出現させるために再描画
+                    st.rerun()
                 except Exception as e:
                     status_box.update(label="❌ 検証エラーが発生しました", state="error")
                     st.error(f"検証中に例外エラーを検知しました: {e}")
 
     # 💻 本番同期モード（即時保存）
-    if col_btn_real.button("🚀 直接本番同期（即時保存＆Driveアップロード）", key="btn_real_diff_update", type="primary", width='stretch'):
+    if col_btn_real.button("🚀 直接本番同期（即時保存＆Driveアップロード）", key="btn_real_diff_update", type="primary", use_container_width=True):
         sync_log_lines = []
         status_box = st.status("📡 データベース全体差分 本番同期中...", expanded=True)
         with status_box:
@@ -400,7 +395,7 @@ def render_full_sync_section(is_jp: bool):
                         is_jp=is_jp,
                         target_tickers=all_tickers,
                         status_callback=update_status_on_screen,
-                        dry_run=False # 即時書き込み
+                        dry_run=False
                     )
                     status_box.update(label="🎉 本番同期タスクが全て正常に完了しました！", state="complete")
                 except Exception as e:
@@ -416,7 +411,7 @@ st.divider()
 def render_manual_repair_section(is_jp: bool):
     st.subheader("3️⃣ 手動ピンポイント一括安全修復")
     st.write(
-        "特定の銘柄においてデータの欠損が発生した場合、Rawデータベースからクリーンダウンロード復元し、"
+        "特定の銘柄においてデータの欠損が発生した場合、Rawデータベースからクリーンダウンロード復元し, "
         "最新のTransform加工を通じてActiveを一元的に再構成します。"
     )
 
@@ -500,7 +495,7 @@ def render_manual_repair_section(is_jp: bool):
                     
                     st.write("🔄 加工検証（Activeのバックビルド）を走らせています...")
                     for interval in settings.TIMEFRAMES:
-                        rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False) # 保存ありで反映
+                        rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False)
                         
                     st.success("✅ パッチ定義が正常に保存され、加工ビルドが終了しました。")
             
@@ -581,7 +576,7 @@ with st.expander("📋 修復ログ一覧", expanded=False):
 # ── 手動パッチ全適用 ──
 st.write(" ")
 st.markdown("#### 🔄 **保存済みパッチのActiveクリーンリビルド適用**")
-if st.button("🔄 保存されているすべてのパッチをActiveへ一括適用（リビルド）", key="btn_apply_all_patches_manual", type="secondary"):
+if st.button("🔄 保存されているすべてのパッチをActiveへ一括適用（リビルド）", key="btn_apply_all_patches_manual", type="secondary", use_container_width=True):
     status_box = st.status("📡 パッチマスタ適用に伴うActive再構築中...", expanded=True)
     with status_box:
         def update_patch_status(msg):
@@ -595,88 +590,96 @@ if st.button("🔄 保存されているすべてのパッチをActiveへ一括�
 
 st.divider()
 
-# 【セクション4】 全件一括フルダウンロード・再構築
+# ── 【セクション4】 全件一括フルダウンロード・再構築（Rawもクリア） ──
+
+@st.dialog("🚨 データベース完全再構築の最終確認", width="medium")
+def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
+    """
+    実行ボタンを間違えて押しても問題ないように、
+    処理前に割り入る『はい／いいえ』の確認ダイアログ（モーダル）です。
+    """
+    st.warning("⚠️ **警告：この操作は取り消せません**")
+    st.markdown(
+        f"既存の **{market_mode} {interval}** の原本データ（Raw）および実行用データ（Active）をディスクから完全に物理削除し、"
+        "白紙の状態からyfinanceの提供限界まで全件再ダウンロードを行います。"
+    )
+    st.write("1分足や5分足の場合、取得可能上限（7日前/60日前）を過ぎて消失した古い履歴データは完全に失われます。本当に実行してよろしいですか？")
+    st.write(" ")
+
+    col_yes, col_no = st.columns(2)
+    
+    # ❌ いいえ（キャンセル）：ダイアログを閉じて元の画面に戻る
+    if col_no.button("いいえ（キャンセル）", use_container_width=True):
+        st.rerun()
+        
+    # 🟢 はい（実行）：ダイアログ内でクリーンビルドを直接実行
+    if col_yes.button("はい（本当に実行する）", type="primary", use_container_width=True):
+        rebuild_log_lines = []
+        status_box = st.status(f"📡 {market_mode} {interval} を一括クリーンビルド中...", expanded=True)
+        with status_box:
+            st.write("既存 of Parquetファイルをディスクから物理クリア中...")
+            for is_raw_target in [True, False]:
+                from data_access.local_db import get_db_filename
+                filename = get_db_filename(interval, is_jp, is_raw=is_raw_target)
+                work_file = os.path.join(settings.WORK_DIR, filename)
+                if os.path.exists(work_file):
+                    try:
+                        os.remove(work_file)
+                    except Exception as e:
+                        st.write(f"⚠️ ファイルクリア中にエラー: {e}")
+            
+            def update_rebuild_status(msg):
+                st.write(msg)
+                rebuild_log_lines.append(str(msg))
+                
+            try:
+                # テスト検証を一切挟まず、白紙から即時本番保存する
+                success = full_rebuild_all_database(
+                    is_jp=is_jp, 
+                    interval=interval, 
+                    status_callback=update_rebuild_status, 
+                    dry_run=False # 即時本番書き込み
+                )
+                if success:
+                    status_box.update(label="✅ クリーンビルド本番保存が正常に完了しました！", state="complete")
+                    st.success("再構築が成功しました。画面を更新します。")
+                    time.sleep(1.0)
+                    st.rerun()
+                else:
+                    status_box.update(label="❌ ダウンロードまたは構築失敗", state="error")
+                    st.error("クリーンビルドに失敗しました。")
+            except Exception as e:
+                status_box.update(label="❌ エラー発生", state="error")
+                st.error(f"再構築中に予期せぬエラーが発生しました: {e}")
+
 @st.fragment
 def render_full_rebuild_section(is_jp: bool, market_mode: str):
     st.subheader("4️⃣ 全件一括フルダウンロード・再構築（Rawもクリア）")
     st.write(
-        "既存のRawおよびActiveデータベースを削除し、yfinanceの提供限界から一発でクリーンビルドし直します。 "
-        "テスト検証をして確認した後に本番適用するか、直接ダウンロード・即時保存するか選べます。"
+        "既存のRawおよびActiveデータベースを完全に物理削除し、yfinanceの提供限界から一発でクリーンビルドし直します。 "
+        "※古い履歴データは完全に消滅するため、実行には十分注意してください。"
     )
 
-    fb_col1, fb_col2 = st.columns(2)
-    with fb_col1:
+    col1, col2 = st.columns([2, 1])
+    with col1:
         rebuild_interval = st.selectbox(
-            "一括再構築する時間足（タイムフレーム）を選択", ["1m", "5m", "60m", "1d"], index=3, key="rebuild_interval_select"
+            "一括再構築する時間足（タイムフレーム）を選択", 
+            ["1m", "5m", "60m", "1d"], 
+            index=3, 
+            key="rebuild_interval_select"
         )
-    with fb_col2:
+    with col2:
         st.write(" ") # 余白調整
         st.write(" ")
-
-    col_fb_test, col_fb_real = st.columns(2)
-    
-    # 🧪 フル再構築テスト
-    if col_fb_test.button("🧪 フル再構築テストを実行（保存なし）", key="btn_test_full_rebuild", type="secondary", width='stretch'):
-        rebuild_log_lines = []
-        status_box = st.status(f"📡 {market_mode} {rebuild_interval} データベースを一括テスト検証中...", expanded=True)
-        with status_box:
-            st.write("既存のParquetファイルをクリア中...")
-            for is_raw_target in [True, False]:
-                from data_access.local_db import get_db_filename
-                filename = get_db_filename(rebuild_interval, is_jp, is_raw=is_raw_target)
-                work_file = os.path.join(settings.WORK_DIR, filename)
-                if os.path.exists(work_file):
-                    os.remove(work_file)
-            
-            def update_rebuild_status(msg):
-                st.write(msg)
-                rebuild_log_lines.append(str(msg))
-                
-            try:
-                success = full_rebuild_all_database(
-                    is_jp=is_jp, interval=rebuild_interval, status_callback=update_rebuild_status, dry_run=True # Dry Runを強制ON
-                )
-                if success:
-                    status_box.update(label="✅ フル構築テスト検証に成功しました！メモリデータに一時保存されています。", state="complete")
-                    time.sleep(1.0)
-                    st.rerun() # 適用ボタンを出すために再描画
-                else:
-                    status_box.update(label="❌ ビルド中にエラーを検出しました。", state="error")
-            except Exception as e:
-                status_box.update(label="❌ エラー発生", state="error")
-                st.error(f"再構築中に予期せぬエラーが発生しました: {e}")
-
-    # 💻 フル再構築本番（即時保存）
-    if col_fb_real.button("🚀 フル構築ダウンロード＆本番適用（即時保存）", key="btn_real_full_rebuild", type="primary", width='stretch'):
-        rebuild_log_lines = []
-        status_box = st.status(f"📡 {market_mode} {rebuild_interval} データベースを一括クリーンビルド中...", expanded=True)
-        with status_box:
-            st.write("既存のParquetファイルをクリア中...")
-            for is_raw_target in [True, False]:
-                from data_access.local_db import get_db_filename
-                filename = get_db_filename(rebuild_interval, is_jp, is_raw=is_raw_target)
-                work_file = os.path.join(settings.WORK_DIR, filename)
-                if os.path.exists(work_file):
-                    os.remove(work_file)
-            
-            def update_rebuild_status(msg):
-                st.write(msg)
-                rebuild_log_lines.append(str(msg))
-                
-            try:
-                success = full_rebuild_all_database(
-                    is_jp=is_jp, interval=rebuild_interval, status_callback=update_rebuild_status, dry_run=False # 即時書き込み
-                )
-                if success:
-                    status_box.update(label="✅ クリーンビルド本番保存が正常に完了しました！", state="complete")
-                else:
-                    status_box.update(label="❌ ダウンロードまたは構築失敗", state="error")
-            except Exception as e:
-                status_box.update(label="❌ エラー発生", state="error")
-                st.error(f"再構築中に予期せぬエラーが発生しました: {e}")
+        
+        # 💥 実行の親ボタン。これ自体を押してもいきなり処理は始まらず、確認用のダイアログ（st.dialog）を呼び出します。
+        if st.button("💥 一括フルダウンロードを実行", key="btn_real_full_rebuild_trigger", type="primary", use_container_width=True):
+            run_full_rebuild_dialog(rebuild_interval, is_jp, market_mode)
 
 render_full_rebuild_section(is_jp, market_mode)
 
-# UI拡張パーツ
+# ストップ高安バー修復UIの表示
 render_stop_allocation_repair_ui(is_jp=is_jp)
+
+# 健康診断UIの表示
 render_database_diagnostics_ui(is_jp=is_jp)
