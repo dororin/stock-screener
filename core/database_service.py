@@ -1,4 +1,5 @@
-# core/database_service.py
+# core/database_service.py のフルコード
+
 import os
 import time
 import pandas as pd
@@ -308,7 +309,7 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
     df_intra = df_intra.drop(columns=["date_only"], errors="ignore")
     return df_intra
 
-def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = False, status_callback=None) -> bool:
+def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = False, skip_assertion: bool = False, status_callback=None) -> bool:
     def log(msg):
         print(msg)
         if status_callback: status_callback(msg)
@@ -328,7 +329,9 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         processed_parts.append(adjusted_group)
     df_processed = pd.concat(processed_parts, ignore_index=True)
 
-    df_processed = apply_saved_patches_to_df(df_processed, is_jp=is_jp)
+    # 💡 skip_assertionがTrue（白紙フル再構築）の場合は、過去の古い手動パッチの強制適用もスキップする
+    if not skip_assertion:
+        df_processed = apply_saved_patches_to_df(df_processed, is_jp=is_jp)
 
     if interval != "1d":
         try:
@@ -337,26 +340,29 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         except Exception as e:
             log(f"⚠️ ストップ高安バーの自動移植はスキップされました: {e}")
 
-    try:
-        df_old_active = load_price_db(interval, is_jp=is_jp, is_raw=False)
-    except FileNotFoundError:
-        df_old_active = pd.DataFrame()
+    # 💡 skip_assertionがTrue（白紙フル再構築）の場合は、古いActiveとの健康比較を完全にスキップして、ダウンロードデータのみでクリーン構築する
+    if not skip_assertion:
+        try:
+            df_old_active = load_price_db(interval, is_jp=is_jp, is_raw=False)
+        except FileNotFoundError:
+            df_old_active = pd.DataFrame()
 
-    alerts = check_processed_data_health(df_old_active, df_processed)
-    if alerts:
-        log("💥 【警告】ビルド後の健康診断チェックで異常を検出しました:")
-        for alert in alerts:
-            log(f"   {alert}")
-        if any("🚨" in a for a in alerts):
-            log("🛑 深刻なデータ不整合（ジャンプなど）を検出したため、破損防止のため同期を強制中断しました。")
-            return False
+        alerts = check_processed_data_health(df_old_active, df_processed)
+        if alerts:
+            log("💥 【警告】ビルド後の健康診断チェックで異常を検出しました:")
+            for alert in alerts:
+                log(f"   {alert}")
+            if any("🚨" in a for a in alerts):
+                log("🛑 深刻なデータ不整合（ジャンプなど）を検出したため、破損防止のため同期を強制中断しました。")
+                return False
+    else:
+        log("✨ [白紙構築] 新旧データの整合性比較、および過去パッチ適用をスキップしてクリーン保存します。")
 
     if dry_run:
         log("🧪 [DRY RUN] 加工・検証を正常に通過。ファイル上書きはスキップ（安全検証モード）。")
         return True
     else:
         df_processed = df_processed.sort_values(["ticker", "date"]).reset_index(drop=True)
-        # Googleドライブへの保存成否とエラーメッセージを受け取る
         cloud_success, cloud_msg = save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False)
         
         if cloud_success:
@@ -523,7 +529,6 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                 df_raw_db = new_combined
             
             df_raw_db = df_raw_db.sort_values(["ticker", "date"]).reset_index(drop=True)
-            # RawDBの保存
             cloud_success, cloud_msg = save_price_db(df_raw_db, interval, is_jp=is_jp, is_raw=True)
             if cloud_success:
                 log(f"  📥 Rawデータ差分保存完了。({len(new_combined):,}件追加)")
@@ -540,9 +545,9 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
     log("📡 1. yfinanceからのRawデータ差分取得を開始します...")
     update_raw_database(is_jp=is_jp, target_tickers=target_tickers, force_refetch=force_refetch, status_callback=status_callback)
 
-    log("🛠️ 2. RawデータからActiveデータベース一括加工・検証ビルドを開始します...")
+    log("🛠️ 2. RawデータからActiveデータベース一括加工・検証ビルスを開始します...")
     for interval in settings.TIMEFRAMES:
-        rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, status_callback=status_callback)
+        rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, skip_assertion=False, status_callback=status_callback)
 
 # =====================================================================
 # 💥 クリーンビルド（RawもActiveも完全にダウンロードし直す）
@@ -609,7 +614,8 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
         else:
             log(f"⚠️ [Raw保存警告] RawデータのGoogleドライブ同期に失敗しました。エラー: {cloud_msg}")
         
-        return rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, status_callback=status_callback)
+        # 💡 白紙フル構築の際は、skip_assertion=True を渡して古い比較チェック・過去パッチの干渉をスキップする
+        return rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, skip_assertion=True, status_callback=status_callback)
     
     return False
 
@@ -684,7 +690,7 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
     
     success_count = 0
     for interval in settings.TIMEFRAMES:
-        success = rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False, status_callback=status_callback)
+        success = rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False, skip_assertion=False, status_callback=status_callback)
         if success:
             success_count += 1
             log(f"  👉 [{interval}] のパッチ適用およびActiveの再生成が正常に完了しました。")
@@ -790,7 +796,7 @@ def repair_stop_allocation_bars_full(is_jp: bool = True, status_callback=None) -
     log("📡 ストップ高安バーの修復処理として、Activeデータベースのリビルドを開始します...")
     results = {}
     for interval in ["60m", "5m", "1m"]:
-        success = rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False, status_callback=status_callback)
+        success = rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False, skip_assertion=False, status_callback=status_callback)
         if success:
             results[interval] = 1 
     return results
