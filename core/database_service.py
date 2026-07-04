@@ -673,12 +673,24 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
 # =====================================================================
 
 def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_callback=None, dry_run: bool = False) -> bool:
+    """
+    既存のRawおよびActiveデータベースを完全に物理削除し、yfinanceの提供限界から一発でクリーンビルドし直します。
+    (日本株のフル再構築時には、スプレッドシートの追加ETF定義を事前に強制同期して最新化します)
+    """
     def log(msg):
         print(msg)
         if status_callback: status_callback(msg)
 
     market_name = "JP" if is_jp else "US"
     if is_jp:
+        # ★【追加】 一括再ダウンロードの直前にスプレッドシートから最新の追加ETFマスタを同期・キャッシュ化
+        try:
+            from core.collector import sync_extra_tickers_to_local
+            sync_extra_tickers_to_local()
+            log("🔄 Google Sheetsから最新の追加収集ETFマスタを取得し、同期しました。")
+        except Exception as e:
+            log(f"⚠️ 追加収集ETFマスタの同期に失敗したため、既存のローカルキャッシュを使用します: {e}")
+            
         tickers = get_all_collection_tickers()
     else:
         tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
