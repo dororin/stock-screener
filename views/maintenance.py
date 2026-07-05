@@ -49,6 +49,7 @@ def get_db_last_update(interval: str, is_jp: bool = True) -> str:
         return "不明"
 
 # ── 追加ETF（extra_tickers）管理コンポーネント ──
+@st.fragment
 def render_etf_manager():
     df = load_extra_tickers_from_sheets()
     count = len(df) if not df.empty else 0
@@ -123,6 +124,7 @@ def render_etf_manager():
             st.caption("登録されている追加ETFはありません。")
 
 # ── ストップ高安（寄り付かず比例配分）バー一括修復コンポーネント ──
+@st.fragment
 def render_stop_allocation_repair_ui(is_jp: bool):
     st.divider()
     st.subheader("🩹 ストップ高安（寄り付かず比例配分）バー修復")
@@ -166,6 +168,7 @@ def render_stop_allocation_repair_ui(is_jp: bool):
                 st.error(f"修復中にエラー: {e}")
 
 # ── 🔍 統合データスキャン（TradingView自動照合・チェックボックス一括修復）コンポーネント ──
+@st.fragment
 def render_unified_scan_and_repair_ui(is_jp: bool):
     st.divider()
     st.subheader("🔍 統合データスキャン（自動検出 → TradingView照合 → 一括自動修復）")
@@ -176,8 +179,8 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
     )
 
     if st.button("🔍 統合スキャンを実行", key="btn_unified_scan", type="primary", use_container_width=True):
-        with st.spinner("段差検出とTradingViewデータ照合を実行中..."):
-            st.session_state.unified_scan_result = scan_and_diagnose_cliffs_with_tv(is_jp=is_jp, interval="1d")
+        with st.spinner("全時間足（1d/60m/5m/1m）の段差検出とTradingViewデータ照合を実行中..."):
+            st.session_state.unified_scan_result = scan_and_diagnose_cliffs_with_tv(is_jp=is_jp)
         st.success("統合スキャンが完了しました。")
 
     result_df = st.session_state.get("unified_scan_result")
@@ -194,20 +197,24 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
     display_df["選択"] = False
     if "cliff_date" in display_df.columns:
         display_df["cliff_date"] = pd.to_datetime(display_df["cliff_date"]).dt.strftime("%Y-%m-%d")
+    if "patch_date" in display_df.columns:
+        display_df["patch_date"] = pd.to_datetime(display_df["patch_date"]).dt.strftime("%Y-%m-%d")
 
-    # TradingViewで取得できなかった行はチェックボックス選択を不可にする（安全対策）
+    # 真の倍率（true_multiplier / est_multiplierフォールバック含む）が取得できなかった行はチェックボックス選択を不可にする（安全対策）
     unresolved_mask = display_df["true_multiplier"].isna()
 
     rename_map = {
         "選択": "選択",
         "ticker": "銘柄",
-        "cliff_date": "崖日付",
-        "before_close": "1日前 Close",
-        "after_close": "当日 Close",
-        "before_adj_close": "1日前 Adj Close",
-        "after_adj_close": "当日 Adj Close",
+        "interval": "時間足",
+        "cliff_date": "変化点",
+        "patch_date": "要補正Close日時（適用基準）",
+        "before_close": "要補正 Close",
+        "after_close": "基準 Close",
+        "before_adj_close": "要補正 Adj Close",
+        "after_adj_close": "基準 Adj Close",
         "volume": "出来高",
-        "tv_close": "TV Close",
+        "tv_close": "TV Close（要補正側）",
         "est_multiplier": "推測倍率(est_multiplier)",
         "true_multiplier": "真の倍率(true_multiplier)",
     }
@@ -221,12 +228,12 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
         hide_index=True,
         disabled=[c for c in ordered_cols if c != "選択"],
         column_config={
-            "選択": st.column_config.CheckboxColumn("選択", help="TV Closeが取得できていない行は選択できません"),
+            "選択": st.column_config.CheckboxColumn("選択", help="真の倍率が取得できていない行は選択できません"),
         },
         key="unified_scan_editor",
     )
 
-    # TV Closeが取得できなかった行は強制的に選択解除（誤操作防止）
+    # 真の倍率が取得できなかった行は強制的に選択解除（誤操作防止）
     edited_df.loc[unresolved_mask.values, "選択"] = False
 
     selected_rows = edited_df[edited_df["選択"] == True]
@@ -234,7 +241,7 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
 
     if st.button("🚀 選択したパッチをすべて本番適用（一括実行）", key="btn_bulk_apply_selected", type="primary", use_container_width=True, disabled=selected_rows.empty):
         patches = [
-            {"ticker": r["銘柄"], "cliff_date": r["崖日付"], "multiplier": r["真の倍率(true_multiplier)"]}
+            {"ticker": r["銘柄"], "patch_date": r["要補正Close日時（適用基準）"], "multiplier": r["真の倍率(true_multiplier)"]}
             for _, r in selected_rows.iterrows()
         ]
         status_box = st.status("📡 選択パッチの一括本番適用を実行中...", expanded=True)
@@ -581,7 +588,7 @@ def render_manual_repair_section(is_jp: bool):
         with col_t1:
             rep_ticker = st.text_input("銘柄コード", placeholder="例:1629", key="rep_ticker_box")
         with col_t2:
-            rep_date_str = st.text_input("修正開始日", placeholder="空白で個別ダウンロード復元", key="rep_date_box")
+            rep_date_str = st.text_input("要補正Close日時（崖前日）", placeholder="空白で個別ダウンロード復元", key="rep_date_box")
         with col_t3:
             rep_ratio_str = st.text_input("修正比率", placeholder="空白で個別ダウンロード復元", key="rep_ratio_box")
         
@@ -712,36 +719,40 @@ def render_manual_repair_section(is_jp: bool):
                     st.success("✅ 個別ダウンロード本番適用が正常に完了しました。")
 
 # ── 指定日以前データ部分削除パッチUI ──
-st.markdown("#### 🗑️ 指定日以前データ一括物理削除パッチ")
-del_col1, del_col2, del_col3 = st.columns([3, 2, 1])
-with del_col1:
-    del_ticker = st.text_input("データ削除を実行する銘柄コード", placeholder="例: 8303", key="del_ticker_box")
-with del_col2:
-    del_date_str = st.text_input("削除の境界となる日付", placeholder="例: 2025-12-16", key="del_date_box")
-with del_col3:
-    st.write(" ")
-    st.write(" ")
-    btn_delete_before = st.button("🗑️ 指定日以前を物理削除", use_container_width=True, type="primary")
+@st.fragment
+def render_delete_before_date_ui(is_jp: bool):
+    st.markdown("#### 🗑️ 指定日以前データ一括物理削除パッチ")
+    del_col1, del_col2, del_col3 = st.columns([3, 2, 1])
+    with del_col1:
+        del_ticker = st.text_input("データ削除を実行する銘柄コード", placeholder="例: 8303", key="del_ticker_box")
+    with del_col2:
+        del_date_str = st.text_input("削除の境界となる日付", placeholder="例: 2025-12-16", key="del_date_box")
+    with del_col3:
+        st.write(" ")
+        st.write(" ")
+        btn_delete_before = st.button("🗑️ 指定日以前を物理削除", use_container_width=True, type="primary")
 
-if btn_delete_before:
-    if not del_ticker:
-        st.error("銘柄コードが入力されていません。")
-    elif not del_date_str:
-        st.error("基準日付が入力されていません。")
-    else:
-        try:
-            pd.to_datetime(del_date_str)
-        except ValueError:
-            st.error("日付は有効な形式（YYYY-MM-DD）で入力してください。")
-            st.stop()
-            
-        pure_t = sanitize_ticker(del_ticker, is_jp=is_jp)
-        with st.spinner(f"🗑️ [{pure_t}] 物理削除・ビルド中..."):
-            from core.database_service import delete_data_before_date
-            del_results = delete_data_before_date(pure_t, del_date_str, is_jp=is_jp)
-            for interval, msg in del_results.items():
-                st.write(f" **{interval}**: {msg}")
-            st.success("✅ 物理削除とActive再構築が完了しました。")
+    if btn_delete_before:
+        if not del_ticker:
+            st.error("銘柄コードが入力されていません。")
+        elif not del_date_str:
+            st.error("基準日付が入力されていません。")
+        else:
+            try:
+                pd.to_datetime(del_date_str)
+            except ValueError:
+                st.error("日付は有効な形式（YYYY-MM-DD）で入力してください。")
+                st.stop()
+                
+            pure_t = sanitize_ticker(del_ticker, is_jp=is_jp)
+            with st.spinner(f"🗑️ [{pure_t}] 物理削除・ビルド中..."):
+                from core.database_service import delete_data_before_date
+                del_results = delete_data_before_date(pure_t, del_date_str, is_jp=is_jp)
+                for interval, msg in del_results.items():
+                    st.write(f" **{interval}**: {msg}")
+                st.success("✅ 物理削除とActive再構築が完了しました。")
+
+render_delete_before_date_ui(is_jp)
 
 # ── 修復ログ一覧 ──
 with st.expander("📋 修復ログ一覧", expanded=False):

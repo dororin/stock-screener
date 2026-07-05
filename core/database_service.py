@@ -116,7 +116,12 @@ def _replace_stop_allocation_bar(df_interval: pd.DataFrame, ticker: str, day_dat
     df_result = pd.concat([df_cleaned, pd.DataFrame([new_row])], ignore_index=True)
     return df_result
 
-def check_anomaly_need_patch(df_ticker: pd.DataFrame, cliff_date_str: str, multiplier: float, threshold: float = 0.10) -> bool:
+def check_anomaly_need_patch(df_ticker: pd.DataFrame, patch_date_str: str, multiplier: float, threshold: float = 0.10) -> bool:
+    """
+    二重適用防止判定（t-1基準）。
+    patch_date_str は「要補正Closeの日時（崖前日）」を指定します。
+    before側は patch_date 以下（<=）、after側は patch_date より後（>）を基準に判定します。
+    """
     if df_ticker.empty or len(df_ticker) < 2:
         return False
         
@@ -124,12 +129,12 @@ def check_anomaly_need_patch(df_ticker: pd.DataFrame, cliff_date_str: str, multi
     df_t["date_dt"] = pd.to_datetime(df_t["date"])
     
     try:
-        target_dt = pd.to_datetime(cliff_date_str)
+        target_dt = pd.to_datetime(patch_date_str)
     except Exception:
         return False
     
-    before_rows = df_t[df_t["date_dt"] < target_dt]
-    after_rows = df_t[df_t["date_dt"] >= target_dt]
+    before_rows = df_t[df_t["date_dt"] <= target_dt]
+    after_rows = df_t[df_t["date_dt"] > target_dt]
     
     if before_rows.empty or after_rows.empty:
         return False
@@ -274,7 +279,8 @@ def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True) -> pd.DataFr
         if not check_anomaly_need_patch(ticker_data, cliff_date, multiplier):
             continue
 
-        pre_mask = (df_result["ticker"] == ticker) & (pd.to_datetime(df_result["date"]) < cliff_date)
+        # cliff_date（ログ上の記録日付）は「要補正Closeの日時（t-1）」のため、この日を含めて（<=）適用する
+        pre_mask = (df_result["ticker"] == ticker) & (pd.to_datetime(df_result["date"]) <= cliff_date)
         if pre_mask.any():
             price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in df_result.columns]
             for col in price_cols:
@@ -385,19 +391,20 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
 # 🧪 開発検証: 手動パッチのメモリ上適用シミュレーション
 # =====================================================================
 
-def test_forced_scale_patch_in_memory(ticker: str, cliff_date_str: str, multiplier: float, is_jp: bool = True) -> tuple:
+def test_forced_scale_patch_in_memory(ticker: str, patch_date_str: str, multiplier: float, is_jp: bool = True) -> tuple:
     """
-    手動パッチ（cliff_date / multiplier）を、実際のParquetを書き換えることなく
+    手動パッチ（patch_date / multiplier）を、実際のParquetを書き換えることなく
     すべてメモリ上でシミュレーション実行し、検証結果と仮の加工後DataFrameを返します。
+    patch_date_str は「要補正Closeの日時（崖前日, t-1）」を指定し、この日を含めて（<=）過去へ一括適用します。
     """
     pure_ticker = sanitize_ticker(ticker, is_jp)
     results = {}
     st_temp_dfs = {}
     
     try:
-        target_dt = pd.to_datetime(cliff_date_str)
+        target_dt = pd.to_datetime(patch_date_str)
     except Exception as e:
-        return {"error": f"崖日付のパース失敗: {e}"}, {}
+        return {"error": f"要補正Close日時のパース失敗: {e}"}, {}
 
     for interval in ["1d", "60m", "5m", "1m"]:
         try:
@@ -415,13 +422,13 @@ def test_forced_scale_patch_in_memory(ticker: str, cliff_date_str: str, multipli
             results[interval] = "対象データなし"
             continue
 
-        need_apply = check_anomaly_need_patch(ticker_data, cliff_date_str, multiplier)
+        need_apply = check_anomaly_need_patch(ticker_data, patch_date_str, multiplier)
         if not need_apply:
             results[interval] = "適用不要（既に調整済み、または落差がありません）"
             continue
 
         ticker_data["date"] = pd.to_datetime(ticker_data["date"])
-        pre_mask = ticker_data["date"] < target_dt
+        pre_mask = ticker_data["date"] <= target_dt
         if not pre_mask.any():
             results[interval] = "対象期間（崖日より過去）のデータなし"
             continue
@@ -721,16 +728,20 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
 # 🩹 手動修復と一括パッチ適用
 # =====================================================================
 
-def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, multiplier: float, is_jp: bool = True) -> dict:
+def apply_forced_scale_patch_to_all_timeframes(ticker: str, patch_date: str, multiplier: float, is_jp: bool = True) -> dict:
+    """
+    patch_date は「要補正Closeの日時（崖前日, t-1）」を指定します。
+    この日を含めて（<=）過去のデータすべてに multiplier を一括適用します。
+    """
     if multiplier <= 0:
         return {"error": f"処理を中断しました。倍率に 0 以下の数値（{multiplier}）は指定できません。"}
 
     pure_ticker = sanitize_ticker(ticker, is_jp)
     results = {}
     try:
-        target_dt = pd.to_datetime(cliff_date)
+        target_dt = pd.to_datetime(patch_date)
     except Exception as e:
-        return {"error": f"崖日付のパース失敗: {e}"}
+        return {"error": f"要補正Close日時のパース失敗: {e}"}
 
     for interval in ["1d", "60m", "5m", "1m"]:
         try:
@@ -748,13 +759,13 @@ def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, mul
             results[interval] = "対象データなし"
             continue
 
-        need_apply = check_anomaly_need_patch(ticker_data, cliff_date, multiplier)
+        need_apply = check_anomaly_need_patch(ticker_data, patch_date, multiplier)
         if not need_apply:
             results[interval] = "スキップ（既に調整済み、または適用不要な落差です）"
             continue
 
         ticker_data["date"] = pd.to_datetime(ticker_data["date"])
-        pre_mask = ticker_data["date"] < target_dt
+        pre_mask = ticker_data["date"] <= target_dt
         
         if not pre_mask.any():
             results[interval] = "対象期間（崖日より過去）のデータなし"
@@ -1033,6 +1044,7 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
     
     if boundary_mask.any():
         boundary_rows = db_df[boundary_mask].copy()
+        boundary_rows["before_date"] = db_df.groupby("ticker")["date"].shift(1)[boundary_mask].values
         boundary_rows["before_close"] = db_df.groupby("ticker")["close"].shift(1)[boundary_mask].values
         boundary_rows["after_close"] = boundary_rows["close"]
         if has_adj:
@@ -1046,7 +1058,7 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
         for col in ["open", "high", "low", "volume"]:
             if col not in boundary_rows.columns:
                 boundary_rows[col] = float("nan")
-        result_rows.append(boundary_rows[["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "open", "high", "low", "volume", "pct_change"]])
+        result_rows.append(boundary_rows[["ticker", "date", "before_date", "before_close", "after_close", "before_adj_close", "after_adj_close", "open", "high", "low", "volume", "pct_change"]])
 
     abs_close = db_df["close"].abs()
     pct = abs_close.groupby(db_df["ticker"]).pct_change()
@@ -1054,6 +1066,7 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
 
     if cliff_mask.any():
         cliff_rows = db_df[cliff_mask].copy()
+        cliff_rows["before_date"] = db_df.groupby("ticker")["date"].shift(1)[cliff_mask].values
         cliff_rows["before_close"] = db_df.groupby("ticker")["close"].shift(1)[cliff_mask].values
         cliff_rows["after_close"] = cliff_rows["close"]
         if has_adj:
@@ -1067,7 +1080,7 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
         for col in ["open", "high", "low", "volume"]:
             if col not in cliff_rows.columns:
                 cliff_rows[col] = float("nan")
-        result_rows.append(cliff_rows[["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "open", "high", "low", "volume", "pct_change"]])
+        result_rows.append(cliff_rows[["ticker", "date", "before_date", "before_close", "after_close", "before_adj_close", "after_adj_close", "open", "high", "low", "volume", "pct_change"]])
 
     if not result_rows:
         return pd.DataFrame()
@@ -1078,6 +1091,7 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
         pct_vals = group["pct_change"].dropna()
         pct_val = pct_vals.iloc[0] if not pct_vals.empty else float("nan")
         
+        before_date_val = group["before_date"].dropna().iloc[0] if not group["before_date"].dropna().empty else pd.NaT
         before_close_val = group["before_close"].dropna().iloc[0] if not group["before_close"].dropna().empty else float("nan")
         after_close_val = group["after_close"].dropna().iloc[0] if not group["after_close"].dropna().empty else float("nan")
         before_adj_val = group["before_adj_close"].dropna().iloc[0] if not group["before_adj_close"].dropna().empty else float("nan")
@@ -1093,6 +1107,7 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
             est_multiplier = after_close_val / before_close_val
             
         return pd.Series({
+            "before_date": before_date_val,
             "before_close": before_close_val, 
             "after_close": after_close_val, 
             "before_adj_close": before_adj_val, 
@@ -1106,6 +1121,8 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
         })
         
     result = result.groupby(["ticker", "cliff_date"], as_index=False).apply(aggregate_anomalies)
+    # patch_date：実際にパッチ適用時の基準日として使用する「要補正Closeの日時（崖前日, t-1）」
+    result["patch_date"] = pd.to_datetime(result["before_date"])
     return result.sort_values(["ticker", "cliff_date"]).reset_index(drop=True)
 
 # =====================================================================
@@ -1229,41 +1246,158 @@ def fetch_tv_close_price(ticker: str, cliff_date, is_jp: bool = True):
                 continue
     return None
 
-def scan_and_diagnose_cliffs_with_tv(is_jp: bool = True, interval: str = "1d") -> pd.DataFrame:
+def fetch_tv_close_pair(ticker: str, patch_date, is_jp: bool = True) -> dict:
+    """
+    TradingViewの非公式API（tvdatafeed）を用いて、
+    「要補正Closeの日時（patch_date, t-1）」の終値と、その1本後（変化当日, t）の終値を
+    自動オフセット処理でまとめて取得します。
+    patch_dateの指定だけで、システム内部が自動的にt本後の終値もピンポイント取得しに行くため、
+    呼び出し側は崖前後の2点を個別に意識する必要がありません。
+    戻り値: {"tv_before_close": float|None, "tv_after_close": float|None}
+    """
+    empty = {"tv_before_close": None, "tv_after_close": None}
+    tv = _get_tv_client()
+    if not tv:
+        return empty
+
+    try:
+        from tvDatafeed import Interval as TvInterval
+    except Exception:
+        return empty
+
+    try:
+        before_date = pd.Timestamp(patch_date).normalize()
+    except Exception:
+        return empty
+
+    mapped = map_ticker_to_tv_symbol(ticker, is_jp)
+    symbol = mapped["symbol"]
+    fixed_exchange = mapped.get("exchange")
+    exchange_candidates = [fixed_exchange] if fixed_exchange else ["NASDAQ", "NYSE", "AMEX"]
+    days_back = int(max((pd.Timestamp.now().normalize() - before_date).days + 30, 60))
+
+    for exchange in exchange_candidates:
+        try:
+            hist = tv.get_hist(symbol=symbol, exchange=exchange, interval=TvInterval.in_daily, n_bars=days_back)
+        except Exception:
+            continue
+        if hist is None or hist.empty:
+            continue
+        hist = hist.copy()
+        hist.index = pd.to_datetime(hist.index).normalize()
+        hist = hist.sort_index()
+
+        tv_before_close = None
+        if before_date in hist.index:
+            try:
+                tv_before_close = float(hist.loc[before_date, "close"])
+            except Exception:
+                tv_before_close = None
+
+        # 自動オフセット処理：要補正日（t-1）の「1本後」＝変化当日（t）以降で最初のバーを取得
+        tv_after_close = None
+        after_candidates = hist[hist.index > before_date]
+        if not after_candidates.empty:
+            try:
+                tv_after_close = float(after_candidates.iloc[0]["close"])
+            except Exception:
+                tv_after_close = None
+
+        if tv_before_close is not None or tv_after_close is not None:
+            return {"tv_before_close": tv_before_close, "tv_after_close": tv_after_close}
+
+    return empty
+
+def scan_and_diagnose_cliffs_with_tv(is_jp: bool = True, intervals: list = None) -> pd.DataFrame:
     """
     「段差（Cliff）検出」と「TradingViewを用いた終値照合」を一本化した統合スキャン関数。
-    yfinanceの推測倍率（est_multiplier）に加え、TradingViewの正しい終値との比較から
-    「真の倍率（true_multiplier）」を自動算出します。
-    画面をシンプルにするため、当日の四本値（Open/High/Low）および変化率は結果から除外します。
-    """
-    base_df = scan_all_anomalies(is_jp=is_jp, interval=interval)
-    if base_df.empty:
-        return base_df
+    全時間足（1d/60m/5m/1m）を対象に拡張し、日足で検出済みの崖日については
+    分足側の重複検出結果を自動的に除外します（分足固有の局所バグのみ単独表示）。
 
-    result = base_df.copy()
-    result["tv_close"] = float("nan")
+    「真の倍率（true_multiplier）」は、崖前後どちらも同じ側（要補正Close, t-1）で
+    TVと自社データを比較する方式に修正済みです：
+        true_multiplier = TVの要補正Close（t-1） ÷ 自社の要補正Close（t-1）
+    TV側のt-1が取得できない場合は、崖前後比率同士の比（フォールバック）を用います：
+        true_multiplier = (TVのt÷TVのt-1) ÷ (自社のt÷自社のt-1)
+    それでも取得できない分足（TV照合が不安定）は tv_close を None のままとし、
+    データ推測倍率（est_multiplier）を「真の倍率」として安全に本番適用する仕様とします。
+    画面をシンプルにするため、当日の四本値（Open/High/Low）は結果から除外します。
+    """
+    target_intervals = intervals if intervals else list(settings.TIMEFRAMES)
+    per_interval_dfs = {}
+    for iv in target_intervals:
+        df_iv = scan_all_anomalies(is_jp=is_jp, interval=iv)
+        if not df_iv.empty:
+            df_iv = df_iv.copy()
+            df_iv["interval"] = iv
+        per_interval_dfs[iv] = df_iv
+
+    # ── 日足優先の重複排除：1dで検出済みの日付は、分足側の同日結果をリストから除外 ──
+    if "1d" in per_interval_dfs and not per_interval_dfs["1d"].empty:
+        daily_flagged_days = set(pd.to_datetime(per_interval_dfs["1d"]["cliff_date"]).dt.normalize())
+        for iv in target_intervals:
+            if iv == "1d" or per_interval_dfs.get(iv) is None or per_interval_dfs[iv].empty:
+                continue
+            df_iv = per_interval_dfs[iv]
+            day_of_cliff = pd.to_datetime(df_iv["cliff_date"]).dt.normalize()
+            per_interval_dfs[iv] = df_iv[~day_of_cliff.isin(daily_flagged_days)].reset_index(drop=True)
+
+    non_empty = [df for df in per_interval_dfs.values() if df is not None and not df.empty]
+    if not non_empty:
+        return pd.DataFrame()
+
+    result = pd.concat(non_empty, ignore_index=True)
+    result["tv_close"] = float("nan")       # TVの要補正Close（t-1）：表示・算出の主基準
+    result["tv_after_close"] = float("nan")  # TVの変化当日Close（t）：参考値
     result["true_multiplier"] = float("nan")
 
     for idx, row in result.iterrows():
+        interval = row["interval"]
         ticker = row["ticker"]
-        cliff_date = row["cliff_date"]
+        patch_date = row.get("patch_date")
+        before_close = row.get("before_close", float("nan"))
         after_close = row.get("after_close", float("nan"))
 
-        tv_close = fetch_tv_close_price(ticker, cliff_date, is_jp=is_jp)
-        if tv_close is None or pd.isna(after_close) or after_close == 0:
+        if interval != "1d" or pd.isna(patch_date):
+            # 分足（60m/5m/1m）はTV側からのピンポイント取得が不安定なため、
+            # TV Close は None のまま、データ推測倍率(est_multiplier)を真の倍率として採用
+            result.at[idx, "true_multiplier"] = row.get("est_multiplier", float("nan"))
             continue
 
-        result.at[idx, "tv_close"] = tv_close
-        result.at[idx, "true_multiplier"] = tv_close / after_close
+        tv_pair = fetch_tv_close_pair(ticker, patch_date, is_jp=is_jp)
+        tv_before_close = tv_pair.get("tv_before_close")
+        tv_after_close = tv_pair.get("tv_after_close")
+
+        if tv_before_close is not None:
+            result.at[idx, "tv_close"] = tv_before_close
+        if tv_after_close is not None:
+            result.at[idx, "tv_after_close"] = tv_after_close
+
+        if tv_before_close is not None and pd.notna(before_close) and before_close != 0:
+            # 主方式：崖前（要補正）同士の比較
+            result.at[idx, "true_multiplier"] = tv_before_close / before_close
+        elif (
+            tv_before_close is not None and tv_after_close is not None and tv_before_close != 0
+            and pd.notna(before_close) and pd.notna(after_close) and before_close != 0
+        ):
+            # フォールバック：崖前後の比率同士の比較（正常変動 ÷ 異常変動）
+            tv_ratio = tv_after_close / tv_before_close
+            self_ratio = after_close / before_close
+            if self_ratio != 0:
+                result.at[idx, "true_multiplier"] = tv_ratio / self_ratio
+        else:
+            # TV照合が完全に失敗した場合は、分足と同様に推測倍率へフォールバック
+            result.at[idx, "true_multiplier"] = row.get("est_multiplier", float("nan"))
 
     drop_cols = [c for c in ["open", "high", "low", "pct_change"] if c in result.columns]
     result = result.drop(columns=drop_cols)
-    return result.sort_values(["ticker", "cliff_date"]).reset_index(drop=True)
+    return result.sort_values(["ticker", "cliff_date", "interval"]).reset_index(drop=True)
 
 def apply_bulk_selected_patches(patches: list, is_jp: bool = True, status_callback=None) -> dict:
     """
-    統合スキャンのテーブルでチェックされた複数パッチ（[{"ticker","cliff_date","multiplier"}, ...]）を
+    統合スキャンのテーブルでチェックされた複数パッチ（[{"ticker","patch_date","multiplier"}, ...]）を
     ループで一括本番適用します。
+    patch_date は「要補正Closeの日時（崖前日, t-1）」を指定し、この日を含めて（<=）過去へ一括適用します。
 
     各銘柄・時間足への適用直前に既存の check_anomaly_need_patch() による
     二重適用防止判定が自動的に働くため（apply_forced_scale_patch_to_all_timeframes内部）、
@@ -1280,24 +1414,24 @@ def apply_bulk_selected_patches(patches: list, is_jp: bool = True, status_callba
 
     for patch in patches:
         ticker = patch.get("ticker")
-        cliff_date = patch.get("cliff_date")
+        patch_date = patch.get("patch_date")
         multiplier = patch.get("multiplier")
 
-        if not ticker or not cliff_date or multiplier is None or pd.isna(multiplier) or multiplier <= 0:
+        if not ticker or not patch_date or multiplier is None or pd.isna(multiplier) or multiplier <= 0:
             log(f"⚠️ [{ticker}] 真の倍率が取得できていないため、この行はスキップしました。")
             skipped_count += 1
             continue
 
         pure_t = sanitize_ticker(ticker, is_jp)
         try:
-            cliff_dt_str = pd.to_datetime(cliff_date).strftime("%Y-%m-%d")
+            patch_dt_str = pd.to_datetime(patch_date).strftime("%Y-%m-%d")
         except Exception:
-            log(f"⚠️ [{ticker}] 崖日付が不正なためスキップしました。")
+            log(f"⚠️ [{ticker}] 要補正Close日時が不正なためスキップしました。")
             skipped_count += 1
             continue
 
-        log(f"🔧 [{pure_t}] {cliff_dt_str} の一括修復パッチを判定・適用中（倍率: {multiplier:.6f}）...")
-        results = apply_forced_scale_patch_to_all_timeframes(pure_t, cliff_dt_str, multiplier, is_jp=is_jp)
+        log(f"🔧 [{pure_t}] {patch_dt_str}（要補正Close日時）以前の一括修復パッチを判定・適用中（倍率: {multiplier:.6f}）...")
+        results = apply_forced_scale_patch_to_all_timeframes(pure_t, patch_dt_str, multiplier, is_jp=is_jp)
 
         applied_intervals = [iv for iv, msg in results.items() if "補正適用完了" in str(msg)]
 
@@ -1308,7 +1442,7 @@ def apply_bulk_selected_patches(patches: list, is_jp: bool = True, status_callba
                 "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "ticker": pure_t,
                 "market": market_str,
-                "cliff_date": cliff_dt_str,
+                "cliff_date": patch_dt_str,
                 "interval": ",".join(applied_intervals),
                 "before_close": "",
                 "after_close": "",
