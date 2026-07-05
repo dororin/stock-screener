@@ -1311,17 +1311,16 @@ def fetch_tv_close_pair(ticker: str, patch_date, is_jp: bool = True) -> dict:
 def scan_and_diagnose_cliffs_with_tv(is_jp: bool = True, intervals: list = None) -> pd.DataFrame:
     """
     「段差（Cliff）検出」と「TradingViewを用いた終値照合」を一本化した統合スキャン関数。
-    全時間足（1d/60m/5m/1m）を対象に拡張し、日足で検出済みの崖日については
+    全時間足（1d/60m/5m/1m）を対象に拡張し、日足で検出済みの「同一銘柄・同一崖日」については
     分足側の重複検出結果を自動的に除外します（分足固有の局所バグのみ単独表示）。
 
     「真の倍率（true_multiplier）」は、崖前後どちらも同じ側（要補正Close, t-1）で
     TVと自社データを比較する方式に修正済みです：
-        true_multiplier = TVの要補正Close（t-1） ÷ 自社の要補正Close（t-1）
+        true_multiplier = TV of t-1 (要補正Close) / 自社 of t-1 (要補正Close)
     TV側のt-1が取得できない場合は、崖前後比率同士の比（フォールバック）を用います：
         true_multiplier = (TVのt÷TVのt-1) ÷ (自社のt÷自社のt-1)
     それでも取得できない分足（TV照合が不安定）は tv_close を None のままとし、
     データ推測倍率（est_multiplier）を「真の倍率」として安全に本番適用する仕様とします。
-    画面をシンプルにするため、当日の四本値（Open/High/Low）は結果から除外します。
     """
     target_intervals = intervals if intervals else list(settings.TIMEFRAMES)
     per_interval_dfs = {}
@@ -1332,15 +1331,26 @@ def scan_and_diagnose_cliffs_with_tv(is_jp: bool = True, intervals: list = None)
             df_iv["interval"] = iv
         per_interval_dfs[iv] = df_iv
 
-    # ── 日足優先の重複排除：1dで検出済みの日付は、分足側の同日結果をリストから除外 ──
+    # ── 【修正箇所】日足優先の重複排除：同一銘柄かつ同一日付のみを除外対象にする ──
     if "1d" in per_interval_dfs and not per_interval_dfs["1d"].empty:
-        daily_flagged_days = set(pd.to_datetime(per_interval_dfs["1d"]["cliff_date"]).dt.normalize())
+        df_1d = per_interval_dfs["1d"]
+        # (ticker, normalized_date) のペアをセットとして作成
+        daily_flagged_pairs = set(
+            zip(df_1d["ticker"], pd.to_datetime(df_1d["cliff_date"]).dt.normalize())
+        )
+        
         for iv in target_intervals:
             if iv == "1d" or per_interval_dfs.get(iv) is None or per_interval_dfs[iv].empty:
                 continue
             df_iv = per_interval_dfs[iv]
-            day_of_cliff = pd.to_datetime(df_iv["cliff_date"]).dt.normalize()
-            per_interval_dfs[iv] = df_iv[~day_of_cliff.isin(daily_flagged_days)].reset_index(drop=True)
+            
+            # 分足側の各行について (ticker, normalized_date) のリストを作成して比較判定
+            iv_dates = pd.to_datetime(df_iv["cliff_date"]).dt.normalize()
+            iv_pairs = list(zip(df_iv["ticker"], iv_dates))
+            
+            # 1dで同じ銘柄かつ同日に検出されていないデータのみを保持
+            keep_mask = [pair not in daily_flagged_pairs for pair in iv_pairs]
+            per_interval_dfs[iv] = df_iv[keep_mask].reset_index(drop=True)
 
     non_empty = [df for df in per_interval_dfs.values() if df is not None and not df.empty]
     if not non_empty:
