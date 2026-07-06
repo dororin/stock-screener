@@ -122,10 +122,53 @@ def get_extra_tickers() -> list:
         return []
 
 def get_all_collection_tickers() -> list:
-    """TOPIX500と追加ETF等のマージされたリストを取得します（重複排除）。"""
+    """TOPIX500、追加ETF、およびセクター定義シート（sector_JP）の個別株・ETFをマージしたリストを取得します（重複排除）。"""
+    import pandas as pd
+    # 循環参照を防ぐために関数内でインポート
+    from data_access.sheets_api import get_sector_spreadsheet
+    
     topix = get_topix500_tickers()
     extra = get_extra_tickers()
-    return list(dict.fromkeys(topix + extra))
+    
+    sector_tickers = []
+    try:
+        # スプレッドシートから直接データを取得し、個別株(B列)とETF(D列)の両方を回収する
+        sh = get_sector_spreadsheet()
+        if sh:
+            ws = sh.worksheet("sector_JP")
+            records = ws.get_all_records()
+            if records:
+                df = pd.DataFrame(records)
+                
+                # B列相当（銘柄コード）の抽出
+                code_col = next((c for c in df.columns if c in ["銘柄コード", "code", "ticker", "コード"]), None)
+                if code_col:
+                    codes = df[code_col].dropna().astype(str).str.strip().str.split(".").str[0].tolist()
+                    sector_tickers.extend([c for c in codes if c])
+                    
+                # D列相当（ETFコード）の抽出
+                etf_col = next((c for c in df.columns if c in ["ETFコード", "etf", "etf_code"]), None)
+                if etf_col:
+                    etfs = df[etf_col].dropna().astype(str).str.strip().str.split(".").str[0].tolist()
+                    sector_tickers.extend([e for e in etfs if e])
+                    
+    except Exception as e:
+        print(f"❌ [get_all_collection_tickers] セクター定義シート読み込みエラー: {e}")
+
+    # 3つのソースを全て結合
+    merged = topix + extra + sector_tickers
+    
+    # 順序を保持したまま重複を完全に排除（セットを使って高速化）
+    cleaned = []
+    seen = set()
+    for t in merged:
+        t_clean = str(t).strip()
+        # 空文字でなく、かつ未登録のものだけ追加
+        if t_clean and t_clean not in seen:
+            seen.add(t_clean)
+            cleaned.append(t_clean)
+            
+    return cleaned
 
 def sync_extra_tickers_to_local() -> tuple:
     """Google Sheetsから追加ティッカーを取得し、ローカルのJSONキャッシュと同期します。"""
