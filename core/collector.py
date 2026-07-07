@@ -11,86 +11,123 @@ import io
 
 def fetch_etf_constituents(etf_code: str) -> dict:
     """
-    PCF CSV等から指定されたETFの構成銘柄（4桁コード: 銘柄名）を取得します。
-    yfinanceを用いて、運用会社（Global X / NEXT FUNDS 等）を自動判別します。
+    ETFの構成銘柄（PCF）を自動取得します。
+    1. Global X等の場合は Solactive サーバーを試行します。
+    2. NEXT FUNDS等の場合は 野村アセットマネジメントの固定URLからExcelを直接取得します。
     """
-    provider_name = "Unknown"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    df = None
+
+    print(f"🔎 [{etf_code}] 構成銘柄データの取得を開始します...")
+
+    # ==========================================
+    # アプローチ1: Solactiveサーバー (Global X系など)
+    # ==========================================
     try:
-        # yfinanceで銘柄名を取得し、運用会社を判別する
-        ticker_info = yf.Ticker(f"{etf_code}.T").info
-        long_name = ticker_info.get("longName", "")
+        from config import settings
+        base_url = getattr(settings, "SOLACTIVE_PCF_BASE_URL", "https://www.solactive.com/downloads/etfservices/tse-pcf/single/")
+    except ImportError:
+        base_url = "https://www.solactive.com/downloads/etfservices/tse-pcf/single/"
         
-        # 銘柄名に含まれるキーワードでどちらのETFかを特定
-        if "NEXT FUNDS" in long_name or "NF・" in long_name:
-            provider_name = "NEXT FUNDS (野村アセットマネジメント)"
-        elif "Global X" in long_name or "グローバル" in long_name:
-            provider_name = "Global X (グローバルＸジャパン)"
-        elif "iShares" in long_name or "ｉシェアーズ" in long_name:
-            provider_name = "iShares (ブラックロック)"
-        elif "MAXIS" in long_name:
-            provider_name = "MAXIS (三菱UFJアセットマネジメント)"
-        elif long_name:
-            provider_name = f"その他 ({long_name})"
+    solactive_url = f"{base_url}{etf_code}.csv"
+    
+    try:
+        response = requests.get(solactive_url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            print(f"  -> ✅ Solactiveサーバーからデータを検出しました。")
+            lines = response.text.splitlines()
+            header_idx = 0
+            for i, line in enumerate(lines[:15]):
+                if "code" in line.lower() or "銘柄コード" in line or "ticker" in line.lower():
+                    header_idx = i
+                    break
+            df = pd.read_csv(io.StringIO(response.text), skiprows=header_idx)
     except Exception:
         pass
 
-    print(f"🔎 [fetch_etf_constituents] ETF({etf_code}) の運用会社判別: {provider_name}")
+    # ==========================================
+    # アプローチ2: 野村アセットマネジメント (NEXT FUNDS) のExcelを直接ダウンロード
+    # ==========================================
+    if df is None or df.empty:
+        print(f"  -> ⚠️ Solactiveにデータなし。NEXT FUNDSのサーバーから直接取得を試みます...")
+        try:
+            # ご提示いただいた正しいURLフォーマット
+            nf_url = f"https://www.nomura-am.co.jp/fund/monthly_holdings/{etf_code}_brd_data.xlsx"
+            file_resp = requests.get(nf_url, headers=headers, timeout=15)
+            
+            if file_resp.status_code == 200:
+                print(f"  -> 📥 NEXT FUNDSファイルを発見・ダウンロード完了: {nf_url}")
+                # Excelファイル（.xlsx）をメモリ上で展開してPandasで読み込む
+                df = pd.read_excel(io.BytesIO(file_resp.content))
+            else:
+                # 念のため、CSV形式で提供されている場合へのフォールバック
+                nf_url_csv = f"https://www.nomura-am.co.jp/fund/monthly_holdings/{etf_code}_brd_data.csv"
+                file_resp_csv = requests.get(nf_url_csv, headers=headers, timeout=15)
+                if file_resp_csv.status_code == 200:
+                    print(f"  -> 📥 NEXT FUNDSファイル(CSV)を発見・ダウンロード完了: {nf_url_csv}")
+                    content = file_resp_csv.content.decode('shift_jis', errors='replace')
+                    df = pd.read_csv(io.StringIO(content))
+                else:
+                    print(f"  -> ❌ 野村アセットマネジメントのサーバーにファイルが見つかりません (Status: {file_resp.status_code})")
+        except Exception as e:
+            print(f"  -> ❌ NEXT FUNDSファイル取得失敗: {e}")
 
-    # JPX上場ETFのPCFファイルは、共通配信サーバー(tse-pcf)に集約されていることが多い
-    base_url = getattr(settings, "SOLACTIVE_PCF_BASE_URL", "https://www.solactive.com/downloads/etfservices/tse-pcf/single/")
-    url = f"{base_url}{etf_code}.csv"
-    
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-    except Exception as e:
-        print(f"❌ [fetch_etf_constituents] ダウンロード失敗 (コード: {etf_code}): {e}")
+    # DataFrameがどちらからも取得できなかった場合は終了
+    if df is None or df.empty:
+        print(f"❌ [{etf_code}] 通信エラー等のため既存データをそのまま維持（全アプローチ失敗）")
         return {}
-    
+
+    # ==========================================
+    # データパース処理 (メタデータ行のスキップと抽出)
+    # ==========================================
     try:
-        # 運用会社によってヘッダー（メタデータ）の行数が異なるため、
-        # "Code" や "銘柄コード" といった列名が存在する行を自動検索する
-        lines = response.text.splitlines()
-        header_idx = 0
-        for i, line in enumerate(lines[:15]):  # 最初の15行を走査
-            line_lower = line.lower()
-            if "code" in line_lower or "銘柄コード" in line_lower or "ticker" in line_lower:
-                header_idx = i
-                break
-                
-        # 発見したヘッダー行を基準にしてPandasで読み込む
-        df = pd.read_csv(io.StringIO(response.text), skiprows=header_idx)
-        df.columns = [str(c).strip() for c in df.columns]
+        cols = [str(c).lower() for c in df.columns]
+        target_keywords = ['code', '銘柄コード', '証券コード', 'コード', 'ticker']
         
-        # 'Code' と 'Name' に相当するカラムを柔軟に抽出（英語・日本語の表記ゆれ対応）
+        # Excel特有の「上部に説明書きが入っている」場合、データ行にヘッダーが埋もれているか探す
+        if not any(keyword in c for c in cols for keyword in target_keywords):
+            target_row_idx = -1
+            for i, row in df.head(20).iterrows(): # ヘッダー行を上から20行目まで走査
+                row_strs = [str(v).lower() for v in row.values]
+                if any(keyword in v for v in row_strs for keyword in target_keywords):
+                    target_row_idx = i
+                    break
+            
+            if target_row_idx != -1:
+                # 見つけたヘッダー行を上に昇格させて、不要な上部行を切り捨てる
+                df.columns = df.iloc[target_row_idx]
+                df = df.iloc[target_row_idx+1:].reset_index(drop=True)
+
+        # カラム名の改行文字などをクリーニング（Excelのセル内改行対策）
+        df.columns = [str(c).strip().replace('\n', '').replace('\r', '') for c in df.columns]
+        
         code_col = None
         name_col = None
         for col in df.columns:
             col_lower = col.lower()
-            if col_lower in ['code', '銘柄コード', 'コード', 'ticker', 'symbol']:
+            if col_lower in target_keywords:
                 code_col = col
-            elif col_lower in ['name', '銘柄名', '名称', 'company name']:
+            elif col_lower in ['name', '銘柄名', '銘柄名称', '名称', 'company name']:
                 name_col = col
                 
         if not code_col or not name_col:
-            print(f"❌ [fetch_etf_constituents] 必要なカラム（コード / 銘柄名）が見つかりません。")
+            print(f"❌ [{etf_code}] DataFrameから対象カラム(コード・銘柄名)が見つかりません: {list(df.columns)}")
             return {}
             
         result = {}
         for _, row in df.iterrows():
             code_raw = str(row[code_col]).strip()
-            # 小数点が入っている場合の除去 (例: "6723.0" -> "6723")
+            # 小数点や ".T" の除去 (例: "1301.0" -> "1301")
             code = code_raw.split(".")[0]
             name = str(row[name_col]).strip()
             
-            # 英数字4桁を判定（防衛テック513A等の混在を許容するため、len=4で確認）
-            if code and len(code) == 4:
+            # 英数字4桁を判定（防衛テック513A等のアルファベット混在も許容）
+            if code and len(code) == 4 and code.isalnum():
                 result[code] = name
                 
         return result
     except Exception as e:
-        print(f"❌ [fetch_etf_constituents] CSVパースエラー (コード: {etf_code}): {e}")
+        print(f"❌ [{etf_code}] DataFrameパース中にエラーが発生しました: {e}")
         return {}
 
 def sanitize_ticker(ticker: str, is_jp: bool = True) -> str:
