@@ -11,8 +11,32 @@ import io
 
 def fetch_etf_constituents(etf_code: str) -> dict:
     """
-    SolactiveのPCF CSVから指定されたETFの構成銘柄（4桁コード: 銘柄名）を取得します。
+    PCF CSV等から指定されたETFの構成銘柄（4桁コード: 銘柄名）を取得します。
+    yfinanceを用いて、運用会社（Global X / NEXT FUNDS 等）を自動判別します。
     """
+    provider_name = "Unknown"
+    try:
+        # yfinanceで銘柄名を取得し、運用会社を判別する
+        ticker_info = yf.Ticker(f"{etf_code}.T").info
+        long_name = ticker_info.get("longName", "")
+        
+        # 銘柄名に含まれるキーワードでどちらのETFかを特定
+        if "NEXT FUNDS" in long_name or "NF・" in long_name:
+            provider_name = "NEXT FUNDS (野村アセットマネジメント)"
+        elif "Global X" in long_name or "グローバル" in long_name:
+            provider_name = "Global X (グローバルＸジャパン)"
+        elif "iShares" in long_name or "ｉシェアーズ" in long_name:
+            provider_name = "iShares (ブラックロック)"
+        elif "MAXIS" in long_name:
+            provider_name = "MAXIS (三菱UFJアセットマネジメント)"
+        elif long_name:
+            provider_name = f"その他 ({long_name})"
+    except Exception:
+        pass
+
+    print(f"🔎 [fetch_etf_constituents] ETF({etf_code}) の運用会社判別: {provider_name}")
+
+    # JPX上場ETFのPCFファイルは、共通配信サーバー(tse-pcf)に集約されていることが多い
     base_url = getattr(settings, "SOLACTIVE_PCF_BASE_URL", "https://www.solactive.com/downloads/etfservices/tse-pcf/single/")
     url = f"{base_url}{etf_code}.csv"
     
@@ -25,21 +49,32 @@ def fetch_etf_constituents(etf_code: str) -> dict:
         return {}
     
     try:
-        # 先頭2行（メタデータ）をスキップし、3行目をヘッダーとしてPandasで読み込む
-        df = pd.read_csv(io.StringIO(response.text), skiprows=2)
+        # 運用会社によってヘッダー（メタデータ）の行数が異なるため、
+        # "Code" や "銘柄コード" といった列名が存在する行を自動検索する
+        lines = response.text.splitlines()
+        header_idx = 0
+        for i, line in enumerate(lines[:15]):  # 最初の15行を走査
+            line_lower = line.lower()
+            if "code" in line_lower or "銘柄コード" in line_lower or "ticker" in line_lower:
+                header_idx = i
+                break
+                
+        # 発見したヘッダー行を基準にしてPandasで読み込む
+        df = pd.read_csv(io.StringIO(response.text), skiprows=header_idx)
         df.columns = [str(c).strip() for c in df.columns]
         
-        # 'Code' と 'Name' に相当するカラムを抽出
+        # 'Code' と 'Name' に相当するカラムを柔軟に抽出（英語・日本語の表記ゆれ対応）
         code_col = None
         name_col = None
         for col in df.columns:
-            if col.lower() == 'code':
+            col_lower = col.lower()
+            if col_lower in ['code', '銘柄コード', 'コード', 'ticker', 'symbol']:
                 code_col = col
-            elif col.lower() == 'name':
+            elif col_lower in ['name', '銘柄名', '名称', 'company name']:
                 name_col = col
                 
         if not code_col or not name_col:
-            print(f"❌ [fetch_etf_constituents] 必要なカラム（Code / Name）が見つかりません。")
+            print(f"❌ [fetch_etf_constituents] 必要なカラム（コード / 銘柄名）が見つかりません。")
             return {}
             
         result = {}
