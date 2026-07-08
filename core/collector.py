@@ -18,18 +18,21 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
     df = None
     provider = str(fund_provider).strip().lower() if fund_provider else ""
 
+    # ==========================================
+    # 🛡️ ETFコードのサニタイズ処理（大文字化・浮動小数点数.0の除去）
+    # ==========================================
+    etf_code = str(etf_code).strip().upper()
+    if "." in etf_code:
+        etf_code = etf_code.split(".")[0]  # "1633.0" -> "1633"
+
     print(f"🔎 [{etf_code}] 構成銘柄データの取得を開始します (ファンド: {fund_provider or '自動判定'})")
 
     # ==========================================
     # ルート1: Global X (Solactive CSV)
     # ==========================================
     if not provider or "global" in provider or "solactive" in provider:
-        try:
-            from config import settings
-            base_url = getattr(settings, "SOLACTIVE_PCF_BASE_URL", "https://www.solactive.com/downloads/etfservices/tse-pcf/single/")
-        except ImportError:
-            base_url = "https://www.solactive.com/downloads/etfservices/tse-pcf/single/"
-            
+        # ご指示通り、接続先URLを legacy2.solactive.com に完全固定します
+        base_url = "https://legacy2.solactive.com/downloads/etfservices/tse-pcf/single/"
         solactive_url = f"{base_url}{etf_code}.csv"
         
         try:
@@ -40,12 +43,14 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
                 header_idx = -1
                 import csv
                 
-                # 最初の15行を走査し、「Code」と「Name」に完全一致する列が含まれる行を探す
+                # 最初の15行を走査し、「code/ticker」と「name」が含まれる行を探す
                 for i, line in enumerate(lines[:15]):
                     try:
                         row_cells = next(csv.reader([line]))
                         row_cells_clean = [str(c).strip().lower() for c in row_cells]
-                        if "code" in row_cells_clean and "name" in row_cells_clean:
+                        has_code = any("code" in c or "ticker" in c for c in row_cells_clean)
+                        has_name = any("name" in c for c in row_cells_clean)
+                        if has_code and has_name:
                             header_idx = i
                             break
                     except Exception:
@@ -53,10 +58,10 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
                 
                 if header_idx != -1:
                     df = pd.read_csv(io.StringIO(response.text), skiprows=header_idx)
-                    # カラム名をクリーニングして完全一致で指定できるようにする
                     df.columns = [str(c).strip().lower() for c in df.columns]
-                    code_col = "code"
-                    name_col = "name"
+                    # 部分一致でコード列と銘柄名列を自動特定
+                    code_col = next((col for col in df.columns if "code" in col or "ticker" in col), None)
+                    name_col = next((col for col in df.columns if "name" in col), None)
         except Exception as e:
             print(f"  -> ❌ Solactive取得失敗: {e}")
 
@@ -70,7 +75,8 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
             
             if file_resp.status_code == 200:
                 print(f"  -> 📥 NEXT FUNDSファイルを発見・ダウンロード完了: {nf_url}")
-                df = pd.read_excel(io.BytesIO(file_resp.content))
+                # header=None を明示し、完全にシート全体を読み込みます（行ズレ防止）
+                df = pd.read_excel(io.BytesIO(file_resp.content), header=None)
             else:
                 # CSV形式でのフォールバック
                 nf_url_csv = f"https://www.nomura-am.co.jp/fund/monthly_holdings/{etf_code}_brd_data.csv"
@@ -78,14 +84,16 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
                 if file_resp_csv.status_code == 200:
                     print(f"  -> 📥 NEXT FUNDSファイル(CSV)を発見・ダウンロード完了: {nf_url_csv}")
                     content = file_resp_csv.content.decode('shift_jis', errors='replace')
-                    df = pd.read_csv(io.StringIO(content))
+                    df = pd.read_csv(io.StringIO(content), header=None)
             
             if df is not None and not df.empty:
-                # 最初の20行を走査し、「銘柄コード(code)」と「銘柄(name)」が含まれる行を探す（改行除去後）
+                # 最初の20行を走査し、「銘柄コード」と「name」が含まれる行を探す
                 target_row_idx = -1
                 for i, row in df.head(20).iterrows():
                     row_strs = [str(v).strip().replace('\n', '').replace('\r', '').lower() for v in row.values]
-                    if "銘柄コード(code)" in row_strs and "銘柄(name)" in row_strs:
+                    row_joined = "".join(row_strs)
+                    # 銘柄コード(code) と 銘柄(name) を確実に感知します
+                    if "銘柄コード" in row_joined and "name" in row_joined:
                         target_row_idx = i
                         break
                 
@@ -93,10 +101,13 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
                     # 見出し行をヘッダーに昇格し、改行をクレンジング
                     df.columns = [str(c).strip().replace('\n', '').replace('\r', '').lower() for c in df.iloc[target_row_idx]]
                     df = df.iloc[target_row_idx+1:].reset_index(drop=True)
-                    code_col = "銘柄コード(code)"
-                    name_col = "銘柄(name)"
+                    
+                    # 1. ティッカー列： 「銘柄コード」を含む列
+                    code_col = next((col for col in df.columns if "銘柄コード" in col), None)
+                    # 2. 銘柄名列： 「name」を含み、かつ「コード / code」を排除して衝突を防止
+                    name_col = next((col for col in df.columns if "name" in col and "コード" not in col and "code" not in col), None)
                 else:
-                    print(f"  -> ❌ NEXT FUNDSの見出し行(銘柄コード(code) / 銘柄(name))が検出できませんでした。")
+                    print(f"  -> ❌ NEXT FUNDSの見出し行(銘柄コード / name)が検出できませんでした。")
                     df = None
         except Exception as e:
             print(f"  -> ❌ NEXT FUNDS取得・解析失敗: {e}")
@@ -110,14 +121,6 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
         return {}
 
     try:
-        # 安全策としての汎用フォールバック
-        if 'code_col' not in locals() or 'name_col' not in locals():
-            df.columns = [str(c).strip().replace('\n', '').replace('\r', '').lower() for c in df.columns]
-            target_keywords = ['code', '銘柄コード', '証券コード', 'コード', 'ticker', '銘柄コード(code)']
-            name_keywords = ['name', '銘柄名', '銘柄名称', '名称', 'company name', '銘柄(name)']
-            code_col = next((col for col in df.columns if col in target_keywords), None)
-            name_col = next((col for col in df.columns if col in name_keywords), None)
-
         if not code_col or not name_col:
             print(f"❌ [{etf_code}] 対象の列(コード・銘柄名)が特定できませんでした。")
             return {}
@@ -128,7 +131,7 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
             code = code_raw.split(".")[0]
             name = str(row[name_col]).strip()
             
-            # 英数字4桁を判定（防衛テック513A等のアルファベット混在も許容）
+            # 英数字4桁を判定（513A等のアルファベット混在も許容）
             if code and len(code) == 4 and code.isalnum():
                 result[code] = name
                 
