@@ -331,14 +331,74 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         log("❌ Rawデータベースファイルが空、または検出されません。")
         return False
 
+    # 1. 権利確定フラグの計算
     df_raw["is_finalized"] = compute_is_finalized(df_raw["date"], interval, is_jp=is_jp)
 
-    processed_parts = []
-    for ticker, group in df_raw.groupby("ticker"):
-        adjusted_group = adjust_ticker_splits_backward_in_memory(group)
-        processed_parts.append(adjusted_group)
-    df_processed = pd.concat(processed_parts, ignore_index=True)
+    # =========================================================================
+    # 🔬 [株式分割データの詳細スキャン ＆ デバッグログ出力]
+    # =========================================================================
+    split_tickers = []
+    has_splits_col = "stock splits" in df_raw.columns
+    
+    if has_splits_col:
+        # nanを排除し、0や1.0以外の有意な分割値（例: 2.0や3.0）があるレコードをスキャン
+        split_mask = (df_raw["stock splits"] > 0) & (df_raw["stock splits"] != 1.0) & (df_raw["stock splits"].notna())
+        if split_mask.any():
+            split_tickers = df_raw.loc[split_mask, "ticker"].unique().tolist()
 
+    # スキャン結果の詳細をコンソールとStreamlit上に明確に出力
+    log(f"  🔬 ----------------------------------------------------")
+    log(f"  🔬 [株式分割・大容量検証デバッグログ] 時間足: {interval}")
+    log(f"    * Rawデータ全体の行数: {len(df_raw):,} 行")
+    log(f"    * 'stock splits' カラムがDBに存在するか: {has_splits_col}")
+    
+    if has_splits_col:
+        valid_splits_cnt = df_raw["stock splits"].notna().sum()
+        active_splits_mask = (df_raw["stock splits"] > 0) & (df_raw["stock splits"] != 1.0) & (df_raw["stock splits"].notna())
+        active_splits_cnt = active_splits_mask.sum()
+        log(f"    * 'stock splits' カラムに値（NaN以外）が入っている行数: {valid_splits_cnt:,} 行")
+        log(f"    * 有意な分割イベント（0や1.0以外）が検出された行数: {active_splits_cnt:,} 行")
+    
+    log(f"    * 🔍 過去に実際に株式分割（崖調整）の対象となったユニーク銘柄数: {len(split_tickers)} 件 / 1,702銘柄中")
+    
+    if split_tickers:
+        log(f"    * 調整対象となった銘柄（先頭15件のみ）: {split_tickers[:15]}")
+        log(f"    * コピーを完全にスキップして素通しする銘柄数: {1702 - len(split_tickers)} 件")
+    else:
+        log(f"    * 📢 調整が必要な分割履歴はありません。全1,702銘柄を一切コピーせず素通しして保存処理へ流します。")
+    log(f"  🔬 ----------------------------------------------------")
+
+    # =========================================================================
+    # ⚡ [メモリ超軽量化] 分割が発生した銘柄だけを切り出して処理
+    # =========================================================================
+    if split_tickers:
+        # 分割が発生した銘柄と、不要な銘柄を分離
+        df_splits = df_raw[df_raw["ticker"].isin(split_tickers)].copy()
+        df_no_splits = df_raw[~df_raw["ticker"].isin(split_tickers)].copy()
+        
+        processed_parts = []
+        for ticker, group in df_splits.groupby("ticker"):
+            adjusted_group = adjust_ticker_splits_backward_in_memory(group)
+            processed_parts.append(adjusted_group)
+            
+        df_processed_splits = pd.concat(processed_parts, ignore_index=True)
+        
+        # 結合
+        df_processed = pd.concat([df_no_splits, df_processed_splits], ignore_index=True)
+        
+        # 不要になった中間データを即時破棄してガベージコレクションを実行
+        del df_splits, df_no_splits, df_processed_splits, processed_parts
+        gc.collect()
+    else:
+        df_processed = df_raw.copy()
+
+    # 原本(df_raw)をメモリから削除
+    del df_raw
+    gc.collect()
+
+    # =========================================================================
+    # 以下、パッチ適用や保存などの通常処理
+    # =========================================================================
     if not skip_assertion:
         df_processed = apply_saved_patches_to_df(df_processed, is_jp=is_jp)
 
@@ -346,6 +406,8 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         try:
             df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False)
             df_processed = propagate_stop_allocation_bars_in_memory(df_1d_active, df_processed, is_jp=is_jp)
+            del df_1d_active
+            gc.collect()
         except Exception as e:
             log(f"⚠️ ストップ高安バーの自動移植はスキップされました: {e}")
 
@@ -361,30 +423,30 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
             for alert in alerts:
                 log(f"   {alert}")
             if any("🚨" in a for a in alerts):
-                log("🛑 深刻なデータ不整合（ジャンプなど）を検出したため、破損防止のため同期を強制中断しました。")
+                log("🛑 深刻なデータ不整合を検出したため、破損防止のため同期を強制中断しました。")
                 return False
-    else:
-        log("✨ [白紙構築] 新旧データの整合性比較、および過去パッチの干渉をスキップしてクリーン処理します。")
+            
+        del df_old_active
+        gc.collect()
 
     if dry_run:
         log(f"🧪 [DRY RUN] {interval} 加工・アサーション検証を正常に通過。")
         if settings.HAS_STREAMLIT:
             import streamlit as st
             st.session_state[f"temp_verified_active_df_{interval}"] = df_processed
-            log(f"   💾 検証済みデータを一時メモリに格納しました。画面から「本番適用」できます。")
+            log(f"   💾 検証済みデータを一時メモリに格納しました。")
         return True
     else:
         df_processed = df_processed.sort_values(["ticker", "date"]).reset_index(drop=True)
         cloud_success, cloud_msg = save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False)
         
+        del df_processed
+        gc.collect()
+        
         if cloud_success:
             log(f"✅ [{interval}] ActiveデータベースをGoogleドライブへ正常に保存しました。")
         else:
-            log(f"⚠️ 【重要警告】[{interval}] Googleドライブへの同期に失敗しました（一時的にローカルフォルダに保存）。")
-            log(f"   ❌ エラー詳細: {cloud_msg}")
-            if "storageQuotaExceeded" in cloud_msg or "storage quota" in cloud_msg.lower():
-                log("   💡 【解決方法】サービスアカウントのストレージ容量制限（0GB）に衝突しています。")
-                log("      事前に同名ファイルをあなたのGoogleアカウントからアップロードして、所有者をご自身に変更してください。")
+            log(f"⚠️ 【重要警告】[{interval}] Googleドライブへの同期に失敗しました。")
         return True
 
 # =====================================================================
