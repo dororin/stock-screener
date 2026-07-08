@@ -320,6 +320,9 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
     return df_intra
 
 def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = False, skip_assertion: bool = False, status_callback=None) -> bool:
+    import gc  # ♻️ 内部で確実にインポート
+    import pandas as pd
+    
     def log(msg):
         print(msg)
         if status_callback: status_callback(msg)
@@ -448,6 +451,55 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         else:
             log(f"⚠️ 【重要警告】[{interval}] Googleドライブへの同期に失敗しました。")
         return True
+
+
+def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intra_active: pd.DataFrame, is_jp: bool = True) -> pd.DataFrame:
+    import gc  # ♻️ 内部で確実にインポート
+    import pandas as pd
+    
+    if df_intra_active.empty:
+        return df_intra_active
+
+    stop_days_df = detect_allocation_stop_days(df_1d_active)
+    if stop_days_df.empty:
+        return df_intra_active
+
+    # ストップ高安が発生した特定のティッカー（極少数）を抽出
+    stop_tickers = stop_days_df["ticker"].unique().tolist()
+    
+    # 巨大データの中から、関係する銘柄のデータだけを切り出して置換処理（残りの99%は完全スルー）
+    df_intra_target = df_intra_active[df_intra_active["ticker"].isin(stop_tickers)].copy()
+    df_intra_safe = df_intra_active[~df_intra_active["ticker"].isin(stop_tickers)]
+
+    if df_intra_target.empty:
+        return df_intra_active
+
+    df_intra_target["date"] = pd.to_datetime(df_intra_target["date"])
+    
+    # 対象データに対してのみループを実行
+    for _, row in stop_days_df.iterrows():
+        ticker = row["ticker"]
+        day_date = pd.Timestamp(row["date"]).date()
+        
+        ticker_data = df_intra_target[df_intra_target["ticker"] == ticker]
+        if ticker_data.empty:
+            continue
+            
+        t_min = ticker_data["date"].min().date()
+        t_max = ticker_data["date"].max().date()
+        
+        if t_min <= day_date <= t_max:
+            df_intra_target = _replace_stop_allocation_bar(
+                df_intra_target, ticker, row["date"], row["close"], row["volume"], is_jp=is_jp
+            )
+
+    df_result = pd.concat([df_intra_safe, df_intra_target], ignore_index=True)
+    
+    # テンポラリメモリの解放
+    del df_intra_target, df_intra_safe
+    gc.collect()
+    
+    return df_result
 
 # =====================================================================
 # 🧪 開発検証: 手動パッチのメモリ上適用シミュレーション
