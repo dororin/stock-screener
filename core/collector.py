@@ -31,7 +31,7 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
     # ルート1: Global X (Solactive CSV)
     # ==========================================
     if not provider or "global" in provider or "solactive" in provider:
-        # ご指示通り、接続先URLを legacy2.solactive.com に完全固定します
+        # ご指示通り、接続先URLを legacy2.solactive.com に完全固定
         base_url = "https://legacy2.solactive.com/downloads/etfservices/tse-pcf/single/"
         solactive_url = f"{base_url}{etf_code}.csv"
         
@@ -43,14 +43,12 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
                 header_idx = -1
                 import csv
                 
-                # 最初の15行を走査し、「code/ticker」と「name」が含まれる行を探す
+                # 最初の15行を走査し、「code」と「name」が完全に一致する列が存在する行を探す（1行目の誤認を防止）
                 for i, line in enumerate(lines[:15]):
                     try:
                         row_cells = next(csv.reader([line]))
                         row_cells_clean = [str(c).strip().lower() for c in row_cells]
-                        has_code = any("code" in c or "ticker" in c for c in row_cells_clean)
-                        has_name = any("name" in c for c in row_cells_clean)
-                        if has_code and has_name:
+                        if "code" in row_cells_clean and "name" in row_cells_clean:
                             header_idx = i
                             break
                     except Exception:
@@ -91,9 +89,12 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
                 target_row_idx = -1
                 for i, row in df.head(20).iterrows():
                     row_strs = [str(v).strip().replace('\n', '').replace('\r', '').lower() for v in row.values]
-                    row_joined = "".join(row_strs)
-                    # 銘柄コード(code) と 銘柄(name) を確実に感知します
-                    if "銘柄コード" in row_joined and "name" in row_joined:
+                    
+                    # セルごとにキーワードを判定（結合によるnanのノイズを排除し、完全なロバスト化）
+                    has_code_cell = any("銘柄コード" in s or "code" in s for s in row_strs)
+                    has_name_cell = any(("銘柄" in s or "name" in s) and "コード" not in s and "code" not in s for s in row_strs)
+                    
+                    if has_code_cell and has_name_cell:
                         target_row_idx = i
                         break
                 
