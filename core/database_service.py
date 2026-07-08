@@ -473,6 +473,8 @@ def test_forced_scale_patch_in_memory(ticker: str, patch_date_str: str, multipli
 # 📥 Rawデータ更新 ＆ 統合同期システム
 # =====================================================================
 
+# core/database_service.py 内の update_raw_database 関数を差し替え
+
 def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None):
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
@@ -491,13 +493,17 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
     now = now_tz.replace(tzinfo=None)
     suffix = ".T" if is_jp else ""
     tickers = [sanitize_ticker(t, is_jp) for t in tickers]
+    
+    log(f"⚙️ [デバッグ] 同期対象銘柄数: {len(tickers)} 件 (例: {tickers[:10]}...)")
 
     for interval in settings.TIMEFRAMES:
         log(f"⏱️ 【{market_name}】{interval} Rawデータ差分収集開始...")
         try:
             df_raw_db = load_price_db(interval, is_jp=is_jp, is_raw=True)
+            log(f"  🔍 [デバッグ] ローカルRaw DB読み込み成功: {len(df_raw_db):,} 行")
         except FileNotFoundError:
             df_raw_db = pd.DataFrame()
+            log(f"  🔍 [デバッグ] ローカルRaw DBが見つかりません。新規作成します。")
 
         db_max_date = df_raw_db["date"].max() if not df_raw_db.empty else None
         if db_max_date is not None:
@@ -517,9 +523,19 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
         last_updates_map = {}
         if not df_raw_db.empty:
             last_updates_map = df_raw_db.groupby("ticker")["date"].max().to_dict()
+            
+            # 🛡️ tickerカラムの型チェック情報をログ出力
+            if last_updates_map:
+                sample_key = list(last_updates_map.keys())[0]
+                log(f"  🔍 [デバッグ型チェック] DB内のticker型: {type(sample_key)} (例: '{sample_key}') | 対象リストのticker型: {type(tickers[0])} (例: '{tickers[0]}')")
+
+        # 照合件数を可視化
+        matched_tickers = [t for t in tickers if t in last_updates_map]
+        log(f"  🔍 [デバッグ] 同期対象 {len(tickers)} 件中、ローカルDBに合致した件数: {len(matched_tickers)} 件")
 
         active_timestamps = [pd.to_datetime(last_updates_map[t]) for t in tickers if t in last_updates_map]
         base_time = pd.Series(active_timestamps).mode()[0] if active_timestamps and not force_refetch else None
+        log(f"  🔍 [デバッグ] 算出されたベース基準日 (base_time): {base_time}")
 
         if interval == "1m": max_delay = timedelta(hours=4)
         elif interval == "5m": max_delay = timedelta(hours=12)
@@ -548,6 +564,8 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                 else:
                     group_C_tickers.append(t)
 
+        log(f"  📊 [デバッグ] グループ判定内訳: A (即時差分) = {len(group_A_tickers)} 件 | B (許容内遅延) = {len(group_B_tickers)} 件 | C (大幅遅延/新規) = {len(group_C_tickers)} 件")
+
         groups = {}
         if group_A_tickers:
             groups[base_time] = group_A_tickers
@@ -561,6 +579,11 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
             t_key = pd.to_datetime(t_last) if t_last is not None else None
             groups.setdefault(t_key, []).append(t)
 
+        # 取得計画の内訳を出力
+        for key_dt, chunk_list in groups.items():
+            key_str = key_dt.strftime("%Y-%m-%d %H:%M:%S") if key_dt is not None else "None (全期間新規取得 / 2016〜)"
+            log(f"  📥 [デバッグ] 取得スケジュール: 開始日={key_str} ➔ 対象={len(chunk_list)} 銘柄 (例: {chunk_list[:5]}...)")
+
         all_downloaded = []
         for t_last, chunk_tickers in groups.items():
             if t_last is None:
@@ -572,6 +595,7 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
             else:
                 start_date_dt = t_last
                 if interval != "1d" and (now - t_last).total_seconds() < 120:
+                    log(f"    ⏭️ [デバッグ] {interval} 最終取得から120秒未満のためダウンロードをスキップします。")
                     continue
                 start_date_str = start_date_dt.strftime("%Y-%m-%d")
 
@@ -593,9 +617,15 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                         continue
 
             BATCH_SIZE = 100
+            total_batches = (len(chunk_tickers) + BATCH_SIZE - 1) // BATCH_SIZE
+            log(f"  🚀 [デバッグ] 開始日 '{start_date_str}' からのダウンロードを開始します (全 {len(chunk_tickers)} 件, {total_batches} バッチ)...")
+
             for i in range(0, len(chunk_tickers), BATCH_SIZE):
                 chunk = chunk_tickers[i:i+BATCH_SIZE]
                 symbols = [f"{t}{suffix}" for t in chunk]
+                batch_num = (i // BATCH_SIZE) + 1
+                log(f"    📡 バッチ {batch_num}/{total_batches}: {len(chunk)} 銘柄ダウンロード中 (例: {chunk[:3]}...)")
+                
                 try:
                     df_raw = yf.download(
                         symbols, 
@@ -607,7 +637,10 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                         threads=True, 
                         timeout=30
                     )
+                    log(f"      📥 生データダウンロード完了: {df_raw.shape}")
+                    
                     chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
+                    log(f"      ✨ パース後レコード数: {len(chunk_processed):,} 行")
                     if not chunk_processed.empty:
                         all_downloaded.append(chunk_processed)
                 except Exception as e:
@@ -616,9 +649,13 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
 
         if all_downloaded:
             new_combined = pd.concat(all_downloaded, ignore_index=True)
+            log(f"  📊 [デバッグ] 今回新規追加されたデータの合計: {len(new_combined):,} 行")
             if not df_raw_db.empty:
                 df_raw_db = pd.concat([df_raw_db, new_combined], ignore_index=True)
+                before_drop = len(df_raw_db)
                 df_raw_db = df_raw_db.drop_duplicates(subset=["date", "ticker"], keep="last")
+                after_drop = len(df_raw_db)
+                log(f"  🧹 [デバッグ] 重複排除前: {before_drop:,} 行 ➔ 重複排除後: {after_drop:,} 行 (重複による削除: {before_drop - after_drop:,} 行)")
             else:
                 df_raw_db = new_combined
             
