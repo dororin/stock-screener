@@ -14,12 +14,19 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
     ETFの構成銘柄（PCF）を自動取得します。
     E列のファンド情報を指定することで、配信元の形式に合わせてピンポイントで最適パースを行います。
     """
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    # 野村アセット等の直リンク防止（Refererチェック）を突破するための高度な偽装ヘッダー
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Referer": "https://www.nomura-am.co.jp/",  # 直リンク制限を突破するための鍵
+        "Connection": "keep-alive"
+    }
     df = None
     provider = str(fund_provider).strip().lower() if fund_provider else ""
 
     # ==========================================
-    # 🛡️ ETFコードのサニタイズ処理（大文字化・浮動小数点数.0の除去）
+    # 🛡️ ETFコードのサニタイズ処理
     # ==========================================
     etf_code = str(etf_code).strip().upper()
     if "." in etf_code:
@@ -31,7 +38,6 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
     # ルート1: Global X (Solactive CSV)
     # ==========================================
     if not provider or "global" in provider or "solactive" in provider:
-        # ご指示通り、接続先URLを legacy2.solactive.com に完全固定
         base_url = "https://legacy2.solactive.com/downloads/etfservices/tse-pcf/single/"
         solactive_url = f"{base_url}{etf_code}.csv"
         
@@ -72,8 +78,17 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
             file_resp = requests.get(nf_url, headers=headers, timeout=15)
             
             if file_resp.status_code == 200:
-                print(f"  -> 📥 NEXT FUNDSファイルを発見・ダウンロード完了: {nf_url}")
-                # header=None を明示し、完全にシート全体を読み込みます（行ズレ防止）
+                # ── 🛡️ 本物のExcelファイル(ZIP)かどうかの検証 ──
+                # 本物のExcelは先頭が必ず 'PK\x03\x04'（ZIPのマジックナンバー）から始まります
+                is_real_excel = file_resp.content.startswith(b'PK\x03\x04')
+                if not is_real_excel:
+                    print(f"  -> ⚠️ [警告] ダウンロードされたデータは有効なExcelファイルではありません！")
+                    # HTMLエラーページが返されている場合に備え、先頭100文字を露出
+                    debug_text = file_resp.content[:100].decode('utf-8', errors='replace')
+                    print(f"  -> [デバッグ] ファイル先頭の中身: {debug_text}")
+                else:
+                    print(f"  -> 📥 NEXT FUNDSファイルを発見・ダウンロード完了: {nf_url}")
+                    
                 df = pd.read_excel(io.BytesIO(file_resp.content), header=None)
             else:
                 # CSV形式でのフォールバック
@@ -85,6 +100,13 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
                     df = pd.read_csv(io.StringIO(content), header=None)
             
             if df is not None and not df.empty:
+                # ── 🔍 読み込まれたデータフレームのデバッグ可視化 ──
+                print(f"  -> [デバッグ] 読み込みサイズ: {df.shape}")
+                print(f"  -> [デバッグ] 最初の5行のデータ:")
+                for idx, r_val in df.head(5).iterrows():
+                    # 最初の5列分だけコンソールに出力します
+                    print(f"      * 行 {idx}: {list(r_val.values)[:5]}")
+
                 # 最初の20行を走査し、「銘柄コード」と「name」が含まれる行を探す
                 target_row_idx = -1
                 for i, row in df.head(20).iterrows():
