@@ -38,6 +38,7 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
     # ルート1: Global X (Solactive CSV)
     # ==========================================
     if not provider or "global" in provider or "solactive" in provider:
+        # 接続先URLを legacy2.solactive.com に完全固定
         base_url = "https://legacy2.solactive.com/downloads/etfservices/tse-pcf/single/"
         solactive_url = f"{base_url}{etf_code}.csv"
         
@@ -78,18 +79,34 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
             file_resp = requests.get(nf_url, headers=headers, timeout=15)
             
             if file_resp.status_code == 200:
-                # ── 🛡️ 本物のExcelファイル(ZIP)かどうかの検証 ──
-                # 本物のExcelは先頭が必ず 'PK\x03\x04'（ZIPのマジックナンバー）から始まります
+                # ── 本物のExcelファイル(ZIP)かどうかの検証 ──
                 is_real_excel = file_resp.content.startswith(b'PK\x03\x04')
                 if not is_real_excel:
                     print(f"  -> ⚠️ [警告] ダウンロードされたデータは有効なExcelファイルではありません！")
-                    # HTMLエラーページが返されている場合に備え、先頭100文字を露出
                     debug_text = file_resp.content[:100].decode('utf-8', errors='replace')
                     print(f"  -> [デバッグ] ファイル先頭の中身: {debug_text}")
+                    df = None
                 else:
                     print(f"  -> 📥 NEXT FUNDSファイルを発見・ダウンロード完了: {nf_url}")
                     
-                df = pd.read_excel(io.BytesIO(file_resp.content), header=None)
+                    # ── 🛡️ 複数シートの中から「保有明細」データシートを自動選定 ── [C5]
+                    xl = pd.ExcelFile(io.BytesIO(file_resp.content))
+                    target_sheet = None
+                    
+                    # 1. 「保有明細」シートがあれば最優先で使用 [C5]
+                    if "保有明細" in xl.sheet_names:
+                        target_sheet = "保有明細"
+                    else:
+                        # 2. 無ければ「$MetaData」や「実行結果」以外のデータ用シートを走査
+                        valid_sheets = [s for s in xl.sheet_names if s != "$MetaData" and "実行" not in s]
+                        if valid_sheets:
+                            target_sheet = valid_sheets[0]
+                        else:
+                            # 3. それでも見つからない場合の最終安全策（2枚目のシートを選択）
+                            target_sheet = xl.sheet_names[1] if len(xl.sheet_names) > 1 else xl.sheet_names[0]
+                            
+                    print(f"  -> [デバッグ] 解析対象シート: {target_sheet} (全シート: {xl.sheet_names})")
+                    df = xl.parse(sheet_name=target_sheet, header=None)
             else:
                 # CSV形式でのフォールバック
                 nf_url_csv = f"https://www.nomura-am.co.jp/fund/monthly_holdings/{etf_code}_brd_data.csv"
@@ -100,11 +117,10 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
                     df = pd.read_csv(io.StringIO(content), header=None)
             
             if df is not None and not df.empty:
-                # ── 🔍 読み込まれたデータフレームのデバッグ可視化 ──
+                # ── 読み込まれたデータフレームのサイズと先頭行を出力 ──
                 print(f"  -> [デバッグ] 読み込みサイズ: {df.shape}")
                 print(f"  -> [デバッグ] 最初の5行のデータ:")
                 for idx, r_val in df.head(5).iterrows():
-                    # 最初の5列分だけコンソールに出力します
                     print(f"      * 行 {idx}: {list(r_val.values)[:5]}")
 
                 # 最初の20行を走査し、「銘柄コード」と「name」が含まれる行を探す
@@ -112,7 +128,7 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
                 for i, row in df.head(20).iterrows():
                     row_strs = [str(v).strip().replace('\n', '').replace('\r', '').lower() for v in row.values]
                     
-                    # セルごとにキーワードを判定（結合によるnanのノイズを排除し、完全なロバスト化）
+                    # セルごとにキーワードを判定（結合によるnanのノイズを排除し、完全なロバスト化） [C5]
                     has_code_cell = any("銘柄コード" in s or "code" in s for s in row_strs)
                     has_name_cell = any(("銘柄" in s or "name" in s) and "コード" not in s and "code" not in s for s in row_strs)
                     
