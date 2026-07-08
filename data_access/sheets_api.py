@@ -345,8 +345,8 @@ def save_extra_tickers_to_sheets(df: pd.DataFrame):
 def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     """
     sector_JP (または sector_US) シートから「ETFコード」が書かれたセクターを自動検知し、
-    最新の構成銘柄をSolactiveから取得して、同一シートを部分上書き更新します。
-    手動管理されている他のセクター（自動車や電気機器など）は一切書き換えずに保護します。
+    最新の構成銘柄をファンド（E列）のルールに従ってSolactiveまたはNomuraから取得し、
+    同一シートを部分上書き更新します。同一ETFコードの無駄な重複ダウンロードは行いません。
     
     戻り値: {セクター名: 状態メッセージ} の辞書形式
     """
@@ -372,6 +372,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     col_code = -1
     col_memo = -1
     col_etf = -1
+    col_fund = -1  # E列の追加対応
     
     for i, h in enumerate(headers):
         if h in ["セクター名", "sector", "sector_name"]:
@@ -382,19 +383,28 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
             col_memo = i
         elif h in ["ETFコード", "etf", "etf_code"]:
             col_etf = i
+        elif h in ["ファンド", "fund", "fund_name"]:
+            col_fund = i
             
     if col_sector == -1 or col_code == -1:
         return {"error": "必須カラム（セクター名、銘柄コード）がシート内に見つかりません。"}
         
-    # ETFコード列がシートにない場合は、右端に自動作成します
+    # ETFコード列がシートにない場合は右端に自動作成
     if col_etf == -1:
         headers.append("ETFコード")
         col_etf = len(headers) - 1
         all_values[0] = headers
         ws.update([headers], "A1")
+
+    # ファンド列がシートにない場合は右端に自動作成
+    if col_fund == -1:
+        headers.append("ファンド")
+        col_fund = len(headers) - 1
+        all_values[0] = headers
+        ws.update([headers], "A1")
         
-    # 3. データの解析（自動化したいセクターとETFのペアを抽出）
-    etf_mapping = {}  # {セクター名: ETFコード}
+    # 3. データの解析（自動化したいセクターと、対応するETF・ファンドのペアを抽出）
+    etf_mapping = {}  # {セクター名: (ETFコード, ファンド)}
     rows_data = []    # 読み込んだ元のデータを退避
     
     for row in all_values[1:]:
@@ -406,53 +416,68 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
         code_val = str(row[col_code]).strip()
         memo_val = str(row[col_memo]).strip() if col_memo != -1 else ""
         etf_val = str(row[col_etf]).strip()
+        fund_val = str(row[col_fund]).strip() if col_fund != -1 else ""
         
-        # 4桁のETFコードや、英数字(513A等)が記載されている場合のみマッピングに登録
+        # ETFコードが記載されている場合のみマッピングに登録
         if sec_val and etf_val:
-            etf_mapping[sec_val] = etf_val
+            etf_mapping[sec_val] = (etf_val, fund_val)
             
         rows_data.append({
             "sector": sec_val,
             "code": code_val,
             "memo": memo_val,
-            "etf": etf_val
+            "etf": etf_val,
+            "fund": fund_val
         })
         
     if not etf_mapping:
         return {"info": "自動同期対象（ETFコードが記入されたセクター）が検出されませんでした。"}
         
-    # 4. Solactiveからの最新データ取得とマージ処理
+    # 4. 重複を排除した効率的なダウンロード処理
     from core.collector import fetch_etf_constituents
     
     sync_results = {}
     final_rows = []
     
-    # 【ステップA】自動同期対象外（手動セクター）の行を無傷で残す
+    # 【ステップA】自動同期対象外（手動管理セクター）の行を無傷で残す
     for r in rows_data:
         if r["sector"] not in etf_mapping:
             final_rows.append(r)
             
-    # 【ステップB】自動同期対象のセクターについて、1件ずつ最新データをマージ
-    for sector_name, etf_code in etf_mapping.items():
-        constituents = fetch_etf_constituents(etf_code)
+    # 【ステップB】重複を排除したユニークな取得対象リストを作成
+    # { ETFコード: ファンド名 }
+    unique_etfs = {}
+    for sector_name, (etf_code, fund_val) in etf_mapping.items():
+        unique_etfs[etf_code] = fund_val
         
-        # ダウンロードに失敗した場合の安全ガード（古いデータをそのまま復元して維持）
+    # 各ETFを1回のみダウンロードしてキャッシュに保持
+    downloaded_cache = {}
+    for etf_code, fund_val in unique_etfs.items():
+        constituents = fetch_etf_constituents(etf_code, fund_provider=fund_val)
+        downloaded_cache[etf_code] = constituents
+        
+    # 【ステップC】自動同期対象セクターについて、キャッシュからデータをマージ
+    for sector_name, (etf_code, fund_val) in etf_mapping.items():
+        constituents = downloaded_cache.get(etf_code)
+        
+        # ダウンロード失敗時の安全ガード（古いデータをそのまま維持）
         if not constituents:
-            sync_results[sector_name] = "通信エラー等のため既存データをそのまま維持"
+            sync_results[sector_name] = f"通信エラー等のため既存データを維持 (ファンド: {fund_val or '未指定'})"
             for r in rows_data:
                 if r["sector"] == sector_name:
                     final_rows.append(r)
             continue
             
-        # ダウンロードに成功した場合、最新の構成銘柄で展開
+        # 最新の構成銘柄でシート用の行を展開
         for code, name in constituents.items():
             final_rows.append({
                 "sector": sector_name,
                 "code": code,
                 "memo": name,  # 備考欄に銘柄名を自動マッピング
-                "etf": etf_code
+                "etf": etf_code,
+                "fund": fund_val
             })
-        sync_results[sector_name] = f"同期成功 ({len(constituents)}銘柄)"
+        sync_results[sector_name] = f"同期成功 ({len(constituents)}銘柄) / ファンド: {fund_val or '自動判定'}"
         
     # 5. スプレッドシートへの一括書き出し
     output_values = [headers]
@@ -463,6 +488,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
         if col_memo != -1:
             row_out[col_memo] = r["memo"]
         row_out[col_etf] = r["etf"]
+        row_out[col_fund] = r["fund"]
         output_values.append(row_out)
         
     # 衝突を避けるため、一度シートをクリアして全書き直し
