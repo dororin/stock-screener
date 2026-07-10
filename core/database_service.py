@@ -575,12 +575,15 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
     suffix = ".T" if is_jp else ""
     tickers = [sanitize_ticker(t, is_jp) for t in tickers]
 
+    print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [UPDATE_RAW] 全体処理対象の銘柄数: {len(tickers)}")
+    sys.stdout.flush()
+
     timeframes_to_run = [target_interval] if target_interval else settings.TIMEFRAMES
 
     for interval in timeframes_to_run:
         log(f"⏱️ 【{market_name}】{interval} Rawデータ差分収集判定を開始...")
         
-        # 🚀 【リファクタリング】数百万行をロードせず、メタデータフッター（台帳）のみを瞬時に読み込みます
+        # 🚀 【リファクタリング】数百万行をロードせず、メタデータフッター（台帳）のみを高速取得
         from data_access.local_db import load_price_db_ledger
         ledger = load_price_db_ledger(interval, is_jp=is_jp, is_raw=True)
         db_max_date_str = ledger.get("db_max_date")
@@ -595,9 +598,135 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                     continue
 
         last_updates_map = ledger.get("last_updates_map", {})
+        if not last_updates_map:
+            last_updates_map = {}
 
-        # ... (中略: グループ分け、差分取得開始日の特定ロジックはそのまま維持) ...
-        # ... (中略: yfinanceダウンロードバッチ処理はそのまま維持) ...
+        # グループ分け、差分取得開始日の特定ロジック
+        active_timestamps = [pd.to_datetime(last_updates_map[t]) for t in tickers if t in last_updates_map]
+        base_time = pd.Series(active_timestamps).mode()[0] if active_timestamps and not force_refetch else None
+
+        if interval == "1m": max_delay = timedelta(hours=4)
+        elif interval == "5m": max_delay = timedelta(hours=12)
+        elif interval == "60m": max_delay = timedelta(days=2)
+        else: max_delay = timedelta(days=10)
+        future_tolerance = timedelta(minutes=5)
+
+        group_A_tickers, group_B_tickers, group_C_tickers = [], [], []
+        group_B_timestamps = []
+
+        for t in tickers:
+            t_last = last_updates_map.get(t)
+            if t_last is None or force_refetch:
+                group_C_tickers.append(t)
+                continue
+            t_last_dt = pd.to_datetime(t_last)
+            if base_time is None:
+                group_C_tickers.append(t)
+            else:
+                delay = base_time - t_last_dt
+                if -future_tolerance <= delay <= timedelta(0):
+                    group_A_tickers.append(t)
+                elif timedelta(0) < delay <= max_delay:
+                    group_B_tickers.append(t)
+                    group_B_timestamps.append(t_last_dt)
+                else:
+                    group_C_tickers.append(t)
+
+        groups = {}
+        if group_A_tickers:
+            groups[base_time] = group_A_tickers
+        if group_B_tickers and group_B_timestamps:
+            oldest_b_time = min(group_B_timestamps)
+            rounded_time = oldest_b_time.floor("30min") if interval in ["1m", "5m"] else oldest_b_time.floor("h") if interval == "60m" else oldest_b_time.floor("D")
+            groups[rounded_time] = group_B_tickers
+
+        for t in group_C_tickers:
+            t_last = last_updates_map.get(t)
+            t_key = pd.to_datetime(t_last) if t_last is not None else None
+            groups.setdefault(t_key, []).append(t)
+
+        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [UPDATE_RAW] グループ数: {len(groups)}")
+        sys.stdout.flush()
+
+        all_downloaded = []  # ⚠️ 処理グループを回す直前に初期化
+        for group_idx, (t_last, chunk_tickers) in enumerate(groups.items()):
+            if t_last is None:
+                if interval == "1m": start_date_dt = now - timedelta(days=6)
+                elif interval == "5m": start_date_dt = now - timedelta(days=58)
+                elif interval == "60m": start_date_dt = now - timedelta(days=718)
+                else: start_date_dt = datetime(2016, 1, 1)
+                start_date_str = start_date_dt.strftime("%Y-%m-%d")
+            else:
+                if interval == "1d":
+                    start_date_dt = t_last + timedelta(days=1)
+                else:
+                    start_date_dt = t_last
+                start_date_str = start_date_dt.strftime("%Y-%m-%d")
+
+            if interval in YFINANCE_GAP_LIMITS:
+                limit_days = YFINANCE_GAP_LIMITS[interval]
+                try:
+                    gap_start_date = start_date_dt.date() if hasattr(start_date_dt, "date") else None
+                except Exception:
+                    gap_start_date = None
+
+                if gap_start_date is not None:
+                    gap_days = (local_today - gap_start_date).days
+                    if gap_days > limit_days:
+                        sample_tickers = ", ".join(chunk_tickers[:5]) + ("..." if len(chunk_tickers) > 5 else "")
+                        log(
+                            f"⚠️【警告】[{interval}] {sample_tickers} の空白期間が {gap_days} 日となり、"
+                            f"yfinanceの上限（{limit_days}日）を超えたため差分同期できません。手動リビルドを行ってください。"
+                        )
+                        continue
+
+            BATCH_SIZE = 100
+            for i in range(0, len(chunk_tickers), BATCH_SIZE):
+                chunk = chunk_tickers[i:i+BATCH_SIZE]
+                symbols = [f"{t}{suffix}" for t in chunk]
+                
+                print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [START] BATCH {i//BATCH_SIZE + 1} for Group {group_idx+1}. (Interval: {interval})")
+                sys.stdout.flush()
+                
+                try:
+                    print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [API_CALL] Requesting symbols: {chunk[:5]}...")
+                    sys.stdout.flush()
+                    
+                    df_raw = yf.download(
+                        symbols, 
+                        start=start_date_str,
+                        interval=interval, 
+                        auto_adjust=False, 
+                        actions=True, 
+                        progress=False, 
+                        threads=True, 
+                        timeout=30
+                    )
+                    
+                    print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [API_SUCCESS] df_raw shape: {df_raw.shape if not df_raw.empty else 'EMPTY'}")
+                    sys.stdout.flush()
+                    
+                    if not df_raw.empty:
+                        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [PARSE] Parsing dataframe for {len(chunk)} tickers...")
+                        sys.stdout.flush()
+                        
+                        chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
+                        
+                        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [PARSE_SUCCESS] Processed rows: {len(chunk_processed)}")
+                        sys.stdout.flush()
+                        
+                        if not chunk_processed.empty:
+                            all_downloaded.append(chunk_processed)
+                    else:
+                        print(f"[CONSOLE_DEBUG] [API_WARNING] Returned DataFrame is EMPTY.")
+                        sys.stdout.flush()
+                except Exception as e:
+                    print(f"[CONSOLE_DEBUG] [BATCH_ERROR] Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                    log(f"     Batch Error: {e}")
+                time.sleep(1)
 
         if all_downloaded:
             new_combined = pd.concat(all_downloaded, ignore_index=True)
@@ -613,7 +742,6 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
             else:
                 new_combined = pd.DataFrame()
             
-            # 分割を検知した場合
             detected_split_tickers = []
             if interval == "1d" and not new_combined.empty:
                 if "stock splits" in new_combined.columns:
@@ -621,7 +749,7 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                     if not split_rows.empty:
                         detected_split_tickers = split_rows["ticker"].unique().tolist()
                         for st_ticker in detected_split_tickers:
-                            log(f"🔔 [株式分割検知] 銘柄 {st_ticker} に分割を検知しました。日足のみフル再ダウンロードを実行。")
+                            log(f"🔔 [株式分割検知] 銘柄 {st_ticker} に分割を検知しました。日足(1d)のみフル再ダウンロードを実行します。")
                             rebuild_single_ticker_1d_raw(st_ticker, is_jp=is_jp)
             
             if not new_combined.empty:
@@ -642,17 +770,14 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                 if cloud_success:
                     log(f"  📥 Rawデータ差分保存完了。({len(new_combined):,}件追加)")
                     
-                    # 🚀 【インクリメンタル処理の注入】日常処理では全体再構築を呼ぶ必要はありません！
-                    # 分割が発生していない場合は、この差分のみをActiveにアペンド加工します。
                     if not detected_split_tickers:
                         log(f"  🛠️ 差分データのみをActiveデータベースへインクリメンタル反映します...")
                         incremental_update_active(interval, is_jp=is_jp, new_raw_diff=new_combined)
                     else:
-                        # 💥 分割が発生した該当銘柄のみ部分ロード遡及処理を実行
                         log(f"  🛠️ 分割発生銘柄のみ部分遡及処理（部分上書き）を実行します...")
                         partial_rebuild_active_for_tickers(interval, detected_split_tickers, is_jp=is_jp)
                 else:
-                    log(f"  ⚠️ [Raw保存警告] 保存に失敗。エラー: {cloud_msg}")
+                    log(f"  ⚠️ [Raw保存警告] Googleドライブへの同期に失敗しました（ローカルのみ）。エラー: {cloud_msg}")
             else:
                 log(f"  📥 yfinanceからの新規差分データはありません。")
         else:
