@@ -337,6 +337,9 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
 
 def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = False, skip_assertion: bool = False, status_callback=None) -> bool:
     """RawデータからActiveデータの加工ビルドとアサーション検証。"""
+    import gc
+    import sys
+    
     def log(msg):
         print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] {msg}")
         sys.stdout.flush()
@@ -353,31 +356,58 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         log("❌ Rawデータベースファイルが空、または検出されません。")
         return False
 
-    print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] Rawデータのロード完了。サイズ: {df_raw.shape}, ユニーク数: {df_raw['ticker'].nunique()}")
-    sys.stdout.flush()
+    log(f"Rawデータのロード完了。サイズ: {df_raw.shape}, ユニーク数: {df_raw['ticker'].nunique()}")
 
     df_raw["is_finalized"] = compute_is_finalized(df_raw["date"], interval, is_jp=is_jp)
 
+    # 管理用マーク列の初期化
     if "split_multiplier" not in df_raw.columns:
         df_raw["split_multiplier"] = 1.0
     if "patched_multiplier" not in df_raw.columns:
         df_raw["patched_multiplier"] = 1.0
 
-    processed_parts = []
-    unique_tickers = df_raw["ticker"].unique()
-    total_tickers = len(unique_tickers)
+    # ── 🚀 【メモリリーク/OOMを防止する劇的軽量化処理】 ──
+    # 従来は1702銘柄全てを無条件にgroupbyループしていましたが、
+    # 株式分割が発生した銘柄（極少数）のみをピンポイントで抽出しループ処理を行います。
+    # 分割がない銘柄（99%以上）は無駄な分割・再結合(concat)を一切行わず高速スルーします。
     
-    print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] 株式分割の過去遡及の計算を開始 (全 {total_tickers} 銘柄)")
-    sys.stdout.flush()
-    
-    for idx, (ticker, group) in enumerate(df_raw.groupby("ticker")):
-        if idx % 50 == 0 or idx == total_tickers - 1:
-            print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE]   -> 処理進捗: {idx+1}/{total_tickers} ({ticker})")
-            sys.stdout.flush()
-        adjusted_group = adjust_ticker_splits_backward_in_memory(group)
-        processed_parts.append(adjusted_group)
-    df_processed = pd.concat(processed_parts, ignore_index=True)
+    split_tickers = []
+    if "stock splits" in df_raw.columns:
+        # 分割イベント（値が 0 より大きく、かつ 1.0 以外のもの）を持つユニーク銘柄を特定
+        split_tickers = df_raw[(df_raw["stock splits"] > 0) & (df_raw["stock splits"] != 1.0)]["ticker"].unique().tolist()
 
+    if split_tickers:
+        log(f"株式分割イベントを検知しました。対象銘柄数: {len(split_tickers)} / {df_raw['ticker'].nunique()}")
+        
+        # 分割ありと分割なしにデータフレームを分割
+        df_with_splits = df_raw[df_raw["ticker"].isin(split_tickers)].copy()
+        df_without_splits = df_raw[~df_raw["ticker"].isin(split_tickers)].copy()
+        
+        # 元の巨大データフレームは不要になった時点で即座にメモリから削除
+        del df_raw
+        gc.collect()
+        
+        processed_parts = []
+        total_split_tickers = len(split_split_tickers) if 'split_split_tickers' in locals() else len(split_tickers)
+        for idx, (ticker, group) in enumerate(df_with_splits.groupby("ticker")):
+            if idx % 10 == 0 or idx == total_split_tickers - 1:
+                print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE]   -> 分割処理進捗: {idx+1}/{total_split_tickers} ({ticker})")
+                sys.stdout.flush()
+            adjusted_group = adjust_ticker_splits_backward_in_memory(group)
+            processed_parts.append(adjusted_group)
+            
+        df_processed_splits = pd.concat(processed_parts, ignore_index=True)
+        
+        # 分割のない元のデータと結合
+        df_processed = pd.concat([df_without_splits, df_processed_splits], ignore_index=True)
+        
+        # 不要な一時データを明示的に解放
+        del df_with_splits, df_without_splits, df_processed_splits, processed_parts
+        gc.collect()
+    else:
+        log("データセット全体に株式分割イベントは検出されませんでした。全ループをスキップして高速ゼロコピー移行します。")
+        df_processed = df_raw
+        
     print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] 遡及修正計算完了。総行数: {len(df_processed)}")
     sys.stdout.flush()
 
@@ -392,6 +422,8 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
             sys.stdout.flush()
             df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False)
             df_processed = propagate_stop_allocation_bars_in_memory(df_1d_active, df_processed, is_jp=is_jp)
+            del df_1d_active
+            gc.collect()
         except Exception as e:
             print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] ストップ高安補完中に警告: {e}")
             sys.stdout.flush()
@@ -420,6 +452,8 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
             if any("🚨" in a for a in alerts):
                 log("🛑 深刻なデータ不整合（ジャンプなど）を検出したため、破損防止のため同期を強制中断しました。")
                 return False
+        del df_old_active
+        gc.collect()
     else:
         log("✨ [白紙構築] 新旧データの整合性比較、および過去パッチの干渉をスキップしてクリーン処理します。")
 
@@ -435,6 +469,10 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         sys.stdout.flush()
         df_processed = df_processed.sort_values(["ticker", "date"]).reset_index(drop=True)
         cloud_success, cloud_msg = save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False)
+        
+        # 保存完了後にメモリをクリア
+        del df_processed
+        gc.collect()
         
         if cloud_success:
             log(f"✅ [{interval}] ActiveデータベースをGoogleドライブへ正常に保存しました。")
