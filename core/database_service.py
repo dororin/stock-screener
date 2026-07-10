@@ -101,22 +101,6 @@ def _build_synthetic_15h_bar_row(schema_cols: list, ticker: str, day_date, close
             row[col] = None
     return row
 
-def _replace_stop_allocation_bar(df_interval: pd.DataFrame, ticker: str, day_date, close_price: float, volume: float, is_jp: bool = True) -> pd.DataFrame:
-    if df_interval.empty:
-        schema_cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
-        new_row = _build_synthetic_15h_bar_row(schema_cols, ticker, day_date, close_price, volume, is_jp=is_jp)
-        return pd.DataFrame([new_row])
-
-    day_only = pd.Timestamp(day_date).normalize()
-    dt_series = pd.to_datetime(df_interval["date"])
-
-    target_mask = (df_interval["ticker"] == ticker) & (dt_series.dt.normalize() == day_only)
-    df_cleaned = df_interval[~target_mask].copy()
-
-    new_row = _build_synthetic_15h_bar_row(df_interval.columns.tolist(), ticker, day_date, close_price, volume, is_jp=is_jp)
-    df_result = pd.concat([df_cleaned, pd.DataFrame([new_row])], ignore_index=True)
-    return df_result
-
 def check_anomaly_need_patch(df_ticker: pd.DataFrame, patch_date_str: str, multiplier: float, threshold: float = 0.10) -> bool:
     """二重適用防止判定（t-1基準）。"""
     if df_ticker.empty or len(df_ticker) < 2:
@@ -293,6 +277,7 @@ def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True) -> pd.DataFr
     return df_result
 
 def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intra_active: pd.DataFrame, is_jp: bool = True) -> pd.DataFrame:
+    """日足のストップ高安発生日を検出し、対象の分足データを一括で合成バーに置き換えます（一括処理最適化版）。"""
     import gc
     import pandas as pd
     
@@ -305,6 +290,7 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
 
     stop_tickers = stop_days_df["ticker"].unique().tolist()
     
+    # ストップ高安検出対象の銘柄と、それ以外の銘柄に分割
     df_intra_target = df_intra_active[df_intra_active["ticker"].isin(stop_tickers)].copy()
     df_intra_safe = df_intra_active[~df_intra_active["ticker"].isin(stop_tickers)]
 
@@ -312,25 +298,55 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
         return df_intra_active
 
     df_intra_target["date"] = pd.to_datetime(df_intra_target["date"])
+    df_intra_target["day_normalize"] = df_intra_target["date"].dt.normalize()
+    
+    # 照合用のタプルキー (ticker, date_normalized) をセット化して高速検索
+    stop_days_df["date_norm"] = pd.to_datetime(stop_days_df["date"]).dt.normalize()
+    stop_keys = set(zip(stop_days_df["ticker"], stop_days_df["date_norm"]))
+    
+    # 削除対象となる分足データの行マスクを一括算出
+    target_zip = zip(df_intra_target["ticker"], df_intra_target["day_normalize"])
+    is_stop_bar = [pair in stop_keys for pair in target_zip]
+    
+    # ストップ高安日以外の通常データを残す（一括抽出）
+    df_cleaned = df_intra_target[~pd.Series(is_stop_bar, index=df_intra_target.index)].copy()
+    
+    # 新しい合成バーを一挙にビルドしてプール
+    schema_cols = df_intra_active.columns.tolist()
+    new_rows = []
     
     for _, row in stop_days_df.iterrows():
         ticker = row["ticker"]
-        day_date = pd.Timestamp(row["date"]).date()
+        day_date = row["date_norm"]
         
+        # 該当銘柄が保有するデータ日付範囲に収まっているかを確認
         ticker_data = df_intra_target[df_intra_target["ticker"] == ticker]
         if ticker_data.empty:
             continue
             
-        t_min = ticker_data["date"].min().date()
-        t_max = ticker_data["date"].max().date()
+        t_min = ticker_data["day_normalize"].min()
+        t_max = ticker_data["day_normalize"].max()
         
         if t_min <= day_date <= t_max:
-            df_intra_target = _replace_stop_allocation_bar(
-                df_intra_target, ticker, row["date"], row["close"], row["volume"], is_jp=is_jp
+            new_row = _build_synthetic_15h_bar_row(
+                schema_cols, ticker, day_date, row["close"], row["volume"], is_jp=is_jp
             )
+            new_rows.append(new_row)
 
-    df_result = pd.concat([df_intra_safe, df_intra_target], ignore_index=True)
-    del df_intra_target, df_intra_safe
+    if new_rows:
+        df_synthetic = pd.DataFrame(new_rows)
+        df_synthetic["date"] = pd.to_datetime(df_synthetic["date"])
+        df_result_target = pd.concat([df_cleaned, df_synthetic], ignore_index=True)
+    else:
+        df_result_target = df_cleaned
+
+    if "day_normalize" in df_result_target.columns:
+        df_result_target = df_result_target.drop(columns=["day_normalize"])
+
+    df_result = pd.concat([df_intra_safe, df_result_target], ignore_index=True)
+    
+    # 不要なメモリを即時解放
+    del df_intra_target, df_intra_safe, df_cleaned, new_rows
     gc.collect()
     
     return df_result
@@ -368,9 +384,6 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         df_raw["patched_multiplier"] = 1.0
 
     # ── 🚀 【完全インプレース化】株式分割遡及修正の劇的軽量化 ──
-    # 対象の266件だけを、巨大データフレームをコピーすることなくダイレクトに書き換えます。
-    # ピークメモリの増加を完全に 0 に抑え込みます。
-    
     split_tickers = []
     if "stock splits" in df_raw.columns:
         split_tickers = df_raw[(df_raw["stock splits"] > 0) & (df_raw["stock splits"] != 1.0)]["ticker"].unique().tolist()
@@ -387,28 +400,19 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
             if not ticker_mask.any():
                 continue
                 
-            # 対象銘柄のみ抽出（サイズが極小のため、コピーしてもメモリに影響ありません）
             group = df_raw[ticker_mask].copy()
-            
-            # 時系列順にソート（この時点の元のインデックス順を保持します）
             group_sorted = group.sort_values("date")
-            
-            # 分割調整（戻り値は 0 始まりの連番インデックスになります）
             adjusted_group = adjust_ticker_splits_backward_in_memory(group_sorted)
             
             if not adjusted_group.empty:
-                # ── インプレース書き戻し用に、元のソート順インデックスを完全復元 ──
                 adjusted_group.index = group_sorted.index
-                
                 valid_cols = [c for c in cols_to_write if c in df_raw.columns and c in adjusted_group.columns]
-                # 元の巨大データフレームへダイレクト上書き（余分なメモリ確保なし）
                 df_raw.loc[adjusted_group.index, valid_cols] = adjusted_group[valid_cols]
             
             if idx % 50 == 0 or idx == total_split_tickers - 1:
                 print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE]   -> インプレース分割処理進捗: {idx+1}/{total_split_tickers} ({ticker})")
                 sys.stdout.flush()
                 
-        # 参照の移し替え
         df_processed = df_raw
     else:
         log("データセット全体に株式分割イベントは検出されませんでした。インプレーススキップします。")
@@ -562,13 +566,12 @@ def test_forced_scale_patch_in_memory(ticker: str, patch_date_str: str, multipli
 # 📥 Rawデータ更新 ＆ 統合同期システム
 # =====================================================================
 
-def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None):
-    """yfinanceからのRawデータ差分取得。"""
+def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None, target_interval: str = None):
+    """yfinanceからのRawデータ差分取得（特定時間足ターゲット指定対応）。"""
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
     
     def log(msg):
-        # メモリ使用量を常にプレフィックスに付与してコンソール出力
         print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [UPDATE_RAW] {msg}")
         sys.stdout.flush()
         if status_callback: 
@@ -591,7 +594,10 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
     print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [UPDATE_RAW] 全体処理対象の銘柄数: {len(tickers)}")
     sys.stdout.flush()
 
-    for interval in settings.TIMEFRAMES:
+    # target_intervalの指定があればその足のみ、なければ全時間足をループ
+    timeframes_to_run = [target_interval] if target_interval else settings.TIMEFRAMES
+
+    for interval in timeframes_to_run:
         log(f"⏱️ 【{market_name}】{interval} Rawデータ差分収集開始...")
         try:
             df_raw_db = load_price_db(interval, is_jp=is_jp, is_raw=True)
@@ -783,17 +789,42 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
             log(f"  🧊 yfinanceからの差分データはありません。")
 
 def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None, dry_run: bool = False):
+    """時間足自己完結型の最適化データベース更新フロー。"""
+    import gc
     def log(msg):
         print(f"[CONSOLE_DEBUG] [UPDATE_PROCESS] {msg}")
         sys.stdout.flush()
-        if status_callback: status_callback(msg)
+        if status_callback: 
+            status_callback(msg)
 
-    log("📡 1. yfinanceからのRawデータ差分取得を開始します...")
-    update_raw_database(is_jp=is_jp, target_tickers=target_tickers, force_refetch=force_refetch, status_callback=status_callback)
+    # 🚀 段階1: すべての時間足の依存基盤となる「1d (日足)」のロードと構築を最優先で完結させる
+    log("📡 1. 【日足 (1d)】のRawデータ差分取得を開始します...")
+    update_raw_database(is_jp=is_jp, target_tickers=target_tickers, force_refetch=force_refetch, status_callback=status_callback, target_interval="1d")
 
-    log("🛠️ 2. RawデータからActiveデータベース一括加工・検証ビルドを開始します...")
-    for interval in settings.TIMEFRAMES:
+    log("🛠️ 2. 【日足 (1d)】のActiveデータベース加工・検証ビルドを実行します...")
+    rebuild_active_from_raw("1d", is_jp=is_jp, dry_run=dry_run, skip_assertion=False, status_callback=status_callback)
+    
+    # 1d足の巨大な加工中一時データをメモリから完全にクリーンアップ
+    gc.collect()
+
+    # 🚀 段階2: 完了した1dのActiveを参照し、残りの分足を1つずつ「取得➔ビルド➔保存➔破棄」で自己完結させる
+    intraday_timeframes = [tf for tf in settings.TIMEFRAMES if tf != "1d"]
+    log(f"📡 3. 以下の分足データに関して、個別独立のロード＆ビルド処理を開始します: {intraday_timeframes}")
+
+    for interval in intraday_timeframes:
+        log(f"⏱️ 【{interval}】の個別同期プロセスを開始します...")
+        
+        # Raw差分取得
+        update_raw_database(is_jp=is_jp, target_tickers=target_tickers, force_refetch=force_refetch, status_callback=status_callback, target_interval=interval)
+        
+        # Active検証ビルド
         rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, skip_assertion=False, status_callback=status_callback)
+        
+        # 当該時間足のすべての巨大オブジェクトを削除・GC強制実行
+        gc.collect()
+        log(f"✅ 【{interval}】の処理が安全に終了し、メモリ領域をクリアしました。")
+
+    log("✨ 全ての時間足に対する個別同期・検証ビルドプロセスが正常に完了しました。")
 
 # =====================================================================
 # 💥 クリーンビルド（RawもActiveも完全にダウンロードし直す）
@@ -840,7 +871,6 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
         chunk = tickers[i:i+BATCH_SIZE]
         symbols = [f"{t}{suffix}" for t in chunk]
         
-        # 🚀 フルビルド時のコンソール進捗ログ
         print(f"[CONSOLE_DEBUG] [START_FULL_REBUILD] Batch {i//BATCH_SIZE + 1} / {(len(tickers)-1)//BATCH_SIZE + 1} (Tickers: {chunk})")
         sys.stdout.flush()
         
@@ -1742,7 +1772,6 @@ def get_current_memory_usage() -> str:
         with open("/proc/self/status", "r") as f:
             for line in f:
                 if line.startswith("VmRSS:"):
-                    # 例: VmRSS:     13484 kB
                     parts = line.split()
                     if len(parts) >= 2:
                         kb = int(parts[1])
