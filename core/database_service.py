@@ -643,7 +643,7 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                         auto_adjust=False, 
                         actions=True, 
                         progress=False, 
-                        threads=True, 
+                        threads=False, 
                         timeout=30
                     )
                     
@@ -783,7 +783,7 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
                 auto_adjust=False,
                 actions=True,
                 progress=False,
-                threads=True,
+                threads=False,
                 timeout=30
             )
             
