@@ -736,9 +736,9 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                 else:
                     log(f"  ⚠️ [Raw保存警告] Googleドライブへの同期に失敗しました（ローカルのみ）。エラー: {cloud_msg}")
             else:
-                log(f"  🧊 yfinanceからの新規差分データはありません。")
+                log(f"  📥 yfinanceからの新規差分データはありません。")
         else:
-            log(f"  🧊 yfinanceからの差分データはありません。")
+            log(f"  📥 yfinanceからの差分データはありません。")
 
 def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None, dry_run: bool = False):
     """時間足自己完結型＆APIレート制御キャッシュ版 データベース更新プロセス。"""
@@ -981,6 +981,102 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
 # =====================================================================
 # 🩹 手動修復と一括パッチ適用
 # =====================================================================
+
+def test_forced_scale_patch_in_memory(ticker: str, patch_date_str: str, multiplier: float, is_jp: bool = True) -> tuple[dict, dict]:
+    """
+    メモリ上で特定銘柄（全時間足）の崖調整パッチ（倍率補正）の適用テストを実行します。
+    ディスク上（Google Drive / ローカル作業ファイル）のデータは書き換えずに、
+    テスト結果のプレビュー用辞書と、調整後のデータフレーム辞書を返します。
+    """
+    if multiplier <= 0:
+        return {"error": "倍率に0以下の数値は指定できません。"}, {}
+
+    pure_ticker = sanitize_ticker(ticker, is_jp)
+    try:
+        target_dt = pd.to_datetime(patch_date_str)
+    except Exception as e:
+        return {"error": f"要補正Close日時のパースに失敗しました: {e}"}, {}
+
+    test_results = {}
+    temp_repaired_dfs = {}
+
+    for interval in ["1d", "60m", "5m", "1m"]:
+        try:
+            db_df = load_price_db(interval, is_jp=is_jp, is_raw=False)
+        except FileNotFoundError:
+            continue
+            
+        if db_df.empty:
+            continue
+
+        mask = db_df["ticker"] == pure_ticker
+        ticker_data = db_df[mask].copy()
+        if ticker_data.empty:
+            continue
+
+        if "patched_multiplier" not in ticker_data.columns:
+            ticker_data["patched_multiplier"] = 1.0
+
+        ticker_data["date_dt"] = pd.to_datetime(ticker_data["date"])
+        
+        # 適用条件：対象日時（含む）以前で、まだパッチが適用されていない部分
+        pre_mask = (ticker_data["date_dt"] <= target_dt) & (ticker_data["patched_multiplier"] == 1.0)
+        
+        if not pre_mask.any():
+            # すでにパッチ適用済み、または対象データなし
+            continue
+
+        applied_count = pre_mask.sum()
+        
+        # 調整前の状態をディープコピーして保持
+        before_ticker_data = ticker_data.copy()
+        
+        # パッチ適用を実行
+        price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in ticker_data.columns]
+        for col in price_cols:
+            ticker_data.loc[pre_mask, col] = ticker_data.loc[pre_mask, col] * multiplier
+        if "volume" in ticker_data.columns:
+            ticker_data.loc[pre_mask, "volume"] = ticker_data.loc[pre_mask, "volume"] / multiplier
+
+        ticker_data.loc[pre_mask, "patched_multiplier"] = multiplier
+
+        # プレビュー表示用のサンプル作成
+        # 調整されたデータの最新5行と、調整されなかった（target_dtより後）データの最古5行、計10行程度を並べる
+        adjusted_idx = ticker_data[pre_mask].index
+        unadjusted_idx = ticker_data[~pre_mask].index
+        
+        # 調整前のDFから、該当インデックスを抽出
+        sample_indices = list(adjusted_idx[-5:]) + list(unadjusted_idx[:5])
+        sample_indices = [idx for idx in sample_indices if idx in ticker_data.index]
+        
+        before_sample = before_ticker_data.loc[sample_indices].drop(columns=["date_dt"], errors="ignore")
+        after_sample = ticker_data.loc[sample_indices].drop(columns=["date_dt"], errors="ignore")
+
+        # 時間系列順にソート
+        if "date" in before_sample.columns:
+            before_sample = before_sample.sort_values("date")
+            after_sample = after_sample.sort_values("date")
+
+        test_results[interval] = {
+            "applied_count": applied_count,
+            "before_sample": before_sample,
+            "after_sample": after_sample
+        }
+
+        # 戻り用の完全な調整後データフレームを構築
+        repaired_ticker_data = ticker_data.drop(columns=["date_dt"], errors="ignore")
+        
+        # 全体DFと差し替え
+        full_repaired_df = db_df[~mask].copy()
+        full_repaired_df = pd.concat([full_repaired_df, repaired_ticker_data], ignore_index=True)
+        full_repaired_df = full_repaired_df.sort_values(["ticker", "date"]).reset_index(drop=True)
+        
+        temp_repaired_dfs[interval] = full_repaired_df
+
+    if not test_results:
+        return {"error": "対象銘柄または適用可能な未調整データが見つかりませんでした。"}, {}
+
+    return test_results, temp_repaired_dfs
 
 def apply_forced_scale_patch_to_all_timeframes(ticker: str, patch_date: str, multiplier: float, is_jp: bool = True) -> dict:
     """特定の日付以前の価格に一括パッチ適用。"""
