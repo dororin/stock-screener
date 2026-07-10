@@ -525,8 +525,8 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
     tickers = target_tickers if target_tickers else []
     
     def log(msg):
-        # 🚀 Streamlitの Console (標準出力) 側へ即時に吐き出す
-        print(f"[CONSOLE_DEBUG] [UPDATE_RAW] {msg}")
+        # メモリ使用量を常にプレフィックスに付与してコンソール出力
+        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [UPDATE_RAW] {msg}")
         sys.stdout.flush()
         if status_callback: 
             try:
@@ -545,7 +545,7 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
     suffix = ".T" if is_jp else ""
     tickers = [sanitize_ticker(t, is_jp) for t in tickers]
 
-    print(f"[CONSOLE_DEBUG] [UPDATE_RAW] 全体処理対象の銘柄数: {len(tickers)}")
+    print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [UPDATE_RAW] 全体処理対象の銘柄数: {len(tickers)}")
     sys.stdout.flush()
 
     for interval in settings.TIMEFRAMES:
@@ -611,7 +611,7 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
             t_key = pd.to_datetime(t_last) if t_last is not None else None
             groups.setdefault(t_key, []).append(t)
 
-        print(f"[CONSOLE_DEBUG] [UPDATE_RAW] グループ数: {len(groups)}")
+        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [UPDATE_RAW] グループ数: {len(groups)}")
         sys.stdout.flush()
 
         all_downloaded = []
@@ -651,12 +651,11 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                 chunk = chunk_tickers[i:i+BATCH_SIZE]
                 symbols = [f"{t}{suffix}" for t in chunk]
                 
-                # 🚀 ダウンロード開始前のコンソールデバッグ
-                print(f"[CONSOLE_DEBUG] [START] BATCH {i//BATCH_SIZE + 1} for Group {group_idx+1}. (Interval: {interval}, Tickers: {chunk[:5]}...)")
+                print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [START] BATCH {i//BATCH_SIZE + 1} for Group {group_idx+1}. (Interval: {interval})")
                 sys.stdout.flush()
                 
                 try:
-                    print(f"[CONSOLE_DEBUG] [API_CALL] Calling yf.download with symbols, start_date={start_date_str}")
+                    print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [API_CALL] Requesting symbols: {chunk[:5]}...")
                     sys.stdout.flush()
                     
                     df_raw = yf.download(
@@ -670,25 +669,25 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                         timeout=30
                     )
                     
-                    print(f"[CONSOLE_DEBUG] [API_SUCCESS] df_raw shape: {df_raw.shape if not df_raw.empty else 'EMPTY'}")
+                    print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [API_SUCCESS] df_raw shape: {df_raw.shape if not df_raw.empty else 'EMPTY'}")
                     sys.stdout.flush()
                     
                     if not df_raw.empty:
-                        print(f"[CONSOLE_DEBUG] [PARSE] Parsing dataframe for {len(chunk)} tickers...")
+                        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [PARSE] Parsing dataframe for {len(chunk)} tickers...")
                         sys.stdout.flush()
                         
                         chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
                         
-                        print(f"[CONSOLE_DEBUG] [PARSE_SUCCESS] Processed rows: {len(chunk_processed)}")
+                        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [PARSE_SUCCESS] Processed rows: {len(chunk_processed)}")
                         sys.stdout.flush()
                         
                         if not chunk_processed.empty:
                             all_downloaded.append(chunk_processed)
                     else:
-                        print(f"[CONSOLE_DEBUG] [API_WARNING] Returned DataFrame is EMPTY.")
+                        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [API_WARNING] Returned DataFrame is EMPTY.")
                         sys.stdout.flush()
                 except Exception as e:
-                    print(f"[CONSOLE_DEBUG] [BATCH_ERROR] Error during yf.download / parse: {e}")
+                    print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [BATCH_ERROR] Error: {e}")
                     import traceback
                     traceback.print_exc()
                     sys.stdout.flush()
@@ -1692,3 +1691,14 @@ def finalize_latest_with_tradingview_in_df(df: pd.DataFrame, interval: str, is_j
     except Exception as e:
         print(f"⚠️ [finalize_latest_with_tradingview_in_df] エラー: {e}")
         return df
+
+def get_current_memory_usage() -> str:
+    """現在のプロセスが物理的に使用しているメモリ量（RSS）をMB単位で返します。"""
+    try:
+        import os
+        import psutil
+        process = psutil.Process(os.getpid())
+        mem_bytes = process.memory_info().rss
+        return f"{mem_bytes / (1024 * 1024):.1f} MB"
+    except Exception:
+        return "取得不可"
