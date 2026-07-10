@@ -1694,6 +1694,20 @@ def finalize_latest_with_tradingview_in_df(df: pd.DataFrame, interval: str, is_j
 
 def get_current_memory_usage() -> str:
     """現在のプロセスが物理的に使用しているメモリ量（RSS）をMB単位で返します。"""
+    # ── 1. Linuxシステムファイルを最優先で直接読み込み (Streamlit Cloudなどの環境) ──
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    # 例: VmRSS:     13484 kB
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        kb = int(parts[1])
+                        return f"{kb / 1024:.1f} MB"
+    except Exception:
+        pass
+
+    # ── 2. psutil を予備として実行 (Windows/Mac などのローカル環境向け) ──
     try:
         import os
         import psutil
@@ -1701,4 +1715,6 @@ def get_current_memory_usage() -> str:
         mem_bytes = process.memory_info().rss
         return f"{mem_bytes / (1024 * 1024):.1f} MB"
     except Exception:
-        return "取得不可"
+        pass
+
+    return "取得不可"
