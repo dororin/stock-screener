@@ -200,8 +200,8 @@ def check_processed_data_health(old_df: pd.DataFrame, new_df: pd.DataFrame) -> l
 def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataFrame:
     """
     メモリ上で配信された株式分割情報（stock splits）に基づき、
-    実際の価格が未調整である場合（崖が残っている場合）のみ過去データを後方修正します。
-    マーカー（stock splits値）が存在しない急落に対する自動比率推測補正は行いません。
+    対象の過去データの split_multiplier が未調整 (1.0) である場合のみ過去データを後方修正し、
+    倍率をセルにマーク保存することで二重適用を防止します。
     """
     if df_ticker.empty or len(df_ticker) < 2:
         return df_ticker
@@ -209,12 +209,18 @@ def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataF
     df = df_ticker.sort_values("date").reset_index(drop=True)
     price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in df.columns]
     
+    # スキーマ初期化
+    if "split_multiplier" not in df.columns:
+        df["split_multiplier"] = 1.0
+    if "patched_multiplier" not in df.columns:
+        df["patched_multiplier"] = 1.0
+    
     if "stock splits" in df.columns:
         split_events = df[(df["stock splits"] > 0) & (df["stock splits"] != 1.0)]
         if not split_events.empty:
             for idx in sorted(split_events.index, reverse=True):
                 if idx == 0:
-                    continue  # 分割日の前日データ（idx-1）がない場合は比率判定ができないためスキップ
+                    continue  # 分割日の前日データ（idx-1）がない場合はスキップ
                 
                 split_val = df.loc[idx, "stock splits"]
                 if split_val <= 0:
@@ -229,21 +235,26 @@ def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataF
                 # 分割前日と当日の実際の価格比率を算出
                 actual_ratio = pre_close / post_close
                 
-                # 実際の価格落差が、配信された分割比率（split_val）に一定の許容範囲（15%以内）で近いかどうかを検証
-                # 比率が近ければ「崖が残っている（未調整）」とみなし、明示されたsplit_valを用いて後方補正を適用
-                if abs(actual_ratio - split_val) / split_val <= 0.15:
+                # 判定: 適用範囲（idx-1より過去）において、split_multiplierがまだ 1.0（未適用）の行のみをマスク
+                unadjusted_mask = (df.index < idx) & (df["split_multiplier"] == 1.0)
+                
+                if unadjusted_mask.any() and abs(actual_ratio - split_val) / split_val <= 0.15:
                     ratio = 1.0 / split_val
                     for col in price_cols:
-                        df.loc[:idx-1, col] = df.loc[:idx-1, col] * ratio
+                        df.loc[unadjusted_mask, col] = df.loc[unadjusted_mask, col] * ratio
                     if "volume" in df.columns:
-                        df.loc[:idx-1, "volume"] = df.loc[:idx-1, "volume"] / ratio
-                else:
-                    # すでに調整済み、または比率が合致しない場合は二重調整防止のため補正は行わない
-                    pass
+                        df.loc[unadjusted_mask, "volume"] = df.loc[unadjusted_mask, "volume"] / ratio
+                        
+                    # 二重処理を物理的に防ぐための調整倍率マークを保存
+                    df.loc[unadjusted_mask, "split_multiplier"] = ratio
 
     return df
 
 def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True) -> pd.DataFrame:
+    """
+    保存されたパッチ定義に基づき、対象データの patched_multiplier が未調整 (1.0) である行に対し、
+    機械的に一律で掛け算処理を行い、倍率をマークして二重処理を防止します。
+    """
     try:
         from data_access.sheets_api import load_repair_log_from_sheets
         log_df = load_repair_log_from_sheets()
@@ -255,6 +266,12 @@ def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True) -> pd.DataFr
 
     market_str = "JP" if is_jp else "US"
     df_result = df.copy()
+    
+    # スキーマ初期化
+    if "patched_multiplier" not in df_result.columns:
+        df_result["patched_multiplier"] = 1.0
+    if "split_multiplier" not in df_result.columns:
+        df_result["split_multiplier"] = 1.0
     
     log_df["parsed_date"] = pd.to_datetime(log_df["cliff_date"], errors="coerce")
     log_df = log_df.dropna(subset=["parsed_date"]).sort_values("parsed_date", ascending=False)
@@ -271,22 +288,25 @@ def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True) -> pd.DataFr
         except ValueError:
             continue
 
-        mask = df_result["ticker"] == ticker
-        if not mask.any():
+        ticker_mask = df_result["ticker"] == ticker
+        if not ticker_mask.any():
             continue
 
-        ticker_data = df_result[mask].copy()
-        if not check_anomaly_need_patch(ticker_data, cliff_date, multiplier):
-            continue
-
-        # cliff_date（ログ上の記録日付）は「要補正Closeの日時（t-1）」のため、この日を含めて（<=）適用する
-        pre_mask = (df_result["ticker"] == ticker) & (pd.to_datetime(df_result["date"]) <= cliff_date)
+        # 判定: patched_multiplier == 1.0 である行に対してのみ適用
+        df_result["date_dt"] = pd.to_datetime(df_result["date"])
+        pre_mask = ticker_mask & (df_result["date_dt"] <= cliff_date) & (df_result["patched_multiplier"] == 1.0)
+        
         if pre_mask.any():
             price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in df_result.columns]
             for col in price_cols:
                 df_result.loc[pre_mask, col] = df_result.loc[pre_mask, col] * multiplier
             if "volume" in df_result.columns:
                 df_result.loc[pre_mask, "volume"] = df_result.loc[pre_mask, "volume"] / multiplier
+            
+            # 倍率をマーク保存
+            df_result.loc[pre_mask, "patched_multiplier"] = multiplier
+        
+        df_result = df_result.drop(columns=["date_dt"])
 
     return df_result
 
@@ -320,9 +340,8 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
     return df_intra
 
 def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = False, skip_assertion: bool = False, status_callback=None) -> bool:
-    import gc  # ♻️ 内部で確実にインポート
-    import pandas as pd
-    
+    """yfinanceの生バッチ出力から統一されたActiveデータを作成し、マークカラムを追加後、
+    保存の直前にTradingViewスクリーナーによる最新アンカー確定（インジェクション）を適用します。"""
     def log(msg):
         print(msg)
         if status_callback: status_callback(msg)
@@ -334,74 +353,20 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         log("❌ Rawデータベースファイルが空、または検出されません。")
         return False
 
-    # 1. 権利確定フラグの計算
     df_raw["is_finalized"] = compute_is_finalized(df_raw["date"], interval, is_jp=is_jp)
 
-    # =========================================================================
-    # 🔬 [株式分割データの詳細スキャン ＆ デバッグログ出力]
-    # =========================================================================
-    split_tickers = []
-    has_splits_col = "stock splits" in df_raw.columns
-    
-    if has_splits_col:
-        # nanを排除し、0や1.0以外の有意な分割値（例: 2.0や3.0）があるレコードをスキャン
-        split_mask = (df_raw["stock splits"] > 0) & (df_raw["stock splits"] != 1.0) & (df_raw["stock splits"].notna())
-        if split_mask.any():
-            split_tickers = df_raw.loc[split_mask, "ticker"].unique().tolist()
+    # 管理用マークカラムを初期化して追加
+    if "split_multiplier" not in df_raw.columns:
+        df_raw["split_multiplier"] = 1.0
+    if "patched_multiplier" not in df_raw.columns:
+        df_raw["patched_multiplier"] = 1.0
 
-    # スキャン結果の詳細をコンソールとStreamlit上に明確に出力
-    log(f"  🔬 ----------------------------------------------------")
-    log(f"  🔬 [株式分割・大容量検証デバッグログ] 時間足: {interval}")
-    log(f"    * Rawデータ全体の行数: {len(df_raw):,} 行")
-    log(f"    * 'stock splits' カラムがDBに存在するか: {has_splits_col}")
-    
-    if has_splits_col:
-        valid_splits_cnt = df_raw["stock splits"].notna().sum()
-        active_splits_mask = (df_raw["stock splits"] > 0) & (df_raw["stock splits"] != 1.0) & (df_raw["stock splits"].notna())
-        active_splits_cnt = active_splits_mask.sum()
-        log(f"    * 'stock splits' カラムに値（NaN以外）が入っている行数: {valid_splits_cnt:,} 行")
-        log(f"    * 有意な分割イベント（0や1.0以外）が検出された行数: {active_splits_cnt:,} 行")
-    
-    log(f"    * 🔍 過去に実際に株式分割（崖調整）の対象となったユニーク銘柄数: {len(split_tickers)} 件 / 1,702銘柄中")
-    
-    if split_tickers:
-        log(f"    * 調整対象となった銘柄（先頭15件のみ）: {split_tickers[:15]}")
-        log(f"    * コピーを完全にスキップして素通しする銘柄数: {1702 - len(split_tickers)} 件")
-    else:
-        log(f"    * 📢 調整が必要な分割履歴はありません。全1,702銘柄を一切コピーせず素通しして保存処理へ流します。")
-    log(f"  🔬 ----------------------------------------------------")
+    processed_parts = []
+    for ticker, group in df_raw.groupby("ticker"):
+        adjusted_group = adjust_ticker_splits_backward_in_memory(group)
+        processed_parts.append(adjusted_group)
+    df_processed = pd.concat(processed_parts, ignore_index=True)
 
-    # =========================================================================
-    # ⚡ [メモリ超軽量化] 分割が発生した銘柄だけを切り出して処理
-    # =========================================================================
-    if split_tickers:
-        # 分割が発生した銘柄と、不要な銘柄を分離
-        df_splits = df_raw[df_raw["ticker"].isin(split_tickers)].copy()
-        df_no_splits = df_raw[~df_raw["ticker"].isin(split_tickers)].copy()
-        
-        processed_parts = []
-        for ticker, group in df_splits.groupby("ticker"):
-            adjusted_group = adjust_ticker_splits_backward_in_memory(group)
-            processed_parts.append(adjusted_group)
-            
-        df_processed_splits = pd.concat(processed_parts, ignore_index=True)
-        
-        # 結合
-        df_processed = pd.concat([df_no_splits, df_processed_splits], ignore_index=True)
-        
-        # 不要になった中間データを即時破棄してガベージコレクションを実行
-        del df_splits, df_no_splits, df_processed_splits, processed_parts
-        gc.collect()
-    else:
-        df_processed = df_raw.copy()
-
-    # 原本(df_raw)をメモリから削除
-    del df_raw
-    gc.collect()
-
-    # =========================================================================
-    # 以下、パッチ適用や保存などの通常処理
-    # =========================================================================
     if not skip_assertion:
         df_processed = apply_saved_patches_to_df(df_processed, is_jp=is_jp)
 
@@ -409,10 +374,12 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         try:
             df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False)
             df_processed = propagate_stop_allocation_bars_in_memory(df_1d_active, df_processed, is_jp=is_jp)
-            del df_1d_active
-            gc.collect()
         except Exception as e:
             log(f"⚠️ ストップ高安バーの自動移植はスキップされました: {e}")
+
+    # --- 【仕様変更】保存の直前に TradingViewスクリーナーによる最終値の確定（ハイブリッド）を適用 ---
+    if not dry_run:
+        df_processed = finalize_latest_with_tradingview_in_df(df_processed, interval, is_jp=is_jp)
 
     if not skip_assertion:
         try:
@@ -426,32 +393,28 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
             for alert in alerts:
                 log(f"   {alert}")
             if any("🚨" in a for a in alerts):
-                log("🛑 深刻なデータ不整合を検出したため、破損防止のため同期を強制中断しました。")
+                log("🛑 深刻なデータ不整合（ジャンプなど）を検出したため、破損防止のため同期を強制中断しました。")
                 return False
-            
-        del df_old_active
-        gc.collect()
+    else:
+        log("✨ [白紙構築] 新旧データの整合性比較、および過去パッチの干渉をスキップしてクリーン処理します。")
 
     if dry_run:
         log(f"🧪 [DRY RUN] {interval} 加工・アサーション検証を正常に通過。")
         if settings.HAS_STREAMLIT:
             import streamlit as st
             st.session_state[f"temp_verified_active_df_{interval}"] = df_processed
-            log(f"   💾 検証済みデータを一時メモリに格納しました。")
+            log(f"   💾 検証済みデータを一時メモリに格納しました。画面から「本番適用」できます。")
         return True
     else:
         df_processed = df_processed.sort_values(["ticker", "date"]).reset_index(drop=True)
         cloud_success, cloud_msg = save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False)
         
-        del df_processed
-        gc.collect()
-        
         if cloud_success:
             log(f"✅ [{interval}] ActiveデータベースをGoogleドライブへ正常に保存しました。")
         else:
-            log(f"⚠️ 【重要警告】[{interval}] Googleドライブへの同期に失敗しました。")
+            log(f"⚠️ 【重要警告】[{interval}] Googleドライブへの同期に失敗しました（一時的にローカルフォルダに保存）。")
+            log(f"   ❌ エラー詳細: {cloud_msg}")
         return True
-
 
 def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intra_active: pd.DataFrame, is_jp: bool = True) -> pd.DataFrame:
     import gc  # ♻️ 内部で確実にインポート
@@ -607,26 +570,16 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
     now = now_tz.replace(tzinfo=None)
     suffix = ".T" if is_jp else ""
     tickers = [sanitize_ticker(t, is_jp) for t in tickers]
-    
-    log(f"⚙️ [デバッグ] 同期対象銘柄数: {len(tickers)} 件 (例: {tickers[:10]}...)")
 
     for interval in settings.TIMEFRAMES:
         log(f"⏱️ 【{market_name}】{interval} Rawデータ差分収集開始...")
         try:
             df_raw_db = load_price_db(interval, is_jp=is_jp, is_raw=True)
-            log(f"  🔍 [デバッグ] ローカルRaw DB読み込み成功: {len(df_raw_db):,} 行")
         except FileNotFoundError:
             df_raw_db = pd.DataFrame()
-            log(f"  🔍 [デバッグ] ローカルRaw DBが見つかりません。新規作成します。")
 
         db_max_date = df_raw_db["date"].max() if not df_raw_db.empty else None
         if db_max_date is not None:
-            if interval != "1d":
-                limit_hour = 15 if is_jp else 16
-                limit_time = datetime.strptime(f"{limit_hour}:00:00", "%H:%M:%S").time()
-                if db_max_date.time() > limit_time:
-                    db_max_date = db_max_date.replace(hour=limit_hour, minute=0, second=0, microsecond=0)
-            
             bm_last_date = get_benchmark_latest_date(interval, is_jp=is_jp)
             log(f"  🔍 ベンチマーク最新: {bm_last_date} | Raw DB最新: {db_max_date}")
             if bm_last_date is not None:
@@ -637,19 +590,9 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
         last_updates_map = {}
         if not df_raw_db.empty:
             last_updates_map = df_raw_db.groupby("ticker")["date"].max().to_dict()
-            
-            # 🛡️ tickerカラムの型チェック情報をログ出力
-            if last_updates_map:
-                sample_key = list(last_updates_map.keys())[0]
-                log(f"  🔍 [デバッグ型チェック] DB内のticker型: {type(sample_key)} (例: '{sample_key}') | 対象リストのticker型: {type(tickers[0])} (例: '{tickers[0]}')")
-
-        # 照合件数を可視化
-        matched_tickers = [t for t in tickers if t in last_updates_map]
-        log(f"  🔍 [デバッグ] 同期対象 {len(tickers)} 件中、ローカルDBに合致した件数: {len(matched_tickers)} 件")
 
         active_timestamps = [pd.to_datetime(last_updates_map[t]) for t in tickers if t in last_updates_map]
         base_time = pd.Series(active_timestamps).mode()[0] if active_timestamps and not force_refetch else None
-        log(f"  🔍 [デバッグ] 算出されたベース基準日 (base_time): {base_time}")
 
         if interval == "1m": max_delay = timedelta(hours=4)
         elif interval == "5m": max_delay = timedelta(hours=12)
@@ -678,8 +621,6 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                 else:
                     group_C_tickers.append(t)
 
-        log(f"  📊 [デバッグ] グループ判定内訳: A (即時差分) = {len(group_A_tickers)} 件 | B (許容内遅延) = {len(group_B_tickers)} 件 | C (大幅遅延/新規) = {len(group_C_tickers)} 件")
-
         groups = {}
         if group_A_tickers:
             groups[base_time] = group_A_tickers
@@ -693,11 +634,6 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
             t_key = pd.to_datetime(t_last) if t_last is not None else None
             groups.setdefault(t_key, []).append(t)
 
-        # 取得計画の内訳を出力
-        for key_dt, chunk_list in groups.items():
-            key_str = key_dt.strftime("%Y-%m-%d %H:%M:%S") if key_dt is not None else "None (全期間新規取得 / 2016〜)"
-            log(f"  📥 [デバッグ] 取得スケジュール: 開始日={key_str} ➔ 対象={len(chunk_list)} 銘柄 (例: {chunk_list[:5]}...)")
-
         all_downloaded = []
         for t_last, chunk_tickers in groups.items():
             if t_last is None:
@@ -707,10 +643,12 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                 else: start_date_dt = datetime(2016, 1, 1)
                 start_date_str = start_date_dt.strftime("%Y-%m-%d")
             else:
-                start_date_dt = t_last
-                if interval != "1d" and (now - t_last).total_seconds() < 120:
-                    log(f"    ⏭️ [デバッグ] {interval} 最終取得から120秒未満のためダウンロードをスキップします。")
-                    continue
+                # 重複のないインクリメンタル追記を保証（MaxDate + 1日から開始）
+                if interval == "1d":
+                    start_date_dt = t_last + timedelta(days=1)
+                else:
+                    start_date_dt = t_last
+                
                 start_date_str = start_date_dt.strftime("%Y-%m-%d")
 
             if interval in YFINANCE_GAP_LIMITS:
@@ -731,15 +669,9 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                         continue
 
             BATCH_SIZE = 100
-            total_batches = (len(chunk_tickers) + BATCH_SIZE - 1) // BATCH_SIZE
-            log(f"  🚀 [デバッグ] 開始日 '{start_date_str}' からのダウンロードを開始します (全 {len(chunk_tickers)} 件, {total_batches} バッチ)...")
-
             for i in range(0, len(chunk_tickers), BATCH_SIZE):
                 chunk = chunk_tickers[i:i+BATCH_SIZE]
                 symbols = [f"{t}{suffix}" for t in chunk]
-                batch_num = (i // BATCH_SIZE) + 1
-                log(f"    📡 バッチ {batch_num}/{total_batches}: {len(chunk)} 銘柄ダウンロード中 (例: {chunk[:3]}...)")
-                
                 try:
                     df_raw = yf.download(
                         symbols, 
@@ -751,10 +683,7 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                         threads=True, 
                         timeout=30
                     )
-                    log(f"      📥 生データダウンロード完了: {df_raw.shape}")
-                    
                     chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
-                    log(f"      ✨ パース後レコード数: {len(chunk_processed):,} 行")
                     if not chunk_processed.empty:
                         all_downloaded.append(chunk_processed)
                 except Exception as e:
@@ -763,22 +692,50 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
 
         if all_downloaded:
             new_combined = pd.concat(all_downloaded, ignore_index=True)
-            log(f"  📊 [デバッグ] 今回新規追加されたデータの合計: {len(new_combined):,} 行")
-            if not df_raw_db.empty:
-                df_raw_db = pd.concat([df_raw_db, new_combined], ignore_index=True)
-                before_drop = len(df_raw_db)
-                df_raw_db = df_raw_db.drop_duplicates(subset=["date", "ticker"], keep="last")
-                after_drop = len(df_raw_db)
-                log(f"  🧹 [デバッグ] 重複排除前: {before_drop:,} 行 ➔ 重複排除後: {after_drop:,} 行 (重複による削除: {before_drop - after_drop:,} 行)")
-            else:
-                df_raw_db = new_combined
             
-            df_raw_db = df_raw_db.sort_values(["ticker", "date"]).reset_index(drop=True)
-            cloud_success, cloud_msg = save_price_db(df_raw_db, interval, is_jp=is_jp, is_raw=True)
-            if cloud_success:
-                log(f"  📥 Rawデータ差分保存完了。({len(new_combined):,}件追加)")
+            # --- 【仕様変更】確実なインクリメンタル追記用：MaxDateを超えるデータのみ抽出して厳密にマージ ---
+            filtered_parts = []
+            for ticker, group in new_combined.groupby("ticker"):
+                t_last = last_updates_map.get(ticker)
+                if t_last is not None:
+                    group = group[pd.to_datetime(group["date"]) > pd.to_datetime(t_last)]
+                filtered_parts.append(group)
+            
+            if filtered_parts:
+                new_combined = pd.concat(filtered_parts, ignore_index=True)
             else:
-                log(f"  ⚠️ [Raw保存警告] Googleドライブへの同期に失敗しました（ローカルのみ）。エラー: {cloud_msg}")
+                new_combined = pd.DataFrame()
+            
+            # --- 【仕様変更】日足（1d）分割イベント検知時の「日足のみフル再ダウンロード」 ---
+            if interval == "1d" and not new_combined.empty:
+                if "stock splits" in new_combined.columns:
+                    split_rows = new_combined[(new_combined["stock splits"] > 0) & (new_combined["stock splits"] != 1.0)]
+                    if not split_rows.empty:
+                        for st_ticker in split_rows["ticker"].unique():
+                            log(f"🔔 [株式分割検知] 銘柄 {st_ticker} に分割を検知しました。日足(1d)のみフル再ダウンロードを実行します。")
+                            rebuild_single_ticker_1d_raw(st_ticker, is_jp=is_jp)
+                            
+                        # フル引き直しを行ったので、現在の同期処理用にRawデータベースを再読込して結合用DFを更新
+                        try:
+                            df_raw_db = load_price_db(interval, is_jp=is_jp, is_raw=True)
+                        except FileNotFoundError:
+                            pass
+            
+            if not new_combined.empty:
+                if not df_raw_db.empty:
+                    df_raw_db = pd.concat([df_raw_db, new_combined], ignore_index=True)
+                    df_raw_db = df_raw_db.drop_duplicates(subset=["date", "ticker"], keep="last")
+                else:
+                    df_raw_db = new_combined
+                
+                df_raw_db = df_raw_db.sort_values(["ticker", "date"]).reset_index(drop=True)
+                cloud_success, cloud_msg = save_price_db(df_raw_db, interval, is_jp=is_jp, is_raw=True)
+                if cloud_success:
+                    log(f"  📥 Rawデータ差分保存完了。({len(new_combined):,}件追加)")
+                else:
+                    log(f"  ⚠️ [Raw保存警告] Googleドライブへの同期に失敗しました（ローカルのみ）。エラー: {cloud_msg}")
+            else:
+                log(f"  🧊 yfinanceからの新規差分データはありません。")
         else:
             log(f"  🧊 yfinanceからの差分データはありません。")
 
@@ -881,8 +838,8 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
 
 def apply_forced_scale_patch_to_all_timeframes(ticker: str, patch_date: str, multiplier: float, is_jp: bool = True) -> dict:
     """
-    patch_date は「要補正Closeの日時（崖前日, t-1）」を指定します。
-    この日を含めて（<=）過去のデータすべてに multiplier を一括適用します。
+    指定された日付以前の該当価格に multiplier を一括適用し、
+    対象の行の patched_multiplier カラムに倍率をマーク保存して上書き保存します。
     """
     if multiplier <= 0:
         return {"error": f"処理を中断しました。倍率に 0 以下の数値（{multiplier}）は指定できません。"}
@@ -910,16 +867,15 @@ def apply_forced_scale_patch_to_all_timeframes(ticker: str, patch_date: str, mul
             results[interval] = "対象データなし"
             continue
 
-        need_apply = check_anomaly_need_patch(ticker_data, patch_date, multiplier)
-        if not need_apply:
-            results[interval] = "スキップ（既に調整済み、または適用不要な落差です）"
-            continue
+        if "patched_multiplier" not in ticker_data.columns:
+            ticker_data["patched_multiplier"] = 1.0
 
-        ticker_data["date"] = pd.to_datetime(ticker_data["date"])
-        pre_mask = ticker_data["date"] <= target_dt
+        # 判定: patched_multiplier が未調整 (1.0) である行のみに適用
+        ticker_data["date_dt"] = pd.to_datetime(ticker_data["date"])
+        pre_mask = (ticker_data["date_dt"] <= target_dt) & (ticker_data["patched_multiplier"] == 1.0)
         
         if not pre_mask.any():
-            results[interval] = "対象期間（崖日より過去）のデータなし"
+            results[interval] = "スキップ（既に調整済み、または対象期間のデータなし）"
             continue
 
         price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in db_df.columns]
@@ -928,13 +884,11 @@ def apply_forced_scale_patch_to_all_timeframes(ticker: str, patch_date: str, mul
         if "volume" in db_df.columns:
             ticker_data.loc[pre_mask, "volume"] = ticker_data.loc[pre_mask, "volume"] / multiplier
 
+        # 倍率をマーク保存
+        ticker_data.loc[pre_mask, "patched_multiplier"] = multiplier
+        ticker_data = ticker_data.drop(columns=["date_dt"])
+
         db_df = db_df[~mask]
-        if not db_df.empty:
-            if pd.api.types.is_datetime64_any_dtype(db_df["date"]):
-                ticker_data["date"] = pd.to_datetime(ticker_data["date"])
-            else:
-                ticker_data["date"] = ticker_data["date"].dt.strftime("%Y-%m-%d %H:%M:%S" if interval != "1d" else "%Y-%m-%d")
-        
         db_df = pd.concat([db_df, ticker_data], ignore_index=True)
         db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
         save_price_db(db_df, interval, is_jp=is_jp, is_raw=False)
@@ -1664,3 +1618,141 @@ def analyze_db_update_needs(is_jp: bool = True) -> dict:
             "missing_tickers": [],
             "error": str(e),
         }
+
+def rebuild_single_ticker_1d_raw(ticker: str, is_jp: bool = True):
+    """
+    株式分割を検知した特定の銘柄のみ、過去の1d Rawデータベースを完全に再ダウンロードして上書き構築します。
+    """
+    pure_ticker = sanitize_ticker(ticker, is_jp)
+    symbol = get_download_symbol(pure_ticker, is_jp)
+    start_date = "2016-01-01"
+    try:
+        df_new = yf.download(symbol, start=start_date, interval="1d", auto_adjust=False, actions=True, progress=False)
+        if not df_new.empty:
+            parsed = parse_yfinance_batch(df_new, [pure_ticker], is_jp=is_jp)
+            if not parsed.empty:
+                try:
+                    raw_db = load_price_db("1d", is_jp=is_jp, is_raw=True)
+                except FileNotFoundError:
+                    raw_db = pd.DataFrame()
+                    
+                if not raw_db.empty:
+                    # 該当銘柄の古い1d Rawデータを消去
+                    raw_db = raw_db[raw_db["ticker"] != pure_ticker]
+                    
+                # フル引き直しした綺麗なRawデータを追加
+                raw_db = pd.concat([raw_db, parsed], ignore_index=True)
+                raw_db = raw_db.sort_values(["ticker", "date"]).reset_index(drop=True)
+                save_price_db(raw_db, "1d", is_jp=is_jp, is_raw=True)
+                print(f"✅ [rebuild_single_ticker_1d_raw] 銘柄 {pure_ticker} の 1d Raw データベースをフル再構築しました。")
+    except Exception as e:
+        print(f"❌ [rebuild_single_ticker_1d_raw] エラー: {e}")
+
+def finalize_latest_with_tradingview_in_df(df: pd.DataFrame, interval: str, is_jp: bool = True) -> pd.DataFrame:
+    """
+    TradingViewスクリーナーを用いて本日大引け（15:30）の確定値を一括取得し、
+    最新行のインジェクション（1d）および分足（60m/5m/1m）の最終バーに対する
+    大引け出来高・高安のクレンジング合成を自動実行します。
+    """
+    # 差分がない、または処理対象外の場合はそのまま返す
+    if df.empty:
+        return df
+        
+    try:
+        from tradingview_screener import Query
+        tickers = df["ticker"].unique().tolist()
+        if not tickers:
+            return df
+            
+        tv_symbols = []
+        symbol_to_ticker = {}
+        for t in tickers:
+            if is_jp:
+                tv_sym = f"TSE:{t}"
+            else:
+                clean_t = t.replace("-", ".")
+                us_exchanges = {
+                    "AAPL": "NASDAQ", "MSFT": "NASDAQ", "NVDA": "NASDAQ", "GOOGL": "NASDAQ", "META": "NASDAQ",
+                    "AMZN": "NASDAQ", "AMD": "NASDAQ", "AVGO": "NASDAQ", "QCOM": "NASDAQ", "MU": "NASDAQ",
+                    "INTC": "NASDAQ", "TSLA": "NASDAQ", "NFLX": "NASDAQ",
+                    "JPM": "NYSE", "BAC": "NYSE", "GS": "NYSE", "MS": "NYSE", "WFC": "NYSE",
+                    "BRK.B": "NYSE", "BRK-B": "NYSE", "JNJ": "NYSE", "UNH": "NYSE", "LLY": "NYSE",
+                    "ABBV": "NYSE", "MRK": "NYSE", "XOM": "NYSE", "CVX": "NYSE", "COP": "NYSE",
+                    "SLB": "NYSE", "EOG": "NYSE", "HD": "NYSE", "MCD": "NYSE", "NKE": "NYSE",
+                    "T": "NYSE", "VZ": "NYSE", "NEE": "NYSE", "DUK": "NYSE", "SO": "NYSE",
+                    "AEP": "NYSE", "D": "NYSE", "LIN": "NYSE", "APD": "NYSE", "FCX": "NYSE",
+                    "NEM": "NYSE", "DOW": "NYSE"
+                }
+                exc = us_exchanges.get(clean_t, "NASDAQ")
+                tv_sym = f"{exc}:{clean_t}"
+            tv_symbols.append(tv_sym)
+            symbol_to_ticker[tv_sym] = t
+            symbol_to_ticker[t.replace("-", ".")] = t
+
+        # TVから最新4本値と出来高を取得
+        total_rows, tv_df = Query().set_tickers(*tv_symbols).select('open', 'high', 'low', 'close', 'volume').get_scanner_data()
+        if tv_df.empty:
+            return df
+        
+        tv_data = {}
+        for idx, r in tv_df.iterrows():
+            ticker_key = symbol_to_ticker.get(idx)
+            if not ticker_key:
+                clean_idx = idx.split(":")[-1] if ":" in idx else idx
+                ticker_key = symbol_to_ticker.get(clean_idx)
+            if ticker_key:
+                tv_data[ticker_key] = {
+                    "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]),
+                    "close": float(r["close"]), "volume": float(r["volume"])
+                }
+
+        df = df.copy()
+        df["date_dt"] = pd.to_datetime(df["date"])
+        
+        # 本日（最新日）の日付のみ（時間部分をノーマライズして除外）を取得
+        latest_day = df["date_dt"].dt.normalize().max()
+        latest_day_mask = df["date_dt"].dt.normalize() == latest_day
+        
+        for ticker, data in tv_data.items():
+            ticker_today_mask = latest_day_mask & (df["ticker"] == ticker)
+            if not ticker_today_mask.any():
+                continue
+                
+            if interval == "1d":
+                # 1dはTV確定値で上書き確定
+                df.loc[ticker_today_mask, "open"] = data["open"]
+                df.loc[ticker_today_mask, "high"] = data["high"]
+                df.loc[ticker_today_mask, "low"] = data["low"]
+                df.loc[ticker_today_mask, "close"] = data["close"]
+                df.loc[ticker_today_mask, "volume"] = data["volume"]
+                if "adj close" in df.columns:
+                    df.loc[ticker_today_mask, "adj close"] = data["close"]
+                    
+            else:
+                # 分足（60m, 5m, 1m 全対応）：その日の該当銘柄の「最後の1本」の行を自動特定
+                ticker_today_rows = df[ticker_today_mask]
+                max_timestamp = ticker_today_rows["date_dt"].max()
+                
+                last_bar_mask = ticker_today_mask & (df["date_dt"] == max_timestamp)
+                previous_bars_mask = ticker_today_mask & (df["date_dt"] < max_timestamp)
+                
+                # Volume = TV1d Volume - sum(その日の過去の全バーのVolume)
+                previous_vol_sum = df.loc[previous_bars_mask, "volume"].sum()
+                calculated_vol = max(0.0, data["volume"] - previous_vol_sum)
+                
+                existing_high = df.loc[last_bar_mask, "high"].values[0] if not df.loc[last_bar_mask, "high"].empty else data["high"]
+                existing_low = df.loc[last_bar_mask, "low"].values[0] if not df.loc[last_bar_mask, "low"].empty else data["low"]
+                
+                # クレンジング適用（Openは維持）
+                df.loc[last_bar_mask, "close"] = data["close"]
+                df.loc[last_bar_mask, "high"] = max(existing_high, data["close"])
+                df.loc[last_bar_mask, "low"] = min(existing_low, data["close"])
+                df.loc[last_bar_mask, "volume"] = calculated_vol
+                if "adj close" in df.columns:
+                    df.loc[last_bar_mask, "adj close"] = data["close"]
+
+        df = df.drop(columns=["date_dt"])
+        return df
+    except Exception as e:
+        print(f"⚠️ [finalize_latest_with_tradingview_in_df] エラー: {e}")
+        return df

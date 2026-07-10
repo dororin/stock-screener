@@ -4,7 +4,7 @@ import json
 import requests
 import pandas as pd
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from config import settings
 from data_access.sheets_api import load_extra_tickers_from_sheets
 import io
@@ -367,7 +367,8 @@ def load_tickers_from_file(file_path: str) -> list:
 # core/collector.py より修正
 
 def parse_yfinance_batch(df_raw: pd.DataFrame, chunk_tickers: list, is_jp: bool = True) -> pd.DataFrame:
-    """yfinanceの生バッチ出力（MultiIndex対応含む）を統一されたDataFrame形式にパースします。"""
+    """yfinanceの生バッチ出力（MultiIndex対応含む）を統一されたDataFrame形式にパースし、
+    仕様に準拠した取引時間内のデータのみを厳密にフィルタリングします。"""
     if df_raw.empty:
         return pd.DataFrame()
     all_rows = []
@@ -390,10 +391,22 @@ def parse_yfinance_batch(df_raw: pd.DataFrame, chunk_tickers: list, is_jp: bool 
             # --- 数値キャストおよび異常値のクレンジング処理 ---
             for col in numeric_cols:
                 if col in t_df.columns:
-                    # errors='coerce' で非数値や不適切な文字列をすべて NaN にキャスト
                     t_df[col] = pd.to_numeric(t_df[col], errors='coerce')
-                    # 実数値の inf, -inf も nan に置換して保存時の PyArrow エラーを防止
                     t_df[col] = t_df[col].replace([float('inf'), float('-inf')], float('nan'))
+            
+            # --- 【仕様変更】取引時間外の単純フィルター処理 ---
+            if "date" in t_df.columns:
+                times = t_df["date"].dt.time
+                start_time = dt_time(9, 0)
+                end_time = dt_time(15, 30) if is_jp else dt_time(16, 0)
+                if not is_jp:
+                    start_time = dt_time(9, 30)
+                
+                # 日足（1d）以外の場合に取引時間外をカット
+                # 判定のため、1日の最初の足が00:00:00でないかどうかで簡易判別
+                is_intraday = not (times == dt_time(0, 0)).all()
+                if is_intraday:
+                    t_df = t_df[(times >= start_time) & (times <= end_time)]
             
             target_cols = ["date", "ticker", "open", "high", "low", "close", "adj close", "volume", "stock splits", "dividends"]
             valid_cols = [c for c in target_cols if c in t_df.columns]
@@ -427,10 +440,20 @@ def parse_yfinance_batch(df_raw: pd.DataFrame, chunk_tickers: list, is_jp: bool 
             # --- 数値キャストおよび異常値のクレンジング処理 ---
             for col in numeric_cols:
                 if col in t_df.columns:
-                    # errors='coerce' で非数値や不適切な文字列をすべて NaN にキャスト
                     t_df[col] = pd.to_numeric(t_df[col], errors='coerce')
-                    # 実数値の inf, -inf も nan に置換して保存時の PyArrow エラーを防止
                     t_df[col] = t_df[col].replace([float('inf'), float('-inf')], float('nan'))
+            
+            # --- 【仕様変更】取引時間外の単純フィルター処理 ---
+            if "date" in t_df.columns:
+                times = t_df["date"].dt.time
+                start_time = dt_time(9, 0)
+                end_time = dt_time(15, 30) if is_jp else dt_time(16, 0)
+                if not is_jp:
+                    start_time = dt_time(9, 30)
+                
+                is_intraday = not (times == dt_time(0, 0)).all()
+                if is_intraday:
+                    t_df = t_df[(times >= start_time) & (times <= end_time)]
             
             target_cols = ["date", "ticker", "open", "high", "low", "close", "adj close", "volume", "stock splits", "dividends"]
             valid_cols = [c for c in target_cols if c in t_df.columns]

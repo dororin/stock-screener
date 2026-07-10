@@ -14,6 +14,7 @@ gspread
 google-api-python-client
 pandas-datareader
 pyarrow
+tradingview-screener
 fastparquet
 streamlit-lightweight-charts
 websocket-client
