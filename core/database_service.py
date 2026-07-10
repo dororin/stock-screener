@@ -338,8 +338,7 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
 def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = False, skip_assertion: bool = False, status_callback=None) -> bool:
     """RawデータからActiveデータの加工ビルドとアサーション検証。"""
     def log(msg):
-        # 🚀 Streamlitの Console (標準出力) 側へ即時に吐き出す
-        print(f"[CONSOLE_DEBUG] [REBUILD_ACTIVE] {msg}")
+        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] {msg}")
         sys.stdout.flush()
         if status_callback: 
             try:
@@ -354,7 +353,7 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         log("❌ Rawデータベースファイルが空、または検出されません。")
         return False
 
-    print(f"[CONSOLE_DEBUG] Rawデータのロード完了。サイズ: {df_raw.shape}, ユニーク数: {df_raw['ticker'].nunique()}")
+    print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] Rawデータのロード完了。サイズ: {df_raw.shape}, ユニーク数: {df_raw['ticker'].nunique()}")
     sys.stdout.flush()
 
     df_raw["is_finalized"] = compute_is_finalized(df_raw["date"], interval, is_jp=is_jp)
@@ -368,38 +367,38 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
     unique_tickers = df_raw["ticker"].unique()
     total_tickers = len(unique_tickers)
     
-    print(f"[CONSOLE_DEBUG] 株式分割の過去遡及の計算を開始します (全 {total_tickers} 銘柄)")
+    print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] 株式分割の過去遡及の計算を開始 (全 {total_tickers} 銘柄)")
     sys.stdout.flush()
     
     for idx, (ticker, group) in enumerate(df_raw.groupby("ticker")):
         if idx % 50 == 0 or idx == total_tickers - 1:
-            print(f"[CONSOLE_DEBUG]   -> 処理進捗: {idx+1}/{total_tickers} ({ticker})")
+            print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE]   -> 処理進捗: {idx+1}/{total_tickers} ({ticker})")
             sys.stdout.flush()
         adjusted_group = adjust_ticker_splits_backward_in_memory(group)
         processed_parts.append(adjusted_group)
     df_processed = pd.concat(processed_parts, ignore_index=True)
 
-    print(f"[CONSOLE_DEBUG] 遡及修正計算完了。総行数: {len(df_processed)}")
+    print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] 遡及修正計算完了。総行数: {len(df_processed)}")
     sys.stdout.flush()
 
     if not skip_assertion:
-        print(f"[CONSOLE_DEBUG] パッチ定義を反映中...")
+        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] パッチ定義を反映中...")
         sys.stdout.flush()
         df_processed = apply_saved_patches_to_df(df_processed, is_jp=is_jp)
 
     if interval != "1d":
         try:
-            print(f"[CONSOLE_DEBUG] ストップ高安バーの補完を開始...")
+            print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] ストップ高安バーの補完を開始...")
             sys.stdout.flush()
             df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False)
             df_processed = propagate_stop_allocation_bars_in_memory(df_1d_active, df_processed, is_jp=is_jp)
         except Exception as e:
-            print(f"[CONSOLE_DEBUG] ストップ高安補完中に警告: {e}")
+            print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] ストップ高安補完中に警告: {e}")
             sys.stdout.flush()
             log(f"⚠️ ストップ高安バーの自動移植はスキップされました: {e}")
 
     if not dry_run:
-        print(f"[CONSOLE_DEBUG] 保存前にTradingView確定値をマージ適用中...")
+        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] 保存前にTradingView確定値をマージ適用中...")
         sys.stdout.flush()
         df_processed = finalize_latest_with_tradingview_in_df(df_processed, interval, is_jp=is_jp)
 
@@ -411,7 +410,7 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
 
         alerts = check_processed_data_health(df_old_active, df_processed)
         if alerts:
-            print(f"[CONSOLE_DEBUG] 🚨 整合性アラートを検出:")
+            print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] 🚨 整合性アラートを検出:")
             for a in alerts:
                 print(f"  {a}")
             sys.stdout.flush()
@@ -432,7 +431,7 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
             log(f"   💾 検証済みデータを一時メモリに格納しました。画面から「本番適用」できます。")
         return True
     else:
-        print(f"[CONSOLE_DEBUG] 加工済データのソート及び保存処理中...")
+        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] 加工済データのソート及び保存処理中...")
         sys.stdout.flush()
         df_processed = df_processed.sort_values(["ticker", "date"]).reset_index(drop=True)
         cloud_success, cloud_msg = save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False)
