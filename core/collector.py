@@ -125,7 +125,10 @@ def get_all_collection_tickers() -> list:
     """TOPIX500と追加ETF等のマージされたリストを取得します（重複排除）。"""
     topix = get_topix500_tickers()
     extra = get_extra_tickers()
-    return list(dict.fromkeys(topix + extra))
+    codes = list(dict.fromkeys(topix + extra))
+    
+    # 🧪 【検証用】一時的に上位30銘柄のみに制限してメモリと処理をテストします
+    return codes[:30]
 
 def sync_extra_tickers_to_local() -> tuple:
     """Google Sheetsから追加ティッカーを取得し、ローカルのJSONキャッシュと同期します。"""
