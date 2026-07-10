@@ -222,15 +222,20 @@ def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataF
 
     return df
 
-def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True) -> pd.DataFrame:
-    """保存されたパッチ定義を適用します。"""
-    try:
-        from data_access.sheets_api import load_repair_log_from_sheets
-        log_df = load_repair_log_from_sheets()
-    except Exception:
-        return df
+def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True, repair_log_df: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    保存されたパッチ定義を適用します。
+    API 503エラー防止のため、事前に取得した修復ログ(repair_log_df)をキャッシュ利用可能にしました。
+    """
+    log_df = repair_log_df
+    if log_df is None:
+        try:
+            from data_access.sheets_api import load_repair_log_from_sheets
+            log_df = load_repair_log_from_sheets()
+        except Exception:
+            return df
 
-    if log_df.empty:
+    if log_df is None or log_df.empty:
         return df
 
     market_str = "JP" if is_jp else "US"
@@ -290,7 +295,6 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
 
     stop_tickers = stop_days_df["ticker"].unique().tolist()
     
-    # ストップ高安検出対象の銘柄と、それ以外の銘柄に分割
     df_intra_target = df_intra_active[df_intra_active["ticker"].isin(stop_tickers)].copy()
     df_intra_safe = df_intra_active[~df_intra_active["ticker"].isin(stop_tickers)]
 
@@ -300,18 +304,14 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
     df_intra_target["date"] = pd.to_datetime(df_intra_target["date"])
     df_intra_target["day_normalize"] = df_intra_target["date"].dt.normalize()
     
-    # 照合用のタプルキー (ticker, date_normalized) をセット化して高速検索
     stop_days_df["date_norm"] = pd.to_datetime(stop_days_df["date"]).dt.normalize()
     stop_keys = set(zip(stop_days_df["ticker"], stop_days_df["date_norm"]))
     
-    # 削除対象となる分足データの行マスクを一括算出
     target_zip = zip(df_intra_target["ticker"], df_intra_target["day_normalize"])
     is_stop_bar = [pair in stop_keys for pair in target_zip]
     
-    # ストップ高安日以外の通常データを残す（一括抽出）
     df_cleaned = df_intra_target[~pd.Series(is_stop_bar, index=df_intra_target.index)].copy()
     
-    # 新しい合成バーを一挙にビルドしてプール
     schema_cols = df_intra_active.columns.tolist()
     new_rows = []
     
@@ -319,7 +319,6 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
         ticker = row["ticker"]
         day_date = row["date_norm"]
         
-        # 該当銘柄が保有するデータ日付範囲に収まっているかを確認
         ticker_data = df_intra_target[df_intra_target["ticker"] == ticker]
         if ticker_data.empty:
             continue
@@ -345,14 +344,13 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
 
     df_result = pd.concat([df_intra_safe, df_result_target], ignore_index=True)
     
-    # 不要なメモリを即時解放
     del df_intra_target, df_intra_safe, df_cleaned, new_rows
     gc.collect()
     
     return df_result
 
-def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = False, skip_assertion: bool = False, status_callback=None) -> bool:
-    """RawデータからActiveデータの加工ビルドとアサーション検証。"""
+def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = False, skip_assertion: bool = False, status_callback=None, log_accumulator: list = None, repair_log_df: pd.DataFrame = None) -> bool:
+    """RawデータからActiveデータの加工ビルドとアサーション検証（Dry Run時の一時ファイル保存・プレビュー制限対応）。"""
     import gc
     import sys
     import pandas as pd
@@ -360,6 +358,13 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
     def log(msg):
         print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] {msg}")
         sys.stdout.flush()
+        if log_accumulator is not None:
+            log_accumulator.append(f"[{datetime.now().strftime('%H:%M:%S')}] [REBUILD_{interval}] {msg}")
+        if settings.HAS_STREAMLIT:
+            import streamlit as st
+            if "sync_logs_history" not in st.session_state:
+                st.session_state["sync_logs_history"] = []
+            st.session_state["sync_logs_history"].append(f"[{datetime.now().strftime('%H:%M:%S')}] [REBUILD_{interval}] {msg}")
         if status_callback: 
             try:
                 status_callback(msg)
@@ -377,13 +382,11 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
 
     df_raw["is_finalized"] = compute_is_finalized(df_raw["date"], interval, is_jp=is_jp)
 
-    # 管理用マーク列の初期化
     if "split_multiplier" not in df_raw.columns:
         df_raw["split_multiplier"] = 1.0
     if "patched_multiplier" not in df_raw.columns:
         df_raw["patched_multiplier"] = 1.0
 
-    # ── 🚀 【完全インプレース化】株式分割遡及修正の劇的軽量化 ──
     split_tickers = []
     if "stock splits" in df_raw.columns:
         split_tickers = df_raw[(df_raw["stock splits"] > 0) & (df_raw["stock splits"] != 1.0)]["ticker"].unique().tolist()
@@ -409,7 +412,7 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
                 valid_cols = [c for c in cols_to_write if c in df_raw.columns and c in adjusted_group.columns]
                 df_raw.loc[adjusted_group.index, valid_cols] = adjusted_group[valid_cols]
             
-            if idx % 50 == 0 or idx == total_split_tickers - 1:
+            if idx % 100 == 0 or idx == total_split_tickers - 1:
                 print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE]   -> インプレース分割処理進捗: {idx+1}/{total_split_tickers} ({ticker})")
                 sys.stdout.flush()
                 
@@ -424,13 +427,14 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
     if not skip_assertion:
         print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] パッチ定義を反映中...")
         sys.stdout.flush()
-        df_processed = apply_saved_patches_to_df(df_processed, is_jp=is_jp)
+        df_processed = apply_saved_patches_to_df(df_processed, is_jp=is_jp, repair_log_df=repair_log_df)
 
     if interval != "1d":
         try:
             print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] ストップ高安バーの補完を開始...")
             sys.stdout.flush()
-            df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False)
+            # 🚀 【二重ロードを完全回避】：Dry Run時は退避先ローカル一時ファイルから直接1dデータを展開
+            df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False, is_temp=dry_run)
             df_processed = propagate_stop_allocation_bars_in_memory(df_1d_active, df_processed, is_jp=is_jp)
             del df_1d_active
             gc.collect()
@@ -468,11 +472,25 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         log("✨ [白紙構築] 新旧データの整合性比較、および過去パッチの干渉をスキップしてクリーン処理します。")
 
     if dry_run:
-        log(f"🧪 [DRY RUN] {interval} 加工・アサーション検証を正常に通過。")
+        log(f"🧪 [DRY RUN] {interval} 加工・アサーション検証を正常に通過。ディスク（_temp.parquet）に一時保存します...")
+        df_processed = df_processed.sort_values(["ticker", "date"]).reset_index(drop=True)
+        
+        # 巨大DFはメモリから直ちに退避（Googleドライブ同期はスキップ）
+        local_success, local_msg = save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False, is_temp=True)
+        
+        if local_success:
+            log(f"💾 一時ファイルをローカルに保存しました。メモリから完全解放します。")
+        else:
+            log(f"⚠️ 一時保存に失敗しました（本番適用時に動作しない可能性があります）: {local_msg}")
+            
         if settings.HAS_STREAMLIT:
             import streamlit as st
-            st.session_state[f"temp_verified_active_df_{interval}"] = df_processed
-            log(f"   💾 検証済みデータを一時メモリに格納しました。画面から「本番適用」できます。")
+            # メモリ上には確認画面プレビュー用の先頭100行と、一時ファイルが存在する目印フラグだけを保管
+            st.session_state[f"temp_verified_active_preview_{interval}"] = df_processed.head(100)
+            st.session_state[f"temp_verified_active_exists_{interval}"] = True
+            
+        del df_processed
+        gc.collect()
         return True
     else:
         print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] 加工済データのソート及び保存処理中...")
@@ -480,7 +498,6 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         df_processed = df_processed.sort_values(["ticker", "date"]).reset_index(drop=True)
         cloud_success, cloud_msg = save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False)
         
-        # 保存完了後にメモリをクリア
         del df_processed
         gc.collect()
         
@@ -492,88 +509,24 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         return True
 
 # =====================================================================
-# 🧪 開発検証: 手動パッチのメモリ上適用シミュレーション
-# =====================================================================
-
-def test_forced_scale_patch_in_memory(ticker: str, patch_date_str: str, multiplier: float, is_jp: bool = True) -> tuple:
-    """手動パッチのメモリ上シミュレーション。"""
-    pure_ticker = sanitize_ticker(ticker, is_jp)
-    results = {}
-    st_temp_dfs = {}
-    
-    try:
-        target_dt = pd.to_datetime(patch_date_str)
-    except Exception as e:
-        return {"error": f"要補正Close日時のパース失敗: {e}"}, {}
-
-    for interval in ["1d", "60m", "5m", "1m"]:
-        try:
-            db_df = load_price_db(interval, is_jp=is_jp, is_raw=False)
-        except FileNotFoundError:
-            results[interval] = "DBなし"
-            continue
-        if db_df.empty:
-            results[interval] = "データ空"
-            continue
-
-        mask = db_df["ticker"] == pure_ticker
-        ticker_data = db_df[mask].copy()
-        if ticker_data.empty:
-            results[interval] = "対象データなし"
-            continue
-
-        need_apply = check_anomaly_need_patch(ticker_data, patch_date_str, multiplier)
-        if not need_apply:
-            results[interval] = "適用不要（既に調整済み、または落差がありません）"
-            continue
-
-        ticker_data["date"] = pd.to_datetime(ticker_data["date"])
-        pre_mask = ticker_data["date"] <= target_dt
-        if not pre_mask.any():
-            results[interval] = "対象期間（崖日より過去）のデータなし"
-            continue
-
-        price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in db_df.columns]
-        sample_before = ticker_data[pre_mask].tail(3).copy()
-        
-        for col in price_cols:
-            ticker_data.loc[pre_mask, col] = ticker_data.loc[pre_mask, col] * multiplier
-        if "volume" in db_df.columns:
-            ticker_data.loc[pre_mask, "volume"] = ticker_data.loc[pre_mask, "volume"] / multiplier
-
-        sample_after = ticker_data[pre_mask].tail(3).copy()
-        db_df_new = db_df[~mask].copy()
-        
-        if not db_df_new.empty:
-            if pd.api.types.is_datetime64_any_dtype(db_df_new["date"]):
-                ticker_data["date"] = pd.to_datetime(ticker_data["date"])
-            else:
-                ticker_data["date"] = ticker_data["date"].dt.strftime("%Y-%m-%d %H:%M:%S" if interval != "1d" else "%Y-%m-%d")
-        
-        db_df_new = pd.concat([db_df_new, ticker_data], ignore_index=True)
-        db_df_new = db_df_new.sort_values(["ticker", "date"]).reset_index(drop=True)
-        
-        st_temp_dfs[interval] = db_df_new
-        results[interval] = {
-            "applied_count": pre_mask.sum(),
-            "before_sample": sample_before,
-            "after_sample": sample_after
-        }
-        
-    return results, st_temp_dfs
-
-# =====================================================================
 # 📥 Rawデータ更新 ＆ 統合同期システム
 # =====================================================================
 
-def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None, target_interval: str = None):
-    """yfinanceからのRawデータ差分取得（特定時間足ターゲット指定対応）。"""
+def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None, target_interval: str = None, log_accumulator: list = None):
+    """yfinanceからのRawデータ差分取得（特定時間足ターゲット指定およびログ蓄積対応）。"""
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
     
     def log(msg):
         print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [UPDATE_RAW] {msg}")
         sys.stdout.flush()
+        if log_accumulator is not None:
+            log_accumulator.append(f"[{datetime.now().strftime('%H:%M:%S')}] [UPDATE_RAW_{interval}] {msg}")
+        if settings.HAS_STREAMLIT:
+            import streamlit as st
+            if "sync_logs_history" not in st.session_state:
+                st.session_state["sync_logs_history"] = []
+            st.session_state["sync_logs_history"].append(f"[{datetime.now().strftime('%H:%M:%S')}] [UPDATE_RAW_{interval}] {msg}")
         if status_callback: 
             try:
                 status_callback(msg)
@@ -594,7 +547,6 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
     print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [UPDATE_RAW] 全体処理対象の銘柄数: {len(tickers)}")
     sys.stdout.flush()
 
-    # target_intervalの指定があればその足のみ、なければ全時間足をループ
     timeframes_to_run = [target_interval] if target_interval else settings.TIMEFRAMES
 
     for interval in timeframes_to_run:
@@ -789,42 +741,135 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
             log(f"  🧊 yfinanceからの差分データはありません。")
 
 def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None, dry_run: bool = False):
-    """時間足自己完結型の最適化データベース更新フロー。"""
+    """時間足自己完結型＆APIレート制御キャッシュ版 データベース更新プロセス。"""
     import gc
+    from data_access.sheets_api import upload_sync_log_to_drive
+    
+    # セッション内の前回のログ履歴をクリア
+    if settings.HAS_STREAMLIT:
+        import streamlit as st
+        st.session_state["sync_logs_history"] = []
+        
+    accumulated_logs = []
+    
     def log(msg):
         print(f"[CONSOLE_DEBUG] [UPDATE_PROCESS] {msg}")
         sys.stdout.flush()
+        accumulated_logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] [PROCESS] {msg}")
+        if settings.HAS_STREAMLIT:
+            if "sync_logs_history" not in st.session_state:
+                st.session_state["sync_logs_history"] = []
+            st.session_state["sync_logs_history"].append(f"[{datetime.now().strftime('%H:%M:%S')}] [PROCESS] {msg}")
         if status_callback: 
             status_callback(msg)
 
-    # 🚀 段階1: すべての時間足の依存基盤となる「1d (日足)」のロードと構築を最優先で完結させる
-    log("📡 1. 【日足 (1d)】のRawデータ差分取得を開始します...")
-    update_raw_database(is_jp=is_jp, target_tickers=target_tickers, force_refetch=force_refetch, status_callback=status_callback, target_interval="1d")
+    log("📡 1. 【パッチ定義】の事前ロード（キャッシュ化）を開始します...")
+    try:
+        from data_access.sheets_api import load_repair_log_from_sheets
+        repair_log_df = load_repair_log_from_sheets()
+        log("   ✅ スプレッドシートからパッチ定義の事前取得に成功しました。503エラーを防止するためにメモリ共有します。")
+    except Exception as e:
+        repair_log_df = None
+        log(f"   ⚠️ パッチの事前ロードに失敗しました。各足で個別ダウンロードを行います: {e}")
 
-    log("🛠️ 2. 【日足 (1d)】のActiveデータベース加工・検証ビルドを実行します...")
-    rebuild_active_from_raw("1d", is_jp=is_jp, dry_run=dry_run, skip_assertion=False, status_callback=status_callback)
+    # 🚀 【1d足】差分取得とActiveビルドを最優先で確定させる
+    log("📡 2. 【日足 (1d)】のRawデータ差分取得を開始します...")
+    update_raw_database(is_jp=is_jp, target_tickers=target_tickers, force_refetch=force_refetch, status_callback=status_callback, target_interval="1d", log_accumulator=accumulated_logs)
+
+    log("🛠️ 3. 【日足 (1d)】のActiveデータベース加工・検証ビルドを実行します...")
+    rebuild_active_from_raw("1d", is_jp=is_jp, dry_run=dry_run, skip_assertion=False, status_callback=status_callback, log_accumulator=accumulated_logs, repair_log_df=repair_log_df)
     
-    # 1d足の巨大な加工中一時データをメモリから完全にクリーンアップ
     gc.collect()
 
-    # 🚀 段階2: 完了した1dのActiveを参照し、残りの分足を1つずつ「取得➔ビルド➔保存➔破棄」で自己完結させる
+    # 🚀 【分足】1つずつ「取得➔ビルド➔保存➔メモリ完全破棄」で完結させ、同時データ居座りをゼロにする
     intraday_timeframes = [tf for tf in settings.TIMEFRAMES if tf != "1d"]
-    log(f"📡 3. 以下の分足データに関して、個別独立のロード＆ビルド処理を開始します: {intraday_timeframes}")
+    log(f"📡 4. 以下の分足データに関して、完全自己完結ロード＆ビルド処理を開始します: {intraday_timeframes}")
 
     for interval in intraday_timeframes:
         log(f"⏱️ 【{interval}】の個別同期プロセスを開始します...")
         
         # Raw差分取得
-        update_raw_database(is_jp=is_jp, target_tickers=target_tickers, force_refetch=force_refetch, status_callback=status_callback, target_interval=interval)
+        update_raw_database(is_jp=is_jp, target_tickers=target_tickers, force_refetch=force_refetch, status_callback=status_callback, target_interval=interval, log_accumulator=accumulated_logs)
         
-        # Active検証ビルド
-        rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, skip_assertion=False, status_callback=status_callback)
+        # Active検証ビルド（キャッシュした修復ログと、ローカル退避済みの1d_tempデータを参照）
+        rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, skip_assertion=False, status_callback=status_callback, log_accumulator=accumulated_logs, repair_log_df=repair_log_df)
         
-        # 当該時間足のすべての巨大オブジェクトを削除・GC強制実行
         gc.collect()
-        log(f"✅ 【{interval}】の処理が安全に終了し、メモリ領域をクリアしました。")
+        log(f"✅ 【{interval}】の個別同期とビルドを安全に終了し、メモリをクリアしました。")
 
-    log("✨ 全ての時間足に対する個別同期・検証ビルドプロセスが正常に完了しました。")
+    log("✨ 全ての時間足に対するデータベース更新プロセスが正常に完了しました。")
+    
+    # 📝 Googleドライブの logs フォルダに累積詳細ログをバッチアップロード保存
+    try:
+        log("📤 蓄積された詳細実行ログをGoogleドライブへアップロード保存しています...")
+        prefix = "sync_dryrun" if dry_run else "sync"
+        log_filename = upload_sync_log_to_drive(accumulated_logs, is_jp=is_jp, prefix=prefix)
+        if log_filename:
+            log(f"💾 ログファイル '{log_filename}' をGoogleドライブに保存しました。")
+        else:
+            log("⚠️ ログの自動アップロードがスキップ、または失敗しました。")
+    except Exception as e:
+        log(f"⚠️ ログファイルの自動転送中に例外エラーが発生しました: {e}")
+
+def execute_apply_verified_temp_dbs_to_active(is_jp: bool = True, status_callback=None) -> dict:
+    """
+    Dry Runで検証完了し、ローカル作業フォルダに一時保存されている Parquet ファイル（_temp）を、
+    Activeデータベースとして本番確定（Google Driveへ一括アップロード）します（一瞬で完了します）。
+    """
+    import gc
+    from data_access.local_db import promote_temp_db_to_active
+    from data_access.sheets_api import upload_sync_log_to_drive
+    
+    accumulated_logs = []
+    
+    def log(msg):
+        print(f"[CONSOLE_DEBUG] [APPLY_ACTIVE] {msg}")
+        sys.stdout.flush()
+        accumulated_logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] [APPLY] {msg}")
+        if settings.HAS_STREAMLIT:
+            import streamlit as st
+            if "sync_logs_history" not in st.session_state:
+                st.session_state["sync_logs_history"] = []
+            st.session_state["sync_logs_history"].append(f"[{datetime.now().strftime('%H:%M:%S')}] [APPLY] {msg}")
+        if status_callback:
+            try:
+                status_callback(msg)
+            except Exception:
+                pass
+                
+    log("🚀 [本番適用] ローカルに退避している検証済み一時ファイルを、Googleドライブへ一括で確定アップロードします...")
+    
+    results = {}
+    success_count = 0
+    
+    for interval in settings.TIMEFRAMES:
+        log(f"📦 [{interval}] 一時ファイルの本番確定処理中...")
+        success, msg = promote_temp_db_to_active(interval, is_jp=is_jp)
+        results[interval] = {"success": success, "message": msg}
+        
+        if success:
+            success_count += 1
+            log(f"   ✅ [{interval}] の本番確定が正常に完了しました。")
+            if settings.HAS_STREAMLIT:
+                import streamlit as st
+                # UI表示用のプレビューフラグやサンプル100行をクリーンアップ
+                if f"temp_verified_active_exists_{interval}" in st.session_state:
+                    st.session_state[f"temp_verified_active_exists_{interval}"] = False
+                if f"temp_verified_active_preview_{interval}" in st.session_state:
+                    del st.session_state[f"temp_verified_active_preview_{interval}"]
+        else:
+            log(f"   ❌ [{interval}] の本番確定に失敗しました: {msg}")
+            
+    gc.collect()
+    log(f"✨ 本番確定同期が終了しました。成功: {success_count} / {len(settings.TIMEFRAMES)}")
+    
+    # 本番適用の実行ログもGoogleドライブへ自動保存
+    try:
+        upload_sync_log_to_drive(accumulated_logs, is_jp=is_jp, prefix="apply_active")
+    except Exception:
+        pass
+        
+    return results
 
 # =====================================================================
 # 💥 クリーンビルド（RawもActiveも完全にダウンロードし直す）

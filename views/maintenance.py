@@ -34,7 +34,8 @@ from core.database_service import (
     rebuild_active_from_raw,
     test_forced_scale_patch_in_memory,  # 追加
     scan_and_diagnose_cliffs_with_tv,   # 追加：統合スキャン（TradingView照合）
-    apply_bulk_selected_patches         # 追加：チェックボックス選択パッチの一括本番適用
+    apply_bulk_selected_patches,         # 追加：チェックボックス選択パッチの一括本番適用
+    execute_apply_verified_temp_dbs_to_active # 🚀 追加：ローカル一時ファイルの一括本番確定
 )
 
 # ── 日足の最新更新日の簡易取得 ──
@@ -135,7 +136,7 @@ def render_stop_allocation_repair_ui(is_jp: bool):
     
     col_st_test, col_st_real = st.columns(2)
     
-    # 🧪 テスト検証モード（インメモリ保存）
+    # 🧪 テスト検証モード（ローカル作業フォルダに一時保存）
     if col_st_test.button("🧪 まずテスト検証を実行（保存なし）", key="btn_repair_stop_alloc_test", type="secondary", use_container_width=True):
         status_box = st.status("📡 ストップ高安バー修復 検証中...", expanded=True)
         with status_box:
@@ -144,7 +145,7 @@ def render_stop_allocation_repair_ui(is_jp: bool):
             try:
                 for interval in ["60m", "5m", "1m"]:
                     rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=True, status_callback=update_status)
-                status_box.update(label="✅ ストップ高安バーのテスト検証が完了しました！メモリデータに一時保存されています。", state="complete")
+                status_box.update(label="✅ ストップ高安バーのテスト検証が完了しました！検証用一時ファイルが保存されています。", state="complete")
                 time.sleep(1.0)
                 st.rerun()
             except Exception as e:
@@ -200,7 +201,6 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
     if "patch_date" in display_df.columns:
         display_df["patch_date"] = pd.to_datetime(display_df["patch_date"]).dt.strftime("%Y-%m-%d")
 
-    # 真の倍率（true_multiplier / est_multiplierフォールバック含む）が取得できなかった行はチェックボックス選択を不可にする（安全対策）
     unresolved_mask = display_df["true_multiplier"].isna()
 
     rename_map = {
@@ -233,7 +233,6 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
         key="unified_scan_editor",
     )
 
-    # 真の倍率が取得できなかった行は強制的に選択解除（誤操作防止）
     edited_df.loc[unresolved_mask.values, "選択"] = False
 
     selected_rows = edited_df[edited_df["選択"] == True]
@@ -355,44 +354,57 @@ def render_database_diagnostics_ui(is_jp: bool):
             ]
             st.dataframe(df_view[cols_to_disp], use_container_width=True, hide_index=True)
 
-# ── 💡 開発者機能: インメモリに一時保存されたデータのコミット機能 ──
+# ── 💡 開発者機能: インメモリおよび一時ファイルに保存された検証済みデータのコミット機能 ──
 def render_commit_verified_data_ui(is_jp: bool):
-    verified_keys = [k for k in st.session_state.keys() if str(k).startswith("temp_verified_active_df_")]
+    """
+    検証済みの一時Parquetファイルがローカル作業フォルダに存在する場合、
+    セッション変数（st.session_state）のフラグを検知して本番一括コミット（確定）を行います。
+    """
+    # 各時間足の Dry Run 一時 Parquet ファイルが存在するフラグを確認（巨大DFそのものはセッションに保持していません）
+    has_temp_verified = any(
+        st.session_state.get(f"temp_verified_active_exists_{tf}", False) 
+        for tf in settings.TIMEFRAMES
+    )
     
-    # 🧪 手動比率修復テスト（検証DataFrame & パッチペイロード）がメモリにある場合もここに合流
+    # 手動修復パッチデータがメモリにある場合（1銘柄分の極小パッチであるためメモリ問題なし）
     has_temp_manual_repair = "temp_manual_repair_dfs" in st.session_state and st.session_state.temp_manual_repair_dfs
 
-    if not verified_keys and not has_temp_manual_repair:
+    if not has_temp_verified and not has_temp_manual_repair:
         return
 
-    st.markdown("### ☁️ **検証済みの一時データがメモリに保管されています**")
+    st.markdown("### ☁️ **検証済みの一時データがディスク（作業フォルダ）に保管されています**")
     st.info(
-        "現在、検証が終了したクリーンデータがメモリに安全に退避されています。 "
-        "以下の「本番適用」ボタンを押すと、ディスクを汚したり2回目のダウンロード待ちをすることなく、メモリ上のデータが一瞬でGoogleドライブへ同期保存されます。"
+        "現在、Dry Runテスト検証を通過した安全なデータが一時ファイル（Parquet）としてローカルディスクに退避されています。\n\n"
+        "以下の「本番適用」ボタンを押すと、**ディスクを一切汚さず、余分な計算や再ダウンロードを行うことなく、数秒でGoogleドライブへ一括確定保存（本番同期）されます。**"
     )
+
+    # 🔍 【新機能】加工後データの先頭プレビューを画面上で目視確認
+    for tf in settings.TIMEFRAMES:
+        preview_key = f"temp_verified_active_preview_{tf}"
+        if st.session_state.get(preview_key) is not None:
+            with st.expander(f"📊 【{tf}】加工データ構造プレビュー（先頭100行）"):
+                st.dataframe(st.session_state[preview_key], use_container_width=True, hide_index=True)
 
     col_btn_apply, col_btn_clear = st.columns([2, 1])
     
     # 💻 本番書き込みボタン（一瞬で完了）
-    if col_btn_apply.button("💻 メモリ上の検証データをGoogleドライブへ本番適用する", key="btn_apply_verified_data_commit", type="primary", use_container_width=True):
-        status_box = st.status("📡 メモリからGoogleドライブへ上書き保存中...", expanded=True)
+    if col_btn_apply.button("💻 一時ファイル（またはメモリパッチ）をGoogleドライブへ本番適用する", key="btn_apply_verified_data_commit", type="primary", use_container_width=True):
+        status_box = st.status("📡 一時ファイルの本番確定・Googleドライブ同期中...", expanded=True)
         with status_box:
             success_count = 0
             
-            # A. 全体差分 or ストップ高安修復テストのコミット
-            for key in verified_keys:
-                interval = key.replace("temp_verified_active_df_", "")
-                df_processed = st.session_state[key]
-                st.write(f"⏱️ [{interval}] をGoogleドライブにアップロード中...")
-                
-                cloud_success, cloud_msg = save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False)
-                if cloud_success:
-                    st.success(f"✅ [{interval}] のGoogleドライブ同期が正常に完了しました。")
-                    success_count += 1
-                else:
-                    st.error(f"❌ [{interval}] の同期に失敗しました。詳細: {cloud_msg}")
+            # A. 全体差分 or ストップ高安修復テストのコミット（一瞬で完了）
+            if has_temp_verified:
+                st.write("📦 ローカルの一時退避ファイルを本番ActiveParquetにリネームしてDriveへアップロード中...")
+                results = execute_apply_verified_temp_dbs_to_active(is_jp=is_jp, status_callback=None)
+                for interval, res in results.items():
+                    if res["success"]:
+                        st.success(f"✅ [{interval}] のGoogleドライブ本番同期が正常に完了しました。")
+                        success_count += 1
+                    else:
+                        st.error(f"❌ [{interval}] の同期に失敗しました: {res['message']}")
                     
-            # B. 手動修復パッチのコミット
+            # B. 手動修復パッチ（極小サイズ）のコミット
             if has_temp_manual_repair:
                 temp_repair_dfs = st.session_state.temp_manual_repair_dfs
                 payload = st.session_state.temp_manual_repair_payload
@@ -425,23 +437,35 @@ def render_commit_verified_data_ui(is_jp: bool):
                 del st.session_state["temp_manual_repair_dfs"]
                 del st.session_state["temp_manual_repair_payload"]
             
-            # メモリ消去
-            for key in verified_keys:
-                del st.session_state[key]
-                
             if success_count > 0:
                 status_box.update(label=f"🎉 計 {success_count} 個の時間足データの本番同期が完了しました！", state="complete")
                 time.sleep(1.0)
                 st.rerun()
 
-    # 🗑️ メモリ一時消去
-    if col_btn_clear.button("🗑️ 検証データを破棄する", key="btn_clear_verified_data_cache", type="secondary", use_container_width=True):
-        for key in verified_keys:
-            del st.session_state[key]
+    # 🗑️ メモリ・一時ファイル消去
+    if col_btn_clear.button("🗑️ 検証一時データを破棄する", key="btn_clear_verified_data_cache", type="secondary", use_container_width=True):
+        # セッション変数と一時ファイルを物理クリーン
+        for tf in settings.TIMEFRAMES:
+            if f"temp_verified_active_exists_{tf}" in st.session_state:
+                st.session_state[f"temp_verified_active_exists_{tf}"] = False
+            if f"temp_verified_active_preview_{tf}" in st.session_state:
+                del st.session_state[f"temp_verified_active_preview_{tf}"]
+                
+            # ディスク上の一時ファイルを物理削除
+            from data_access.local_db import get_db_filename
+            temp_filename = get_db_filename(tf, is_jp, is_raw=False, is_temp=True)
+            temp_path = os.path.join(settings.WORK_DIR, temp_filename)
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+                    
         if has_temp_manual_repair:
             del st.session_state["temp_manual_repair_dfs"]
             del st.session_state["temp_manual_repair_payload"]
-        st.warning("メモリ上の一時データを消去しました。")
+            
+        st.warning("メモリ上およびディスク上の一時データを消去しました。")
         time.sleep(0.5)
         st.rerun()
 
@@ -462,7 +486,19 @@ with m_col2:
     
 st.divider()
 
-# 💡 インメモリ・コミット用のUI表示（検証データが存在するときのみ現れます）
+# 💡 Rerun（ボタン押下）が発生しても画面からログが消えないようにするためのログ永続化表示システム
+if "sync_logs_history" not in st.session_state:
+    st.session_state["sync_logs_history"] = []
+
+if st.session_state["sync_logs_history"]:
+    with st.expander("📝 詳細ログ履歴コンソール（勝手に閉じず、いつでも確認・確認消去が可能です）", expanded=True):
+        st.code("\n".join(st.session_state["sync_logs_history"]), language="text")
+        if st.button("🗑️ ログ表示履歴をクリア", key="btn_clear_st_logs_history_on_screen", use_container_width=True):
+            st.session_state["sync_logs_history"] = []
+            st.rerun()
+    st.divider()
+
+# 💡 一時ファイル＆インメモリ・コミット用のUI表示（検証データが存在するときのみ自動的に上部に現れます）
 render_commit_verified_data_ui(is_jp)
 
 st.divider()
@@ -503,9 +539,9 @@ def render_full_sync_section(is_jp: bool):
 
     col_btn_test, col_btn_real = st.columns(2)
     
-    # 🧪 テスト検証モード
+    # 🧪 テスト検証モード（メモリをほとんど消費しない、Parquet一時退避式）
     if col_btn_test.button("🧪 まずテスト検証を実行（保存なし）", key="btn_test_diff_update", type="secondary", use_container_width=True):
-        sync_log_lines = []
+        st.session_state["sync_logs_history"] = []  # ログ初期化
         status_box = st.status("📡 データベース全体差分 テスト検証中...", expanded=True)
         with status_box:
             st.write("追加ティッカーのローカル同期を実行中...")
@@ -517,7 +553,6 @@ def render_full_sync_section(is_jp: bool):
 
             def update_status_on_screen(msg):
                 st.write(f"  * {msg}")
-                sync_log_lines.append(str(msg))
 
             with st.spinner("同期検証中..."):
                 try:
@@ -526,9 +561,9 @@ def render_full_sync_section(is_jp: bool):
                         is_jp=is_jp,
                         target_tickers=all_tickers,
                         status_callback=update_status_on_screen,
-                        dry_run=True # Dry Runを強制ON
+                        dry_run=True # Dry Runを強制ON（メモリリークを完全回避するParquet退避動作）
                     )
-                    status_box.update(label="🎉 テスト検証が正常に完了しました！メモリデータに一時保存されています。", state="complete")
+                    status_box.update(label="🎉 テスト検証が正常に完了しました！一時ファイルがローカルに安全保存されています。", state="complete")
                     time.sleep(1.0)
                     st.rerun()
                 except Exception as e:
@@ -537,7 +572,7 @@ def render_full_sync_section(is_jp: bool):
 
     # 💻 本番同期モード（即時保存）
     if col_btn_real.button("🚀 直接本番同期（即時保存＆Driveアップロード）", key="btn_real_diff_update", type="primary", use_container_width=True):
-        sync_log_lines = []
+        st.session_state["sync_logs_history"] = []  # ログ初期化
         status_box = st.status("📡 データベース全体差分 本番同期中...", expanded=True)
         with status_box:
             st.write("追加ティッカーの同期を実行中...")
@@ -549,7 +584,6 @@ def render_full_sync_section(is_jp: bool):
 
             def update_status_on_screen(msg):
                 st.write(f"  * {msg}")
-                sync_log_lines.append(str(msg))
 
             with st.spinner("ダウンロード同期中..."):
                 try:
@@ -561,6 +595,8 @@ def render_full_sync_section(is_jp: bool):
                         dry_run=False
                     )
                     status_box.update(label="🎉 本番同期タスクが全て正常に完了しました！", state="complete")
+                    time.sleep(1.0)
+                    st.rerun()
                 except Exception as e:
                     status_box.update(label="❌ 同期中にエラーが発生しました", state="error")
                     st.error(f"同期中にエラーを検知しました: {e}")
@@ -579,8 +615,8 @@ st.divider()
 def render_manual_repair_section(is_jp: bool):
     st.write(
         "TradingView APIが停止している等の非常時に備え、従来の手動ピンポイント一括安全修復フォームを"
-        "バックアップとして残しています。特定の銘柄においてデータの欠損が発生した場合、"
-        "Rawデータベースからクリーンダウンロード復元し、最新のTransform加工を通じてActiveを一元的に再構成します。"
+        "バックアップとして残しています。特定の銘柄においてデータの欠損が発生した場合, "
+        "Rawデータベースからクリーンダウンロード復元し, 最新のTransform加工を通じてActiveを一元的に再構成します。"
     )
 
     with st.form(key="safe_repair_form"):
@@ -598,7 +634,6 @@ def render_manual_repair_section(is_jp: bool):
         rep_col3_test_btn = col_form_test.form_submit_button("🧪 まずテスト検証を実行（保存なし）", type="secondary")
         rep_col3_btn = col_form_real.form_submit_button("🚀 直接本番修復を実行（即時保存）", type="primary")
 
-    # 🧪 テスト検証モードが押された場合
     if rep_col3_test_btn:
         if not repair_confirm:
             st.error("❌ 安全ロックがかかっています。チェックボックスをONにしてください。")
@@ -608,7 +643,6 @@ def render_manual_repair_section(is_jp: bool):
             pure_t = sanitize_ticker(rep_ticker, is_jp=is_jp)
             market_str = "JP" if is_jp else "US"
             
-            # ── パターンA: 崖修正パッチのテスト ──
             if rep_date_str.strip() and rep_ratio_str.strip():
                 try:
                     multiplier = float(rep_ratio_str.strip())
@@ -631,7 +665,6 @@ def render_manual_repair_section(is_jp: bool):
                     else:
                         st.success("✅ メモリ上での崖調整テストが完了しました。対比プレビューを確認してください。")
                         
-                        # 各時間足のビフォーアフター対比プレビューテーブルを綺麗に並べて出力
                         for interval, info in test_results.items():
                             if isinstance(info, dict):
                                 st.markdown(f"📊 **【{interval}】 調整対比プレビュー (調整件数: {info['applied_count']}件)**")
@@ -645,7 +678,6 @@ def render_manual_repair_section(is_jp: bool):
                                     st.caption("調整後 (After)")
                                     st.dataframe(info["after_sample"][disp_cols], use_container_width=True, hide_index=True)
                         
-                        # 検証データを退避し、上のコミットボタンを出現させる
                         st.session_state.temp_manual_repair_dfs = temp_repaired_dfs
                         st.session_state.temp_manual_repair_payload = {
                             "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -657,16 +689,13 @@ def render_manual_repair_section(is_jp: bool):
                         }
                         st.info("💡 プレビューに問題がなければ、一番上の「コミットUI」から『本番適用』ボタンを押してGoogleドライブへ上書き保存してください。")
             
-            # ── パターンB: 個別ダウンロードのテスト（メモリ上で構築だけ行う） ──
             elif not rep_date_str.strip() and not rep_ratio_str.strip():
                 with st.spinner(f"🔧 [{pure_t}] のRawデータ部分ダウンロード及びActive再生成検証中..."):
-                    # 一時的にdry_runフラグは無いが、個別DLを走らせてActiveをdry_runでリビルドする
                     results = repair_single_ticker_all_timeframes(pure_t, is_jp=is_jp)
                     for interval, msg in results.items():
                         st.write(f" **{interval}**: {msg}")
                     st.success("✅ 個別ダウンロードが完了しました。")
 
-    # 🚀 直接本番修復を実行（即時保存）
     if rep_col3_btn:
         if not repair_confirm:
             st.error("❌ 安全ロックがかかっています。チェックボックスをONにしてください。")
