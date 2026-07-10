@@ -34,8 +34,8 @@ def read_parquet_ledger(filepath: str) -> dict:
 
 def load_price_db_ledger(interval: str, is_jp: bool = True, is_raw: bool = False, is_temp: bool = False) -> dict:
     """
-    実データをロードせず、メタデータフッター（台帳情報）のみを高速取得します。
-    ファイルがローカルになければ必要最低限のダウンロードを行います。
+    Parquetファイルをロードせず、フッターメタデータ（台帳）のみを高速取得します。
+    ※台帳が見つからない既存のレガシーファイルを検出した場合、自動的に1度だけ読み込んでメタデータを埋め込み直します。
     """
     filename = get_db_filename(interval, is_jp, is_raw, is_temp)
     work_file = os.path.join(settings.WORK_DIR, filename)
@@ -45,8 +45,24 @@ def load_price_db_ledger(interval: str, is_jp: bool = True, is_raw: bool = False
         api_success = download_from_drive_api(filename, work_file)
         if not api_success and os.path.exists(drive_file):
             shutil.copy2(drive_file, work_file)
+                
+    if os.path.exists(work_file):
+        ledger = read_parquet_ledger(work_file)
+        if ledger and ledger.get("last_updates_map"):
+            return ledger
+        
+        # 🔄 【レガシー互換フォールバック】台帳が埋め込まれていない古い形式のファイルが存在する場合
+        try:
+            print(f"[CONSOLE_DEBUG] [LEDGER] レガシーParquetファイル（{filename}）を検出。台帳メタデータを作成し、再保存します...")
+            df = pd.read_parquet(work_file)
+            if not df.empty:
+                ledger = compute_ledger_from_df(df)
+                save_price_db(df, interval, is_jp=is_jp, is_raw=is_raw, is_temp=is_temp, custom_ledger=ledger)
+                return ledger
+        except Exception as e:
+            print(f"[CONSOLE_DEBUG] [LEDGER_WARNING] レガシー台帳の自動作成中にエラー: {e}")
             
-    return read_parquet_ledger(work_file)
+    return {}
 
 def compute_ledger_from_df(df: pd.DataFrame) -> dict:
     """DataFrameから最新日付と銘柄ごとの最終更新日マップを高速に計算して台帳JSON形式にします。"""
