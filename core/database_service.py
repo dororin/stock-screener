@@ -283,92 +283,100 @@ def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True, repair_log_d
 
 def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intra_active: pd.DataFrame, is_jp: bool = True) -> pd.DataFrame:
     """
-    日足のストップ高安発生日を検出し、対象の分足データを一括で合成バーに置き換えます（メモリ最適化版）。
-    無関係な銘柄のデータコピーを発生させず、瞬間的なメモリスパイクを極限まで低減します。
+    日足のストップ高安発生日を検出し、対象の分足データを一括で合成バーに置き換えます（メモリ＆速度極限最適化版）。
+    無駄なDataFrameのコピーや重いループを徹底排除し、省メモリで動作させます。
     """
     import gc
+    import sys
     import pandas as pd
     
+    def log_mem(step_name):
+        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [PROPAGATE_STOP] {step_name}")
+        sys.stdout.flush()
+
+    log_mem("補完処理を開始します...")
+
     if df_intra_active.empty:
+        log_mem("補完処理をスキップ（df_intra_activeが空です）")
         return df_intra_active
 
-    # ストップ高安発生日のリストを取得（ごく少数の行数）
+    # 1. ストップ高安発生日のリストを取得
+    log_mem("日足データから比例配分ストップ高安発生日を検索中...")
     stop_days_df = detect_allocation_stop_days(df_1d_active)
     if stop_days_df.empty:
+        log_mem("補完処理を終了（比例配分ストップ高安日は1件もありませんでした）")
         return df_intra_active
 
     stop_days_df = stop_days_df.copy()
     stop_days_df["date_norm"] = pd.to_datetime(stop_days_df["date"]).dt.normalize()
+    log_mem(f"比例配分ストップ高安日が {len(stop_days_df)} 件検出されました。")
+
+    # 2. 軽量日付キーの生成とベクトル化マッチング
+    log_mem("日付マッチング用の軽量インデックスキーを抽出中...")
+    # メモリ節約のため、日付列と銘柄列のみを保持する最小のDataFrameを作成
+    df_keys = pd.DataFrame({
+        "ticker": df_intra_active["ticker"],
+        "date_norm": pd.to_datetime(df_intra_active["date"]).dt.normalize()
+    })
+    log_mem("キー抽出完了。ベクトル化マージによるマッチング処理を実行中...")
+
+    # ストップ日判別用の一時マッピング
+    stop_days_df_match = stop_days_df[["ticker", "date_norm"]].copy()
+    stop_days_df_match["is_stop"] = True
     
-    # 処理を高速化するため { 銘柄 : {対象日のセット} } の形にまとめる（極めて軽量な辞書）
-    stop_dict = stop_days_df.groupby("ticker")["date_norm"].apply(set).to_dict()
-    stop_tickers = set(stop_dict.keys())
-
-    # ストップ高安が一度も発生していない無関係な銘柄を特定
-    mask_has_stop = df_intra_active["ticker"].isin(stop_tickers)
+    # マージにより一撃で判定
+    merged = df_keys.merge(stop_days_df_match, on=["ticker", "date_norm"], how="left")
+    is_stop_mask = merged["is_stop"].fillna(False).values
     
-    # ストップ高安がデータ範囲内で一度もオーバーラップしていない場合は即時返却
-    if not mask_has_stop.any():
-        return df_intra_active
+    # 不要なマージ中間変数を即時解放
+    del merged, df_keys
+    gc.collect()
+    log_mem(f"マッチング判定完了。削除対象となるストップ日のバー総数: {is_stop_mask.sum()} 件")
 
-    # 1. 安全なデータ（全体の95%以上）: コピー（.copy()）をせず、単なるスライス参照として取り出す（メモリを消費しない）
-    df_intra_safe = df_intra_active[~mask_has_stop]
+    # 3. ストップ高安日以外の「安全な」足のみを抽出
+    log_mem("ストップ高安日の時間足バーを物理除外中（1サイクルで高速処理）...")
+    df_cleaned = df_intra_active[~is_stop_mask].copy()
+    log_mem(f"除外完了。残存時間足バー数: {len(df_cleaned)}")
+
+    # 4. 補完合成バー（大引けバー）の算出
+    log_mem("補完バー配置のため、各時間足データベースの収録期間を計算中...")
+    # 全体をグループバイして一度に範囲を決定
+    active_ranges = df_cleaned.groupby("ticker")["date"].agg(["min", "max"])
+    active_ranges["min_date"] = pd.to_datetime(active_ranges["min"]).dt.normalize()
+    active_ranges["max_date"] = pd.to_datetime(active_ranges["max"]).dt.normalize()
     
-    # 2. 対象データ（ごく一部の銘柄のみ）: こちらだけをコピーして加工対象とする
-    df_intra_target = df_intra_active[mask_has_stop].copy()
-
-    # 対象データのみ日付オブジェクトの正規化を適用（変換コストとメモリを最小限に制限）
-    df_intra_target["date"] = pd.to_datetime(df_intra_target["date"])
-    df_intra_target["day_normalize"] = df_intra_target["date"].dt.normalize()
-
-    # 高速かつ省メモリな判定（Pythonのタプル生成数を極小化）
-    is_stop_bar = [
-        t in stop_dict and d in stop_dict[t]
-        for t, d in zip(df_intra_target["ticker"], df_intra_target["day_normalize"])
+    # 台帳範囲内にあるストップ日のイベントのみにフィルタリング
+    log_mem("収録期間をまたぐ有効なストップ高安のみをフィルタ中...")
+    valid_stops = stop_days_df.join(active_ranges[["min_date", "max_date"]], on="ticker")
+    valid_stops = valid_stops[
+        (valid_stops["date_norm"] >= valid_stops["min_date"]) &
+        (valid_stops["date_norm"] <= valid_stops["max_date"])
     ]
     
-    # ストップ日に合致する分足バーを削除
-    df_cleaned = df_intra_target[~pd.Series(is_stop_bar, index=df_intra_target.index)].copy()
-
-    # 合成バー（大引け15:00/15:30などのバー）を生成
+    log_mem(f"大引け合成補完バー（計 {len(valid_stops)} 本）を作成中...")
     schema_cols = df_intra_active.columns.tolist()
     new_rows = []
     
-    for _, row in stop_days_df.iterrows():
+    for _, row in valid_stops.iterrows():
         ticker = row["ticker"]
         day_date = row["date_norm"]
-        
-        # 処理中の分足データに存在する銘柄のみ処理
-        ticker_data = df_intra_target[df_intra_target["ticker"] == ticker]
-        if ticker_data.empty:
-            continue
-            
-        t_min = ticker_data["day_normalize"].min()
-        t_max = ticker_data["day_normalize"].max()
-        
-        # データの収録期間内に収まっている場合のみ、合成バーを作成
-        if t_min <= day_date <= t_max:
-            new_row = _build_synthetic_15h_bar_row(
-                schema_cols, ticker, day_date, row["close"], row["volume"], is_jp=is_jp
-            )
-            new_rows.append(new_row)
+        new_row = _build_synthetic_15h_bar_row(
+            schema_cols, ticker, day_date, row["close"], row["volume"], is_jp=is_jp
+        )
+        new_rows.append(new_row)
 
     if new_rows:
         df_synthetic = pd.DataFrame(new_rows)
         df_synthetic["date"] = pd.to_datetime(df_synthetic["date"])
-        df_result_target = pd.concat([df_cleaned, df_synthetic], ignore_index=True)
+        log_mem(f"合成補完バー（{len(df_synthetic)}行）を時間足データに結合中...")
+        df_result = pd.concat([df_cleaned, df_synthetic], ignore_index=True)
     else:
-        df_result_target = df_cleaned
+        df_result = df_cleaned
 
-    if "day_normalize" in df_result_target.columns:
-        df_result_target = df_result_target.drop(columns=["day_normalize"])
-
-    # 触っていなかった大部分の安全なデータと、加工済みの対象データを再結合
-    df_result = pd.concat([df_intra_safe, df_result_target], ignore_index=True)
-    
-    # 不要になった変数をローカルスコープから完全に抹消
-    del df_intra_target, df_intra_safe, df_cleaned, new_rows, stop_dict, stop_tickers
+    # メモリを明示的にクリア
+    del df_cleaned, new_rows, stop_days_df
     gc.collect()
+    log_mem(f"補完処理が正常終了しました。最終データ行数: {len(df_result)}")
     
     return df_result
 
