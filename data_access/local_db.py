@@ -12,31 +12,29 @@ def get_db_filename(interval: str, is_jp: bool = True, is_raw: bool = False, is_
     temp_suffix = "_temp" if is_temp else ""
     return f"price_{market}_{interval}{suffix}{temp_suffix}.parquet"
 
-def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_temp: bool = False) -> pd.DataFrame:
+def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_temp: bool = False, columns: list = None) -> pd.DataFrame:
     """
     Drive、またはローカルフォルダから該当するParquetデータベースをロードし、DataFrameにパースして返します。
-    is_temp=True の場合、Drive APIアクセスを完全にスキップしてローカルの一時退避ファイルを直接ロードします。
+    columns引数を指定することで、特定の列だけを省メモリでロードできます。
     """
     filename = get_db_filename(interval, is_jp, is_raw, is_temp)
     work_file = os.path.join(settings.WORK_DIR, filename)
     drive_file = os.path.join(settings.DRIVE_DIR, filename)
 
-    # 一時ファイルの読み込み時はDriveとの同期・ダウンロードをスキップしてローカル完結
     if is_temp:
         if os.path.exists(work_file):
-            df = pd.read_parquet(work_file)
+            df = pd.read_parquet(work_file, columns=columns) # columnsを追加
             if "date" in df.columns:
                 df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
             return df
         return pd.DataFrame()
 
-    # 通常時のダウンロード第一優先
     api_success = download_from_drive_api(filename, work_file)
     if not api_success and os.path.exists(drive_file):
         shutil.copy2(drive_file, work_file)
     
     if os.path.exists(work_file):
-        df = pd.read_parquet(work_file)
+        df = pd.read_parquet(work_file, columns=columns) # columnsを追加
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
         return df

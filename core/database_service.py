@@ -282,36 +282,55 @@ def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True, repair_log_d
     return df_result
 
 def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intra_active: pd.DataFrame, is_jp: bool = True) -> pd.DataFrame:
-    """日足のストップ高安発生日を検出し、対象の分足データを一括で合成バーに置き換えます（一括処理最適化版）。"""
+    """
+    日足のストップ高安発生日を検出し、対象の分足データを一括で合成バーに置き換えます（メモリ最適化版）。
+    無関係な銘柄のデータコピーを発生させず、瞬間的なメモリスパイクを極限まで低減します。
+    """
     import gc
     import pandas as pd
     
     if df_intra_active.empty:
         return df_intra_active
 
+    # ストップ高安発生日のリストを取得（ごく少数の行数）
     stop_days_df = detect_allocation_stop_days(df_1d_active)
     if stop_days_df.empty:
         return df_intra_active
 
-    stop_tickers = stop_days_df["ticker"].unique().tolist()
+    stop_days_df = stop_days_df.copy()
+    stop_days_df["date_norm"] = pd.to_datetime(stop_days_df["date"]).dt.normalize()
     
-    df_intra_target = df_intra_active[df_intra_active["ticker"].isin(stop_tickers)].copy()
-    df_intra_safe = df_intra_active[~df_intra_active["ticker"].isin(stop_tickers)]
+    # 処理を高速化するため { 銘柄 : {対象日のセット} } の形にまとめる（極めて軽量な辞書）
+    stop_dict = stop_days_df.groupby("ticker")["date_norm"].apply(set).to_dict()
+    stop_tickers = set(stop_dict.keys())
 
-    if df_intra_target.empty:
+    # ストップ高安が一度も発生していない無関係な銘柄を特定
+    mask_has_stop = df_intra_active["ticker"].isin(stop_tickers)
+    
+    # ストップ高安がデータ範囲内で一度もオーバーラップしていない場合は即時返却
+    if not mask_has_stop.any():
         return df_intra_active
 
+    # 1. 安全なデータ（全体の95%以上）: コピー（.copy()）をせず、単なるスライス参照として取り出す（メモリを消費しない）
+    df_intra_safe = df_intra_active[~mask_has_stop]
+    
+    # 2. 対象データ（ごく一部の銘柄のみ）: こちらだけをコピーして加工対象とする
+    df_intra_target = df_intra_active[mask_has_stop].copy()
+
+    # 対象データのみ日付オブジェクトの正規化を適用（変換コストとメモリを最小限に制限）
     df_intra_target["date"] = pd.to_datetime(df_intra_target["date"])
     df_intra_target["day_normalize"] = df_intra_target["date"].dt.normalize()
+
+    # 高速かつ省メモリな判定（Pythonのタプル生成数を極小化）
+    is_stop_bar = [
+        t in stop_dict and d in stop_dict[t]
+        for t, d in zip(df_intra_target["ticker"], df_intra_target["day_normalize"])
+    ]
     
-    stop_days_df["date_norm"] = pd.to_datetime(stop_days_df["date"]).dt.normalize()
-    stop_keys = set(zip(stop_days_df["ticker"], stop_days_df["date_norm"]))
-    
-    target_zip = zip(df_intra_target["ticker"], df_intra_target["day_normalize"])
-    is_stop_bar = [pair in stop_keys for pair in target_zip]
-    
+    # ストップ日に合致する分足バーを削除
     df_cleaned = df_intra_target[~pd.Series(is_stop_bar, index=df_intra_target.index)].copy()
-    
+
+    # 合成バー（大引け15:00/15:30などのバー）を生成
     schema_cols = df_intra_active.columns.tolist()
     new_rows = []
     
@@ -319,6 +338,7 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
         ticker = row["ticker"]
         day_date = row["date_norm"]
         
+        # 処理中の分足データに存在する銘柄のみ処理
         ticker_data = df_intra_target[df_intra_target["ticker"] == ticker]
         if ticker_data.empty:
             continue
@@ -326,6 +346,7 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
         t_min = ticker_data["day_normalize"].min()
         t_max = ticker_data["day_normalize"].max()
         
+        # データの収録期間内に収まっている場合のみ、合成バーを作成
         if t_min <= day_date <= t_max:
             new_row = _build_synthetic_15h_bar_row(
                 schema_cols, ticker, day_date, row["close"], row["volume"], is_jp=is_jp
@@ -342,9 +363,11 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
     if "day_normalize" in df_result_target.columns:
         df_result_target = df_result_target.drop(columns=["day_normalize"])
 
+    # 触っていなかった大部分の安全なデータと、加工済みの対象データを再結合
     df_result = pd.concat([df_intra_safe, df_result_target], ignore_index=True)
     
-    del df_intra_target, df_intra_safe, df_cleaned, new_rows
+    # 不要になった変数をローカルスコープから完全に抹消
+    del df_intra_target, df_intra_safe, df_cleaned, new_rows, stop_dict, stop_tickers
     gc.collect()
     
     return df_result
@@ -433,8 +456,16 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         try:
             print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] ストップ高安バーの補完を開始...")
             sys.stdout.flush()
-            # 🚀 【二重ロードを完全回避】：Dry Run時は退避先ローカル一時ファイルから直接1dデータを展開
-            df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False, is_temp=dry_run)
+            
+            # 🚀 1dアクティブデータから必要最小限の列だけを省メモリでロードする
+            cols_needed = ["ticker", "date", "open", "high", "low", "close", "volume"]
+            try:
+                # 'is_finalized' カラムがある場合は一緒に読み込む
+                df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False, is_temp=dry_run, columns=cols_needed + ["is_finalized"])
+            except Exception:
+                # 存在しない、あるいは読み込み失敗した場合は基本カラムのみ
+                df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False, is_temp=dry_run, columns=cols_needed)
+                
             df_processed = propagate_stop_allocation_bars_in_memory(df_1d_active, df_processed, is_jp=is_jp)
             del df_1d_active
             gc.collect()
@@ -485,8 +516,8 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
             
         if settings.HAS_STREAMLIT:
             import streamlit as st
-            # メモリ上には確認画面プレビュー用の先頭100行と、一時ファイルが存在する目印フラグだけを保管
-            st.session_state[f"temp_verified_active_preview_{interval}"] = df_processed.head(100)
+            # 🚀 .copy(deep=True) を追加して元の配列データとの参照を遮断し、メモリを開放可能にする
+            st.session_state[f"temp_verified_active_preview_{interval}"] = df_processed.head(100).copy(deep=True)
             st.session_state[f"temp_verified_active_exists_{interval}"] = True
             
         del df_processed
