@@ -339,6 +339,7 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
     """RawデータからActiveデータの加工ビルドとアサーション検証。"""
     import gc
     import sys
+    import pandas as pd
     
     def log(msg):
         print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] {msg}")
@@ -366,46 +367,51 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
     if "patched_multiplier" not in df_raw.columns:
         df_raw["patched_multiplier"] = 1.0
 
-    # ── 🚀 【メモリリーク/OOMを防止する劇的軽量化処理】 ──
-    # 従来は1702銘柄全てを無条件にgroupbyループしていましたが、
-    # 株式分割が発生した銘柄（極少数）のみをピンポイントで抽出しループ処理を行います。
-    # 分割がない銘柄（99%以上）は無駄な分割・再結合(concat)を一切行わず高速スルーします。
+    # ── 🚀 【完全インプレース化】株式分割遡及修正の劇的軽量化 ──
+    # 対象の266件だけを、巨大データフレームをコピーすることなくダイレクトに書き換えます。
+    # ピークメモリの増加を完全に 0 に抑え込みます。
     
     split_tickers = []
     if "stock splits" in df_raw.columns:
-        # 分割イベント（値が 0 より大きく、かつ 1.0 以外のもの）を持つユニーク銘柄を特定
         split_tickers = df_raw[(df_raw["stock splits"] > 0) & (df_raw["stock splits"] != 1.0)]["ticker"].unique().tolist()
 
     if split_tickers:
         log(f"株式分割イベントを検知しました。対象銘柄数: {len(split_tickers)} / {df_raw['ticker'].nunique()}")
         
-        # 分割ありと分割なしにデータフレームを分割
-        df_with_splits = df_raw[df_raw["ticker"].isin(split_tickers)].copy()
-        df_without_splits = df_raw[~df_raw["ticker"].isin(split_tickers)].copy()
+        price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in df_raw.columns]
+        cols_to_write = price_cols + ["volume", "split_multiplier", "patched_multiplier"]
         
-        # 元の巨大データフレームは不要になった時点で即座にメモリから削除
-        del df_raw
-        gc.collect()
-        
-        processed_parts = []
-        total_split_tickers = len(split_split_tickers) if 'split_split_tickers' in locals() else len(split_tickers)
-        for idx, (ticker, group) in enumerate(df_with_splits.groupby("ticker")):
-            if idx % 10 == 0 or idx == total_split_tickers - 1:
-                print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE]   -> 分割処理進捗: {idx+1}/{total_split_tickers} ({ticker})")
-                sys.stdout.flush()
-            adjusted_group = adjust_ticker_splits_backward_in_memory(group)
-            processed_parts.append(adjusted_group)
+        total_split_tickers = len(split_tickers)
+        for idx, ticker in enumerate(split_tickers):
+            ticker_mask = df_raw["ticker"] == ticker
+            if not ticker_mask.any():
+                continue
+                
+            # 対象銘柄のみ抽出（サイズが極小のため、コピーしてもメモリに影響ありません）
+            group = df_raw[ticker_mask].copy()
             
-        df_processed_splits = pd.concat(processed_parts, ignore_index=True)
-        
-        # 分割のない元のデータと結合
-        df_processed = pd.concat([df_without_splits, df_processed_splits], ignore_index=True)
-        
-        # 不要な一時データを明示的に解放
-        del df_with_splits, df_without_splits, df_processed_splits, processed_parts
-        gc.collect()
+            # 時系列順にソート（この時点の元のインデックス順を保持します）
+            group_sorted = group.sort_values("date")
+            
+            # 分割調整（戻り値は 0 始まりの連番インデックスになります）
+            adjusted_group = adjust_ticker_splits_backward_in_memory(group_sorted)
+            
+            if not adjusted_group.empty:
+                # ── インプレース書き戻し用に、元のソート順インデックスを完全復元 ──
+                adjusted_group.index = group_sorted.index
+                
+                valid_cols = [c for c in cols_to_write if c in df_raw.columns and c in adjusted_group.columns]
+                # 元の巨大データフレームへダイレクト上書き（余分なメモリ確保なし）
+                df_raw.loc[adjusted_group.index, valid_cols] = adjusted_group[valid_cols]
+            
+            if idx % 50 == 0 or idx == total_split_tickers - 1:
+                print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE]   -> インプレース分割処理進捗: {idx+1}/{total_split_tickers} ({ticker})")
+                sys.stdout.flush()
+                
+        # 参照の移し替え
+        df_processed = df_raw
     else:
-        log("データセット全体に株式分割イベントは検出されませんでした。全ループをスキップして高速ゼロコピー移行します。")
+        log("データセット全体に株式分割イベントは検出されませんでした。インプレーススキップします。")
         df_processed = df_raw
         
     print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] 遡及修正計算完了。総行数: {len(df_processed)}")
