@@ -4,6 +4,8 @@ import time
 import pandas as pd
 import pytz
 import yfinance as yf
+import gc  # メモリ解放用に追加
+import sys # ログのフラッシュ用に追加
 from datetime import datetime, timedelta, time as dt_time
 from config import settings
 from data_access.local_db import load_price_db, save_price_db
@@ -12,47 +14,58 @@ from core.collector import (
     get_benchmark_latest_date, parse_yfinance_batch
 )
 
+# --- psutilによるメモリ計測（利用できない場合は代替ロジックへフォールバック） ---
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+def get_memory_usage_str() -> str:
+    """現在のプロセスの物理メモリ使用量(RSS)を人間が読める文字列で返します。"""
+    try:
+        if psutil is not None:
+            process = psutil.Process(os.getpid())
+            mem_bytes = process.memory_info().rss
+            return f"[RAM: {mem_bytes / (1024 * 1024):.2f} MB]"
+        else:
+            # Linuxコンテナ環境用の簡易フォールバック
+            if os.path.exists('/proc/self/status'):
+                with open('/proc/self/status', 'r') as f:
+                    for line in f:
+                        if 'VmRSS' in line:
+                            parts = line.split()
+                            val = float(parts[1])
+                            unit = parts[2]
+                            if unit.lower() == 'kB':
+                                return f"[RAM: {val / 1024:.2f} MB]"
+                            return f"[RAM: {val} {unit}]"
+    except Exception:
+        pass
+    return "[RAM: 計測不可]"
+
+
 # --- yfinanceが取得可能な期間の上限（日数） ---
 YFINANCE_GAP_LIMITS = {"1m": 7, "5m": 60, "60m": 730}
 
 # --- 東証: 取引時間延伸（2024年11月5日、arrowhead4.0稼働）の境界日 ---
-# この日以降、大引け（取引終了時刻）は 15:00 → 15:30 に変更されている（クロージング・オークション導入）。
 TSE_EXTENDED_HOURS_DATE = pd.Timestamp("2024-11-05")
 
 def get_jp_session_close_time(date) -> dt_time:
-    """
-    指定日における東証の大引け時刻を返します。
-    2024/11/5以降: 15:30（クロージング・オークション導入後）
-    2024/11/5より前: 15:00（旧終了時刻）
-    """
+    """指定日における東証の大引け時刻を返します。"""
     d = pd.Timestamp(date).normalize()
     if d >= TSE_EXTENDED_HOURS_DATE:
         return dt_time(15, 30)
     return dt_time(15, 0)
 
 def get_market_localized_now(is_jp: bool = True):
-    """
-    市場モード（is_jp）に基づき、Asia/Tokyo（日本株）または America/New_York（米国株）の
-    タイムゾーンにローカライズされた現在時刻（now_tz）と、本日日付（local_today）を返します。
-    サーバーがUTC等の別タイムゾーンで動作していても、常に市場基準のローカル時刻を得られます。
-    """
+    """市場モード（is_jp）に基づき、ローカライズされた現在時刻と本日日付を返します。"""
     tz = pytz.timezone("Asia/Tokyo") if is_jp else pytz.timezone("America/New_York")
     now_tz = datetime.now(pytz.utc).astimezone(tz)
     local_today = now_tz.date()
     return now_tz, local_today
 
 def compute_is_finalized(date_series: pd.Series, interval: str, is_jp: bool = True) -> pd.Series:
-    """
-    時間ベースの確定（finalize）判定ロジック。
-
-    - タイムフレームが 1d の場合:
-        * データの日付が本日（local_today）より前 → 無条件で確定(True)。
-        * データの日付が本日と同じ → 実行時のローカル時刻が市場の閉場バッファ
-          （日本株: JST 16:30 / 米国株: EST 17:30）を過ぎていれば確定(True)、
-          過ぎていなければ未確定(False)。
-    - タイムフレームが 1d 以外（短期足）の場合:
-        * タイムゾーン情報を除いたローカル現在時刻（now_naive）から1時間より前のデータのみ確定(True)。
-    """
+    """時間ベースの確定（finalize）判定ロジック。"""
     now_tz, local_today = get_market_localized_now(is_jp)
     dt_series = pd.to_datetime(date_series)
 
@@ -70,19 +83,7 @@ def compute_is_finalized(date_series: pd.Series, interval: str, is_jp: bool = Tr
         return dt_series < (now_naive - timedelta(hours=1))
 
 def detect_allocation_stop_days(df_1d: pd.DataFrame) -> pd.DataFrame:
-    """
-    日足(1d)データから「寄り付かずストップ高/安（比例配分）」の日付を検出します（仕様書アプローチA）。
-
-    判定式:
-        is_allocation_stop = (Open == High == Low == Close) AND (Volume > 0) AND (Close != 前日Close)
-
-    未確定データ安全ガード:
-        is_finalized 列が存在する場合、is_finalized == True の行のみを対象とします。
-        （まだ確定していない当日データは、次回同期以降 is_finalized == True に切り替わってから
-          初めて検出対象となります。）
-
-    戻り値: columns = ["ticker", "date", "close", "volume"]
-    """
+    """日足(1d)データから「寄り付かずストップ高/安（比例配分）」の日付を検出します。"""
     empty_result = pd.DataFrame(columns=["ticker", "date", "close", "volume"])
     if df_1d is None or df_1d.empty:
         return empty_result
@@ -96,7 +97,6 @@ def detect_allocation_stop_days(df_1d: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return empty_result
 
-    # 前日Closeは「銘柄ごとの直前の確定済みレコード」を基準にする
     df["prev_close"] = df.groupby("ticker")["close"].shift(1)
 
     is_allocation_stop = (
@@ -112,10 +112,7 @@ def detect_allocation_stop_days(df_1d: pd.DataFrame) -> pd.DataFrame:
     return result
 
 def _build_synthetic_15h_bar_row(schema_cols: list, ticker: str, day_date, close_price: float, volume: float, is_jp: bool = True) -> dict:
-    """
-    短期足DBの既存スキーマ(schema_cols)に合わせ、大引け固定の1本分のバー行を組み立てます。
-    日本株の場合、2024/11/5の取引時間延伸を踏まえ、日付に応じて15:00/15:30を自動判定します。
-    """
+    """短期足DBの既存スキーマに合わせ、大引け固定の1本分のバー行を組み立てます。"""
     if is_jp:
         close_t = get_jp_session_close_time(day_date)
         bar_datetime = pd.Timestamp(day_date).normalize() + pd.Timedelta(hours=close_t.hour, minutes=close_t.minute)
@@ -141,13 +138,7 @@ def _build_synthetic_15h_bar_row(schema_cols: list, ticker: str, day_date, close
     return row
 
 def _replace_stop_allocation_bar(df_interval: pd.DataFrame, ticker: str, day_date, close_price: float, volume: float, is_jp: bool = True) -> pd.DataFrame:
-    """
-    指定ティッカー・指定日の既存レコード（取引時間帯全体）を一度全削除してから、
-    大引け固定（日本株: 2024/11/5以降15:30・それ以前は15:00）の1本のバーに置換します。
-
-    ※ 単純追記(append)ではなく「削除→再構築」方式にすることで、
-      同一日が同期のたびに何度再処理されても最終結果が変わらない（べき等）ようにしています。
-    """
+    """指定日の既存レコードを一度全削除してから、大引け固定の1本のバーに置換します。"""
     if df_interval.empty:
         schema_cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
         new_row = _build_synthetic_15h_bar_row(schema_cols, ticker, day_date, close_price, volume, is_jp=is_jp)
@@ -166,7 +157,7 @@ def _replace_stop_allocation_bar(df_interval: pd.DataFrame, ticker: str, day_dat
 def propagate_stop_allocation_bars_to_intraday(stop_days_df: pd.DataFrame, is_jp: bool = True, log_func=None) -> dict:
     def _log(msg):
         if log_func: log_func(msg)
-        else: print(msg)
+        else: print(msg, flush=True)
 
     results = {"60m": 0, "5m": 0, "1m": 0}
     if stop_days_df is None or stop_days_df.empty:
@@ -181,19 +172,14 @@ def propagate_stop_allocation_bars_to_intraday(stop_days_df: pd.DataFrame, is_jp
             continue
 
         db_df["date"] = pd.to_datetime(db_df["date"])
-        
-        # --- 💡 修正箇所：銘柄ごとにDBに存在する「最古」と「最新」の日付範囲を把握する ---
         db_df["date_only"] = db_df["date"].dt.date
         limits_map = db_df.groupby("ticker")["date_only"].agg(["min", "max"]).to_dict(orient="index")
         
         applied = 0
-
         for _, row in stop_days_df.iterrows():
             ticker = row["ticker"]
             day_date = pd.Timestamp(row["date"]).date()
             
-            # 短期足DBに対象銘柄のデータが存在し、かつ該当日の比例配分が
-            # その銘柄の保持期間（最古〜最新）の範囲内である場合のみ修復処理を実行する
             if ticker in limits_map:
                 t_min = limits_map[ticker]["min"]
                 t_max = limits_map[ticker]["max"]
@@ -204,26 +190,22 @@ def propagate_stop_allocation_bars_to_intraday(stop_days_df: pd.DataFrame, is_jp
                     )
                     applied += 1
 
-        # テンポラリ列を削除
         db_df = db_df.drop(columns=["date_only"])
 
         if applied > 0:
             db_df = db_df.sort_values(["ticker", "date"]).reset_index(drop=True)
             save_price_db(db_df, interval, is_jp=is_jp)
             results[interval] = applied
-            _log(f"  🩹 [{interval}] ストップ高安（比例配分）バーを {applied}件 反映（置換・べき等）しました。")
+            _log(f"  🩹 [{interval}] ストップ高安（比例配分）バーを {applied}件 反映しました。")
         else:
             _log(f"  🧊 [{interval}] 保持期間内の対象がないため修復はスキップされました。")
 
     return results
 
 def repair_stop_allocation_bars_full(is_jp: bool = True, status_callback=None) -> dict:
-    """
-    既存Parquetの1d全履歴から「寄り付かずS高/S安（確定済）」日付を再スキャンし、
-    60m/5m/1mの該当日を「大引け固定バー1本のみ」の状態に一括で書き換え修復します（仕様書フローB）。
-    """
+    """比例配分日の大引けバー一括修復。"""
     def log(msg):
-        print(msg)
+        print(msg, flush=True)
         if status_callback: status_callback(msg)
 
     try:
@@ -234,7 +216,7 @@ def repair_stop_allocation_bars_full(is_jp: bool = True, status_callback=None) -
 
     stop_days_df = detect_allocation_stop_days(db_1d)
     if stop_days_df.empty:
-        log("🧊 確定済みの「寄り付かずS高/S安」日は検出されませんでした。")
+        log("🧊 確定済みの比例配分日は検出されませんでした。")
         return {}
 
     log(f"🔍 確定済みの比例配分日を {len(stop_days_df)}件 検出しました。短期足の一括修復を開始します...")
@@ -244,10 +226,7 @@ def repair_stop_allocation_bars_full(is_jp: bool = True, status_callback=None) -
     return results
 
 def check_anomaly_need_patch(df_ticker: pd.DataFrame, cliff_date_str: str, multiplier: float, threshold: float = 0.10) -> bool:
-    """
-    指定された崖日付（cliff_date_str）の前後のClose価格を検証し、
-    パッチ適用が必要かどうかを判定する（仕様書の数式に基づく）。
-    """
+    """パッチ適用が必要か判定します。"""
     if df_ticker.empty or len(df_ticker) < 2:
         return False
         
@@ -259,9 +238,7 @@ def check_anomaly_need_patch(df_ticker: pd.DataFrame, cliff_date_str: str, multi
     except Exception:
         return False
     
-    # 崖日直前のレコード（target_dtより前の最大日付）
     before_rows = df_t[df_t["date_dt"] < target_dt]
-    # 崖日当日のレコード（target_dt以降の最小日付）
     after_rows = df_t[df_t["date_dt"] >= target_dt]
     
     if before_rows.empty or after_rows.empty:
@@ -276,7 +253,6 @@ def check_anomaly_need_patch(df_ticker: pd.DataFrame, cliff_date_str: str, multi
     r_raw = p_after / p_before
     r_adjusted = p_after / (p_before * multiplier)
     
-    # 仕様書の判定条件: |R_adjusted - 1.0| <= |R_raw - 1.0| - threshold
     if abs(r_adjusted - 1.0) <= abs(r_raw - 1.0) - threshold:
         return True
     return False
@@ -457,24 +433,22 @@ def merge_price_data(old_df: pd.DataFrame, new_df: pd.DataFrame, interval: str, 
     return combined.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: bool = True, log_func=None):
-    """日足等で検知した株式分割を、短期足DB(60m, 5m, 1m)へ調整適用します。"""
+    """株式分割を短期足DB(60m, 5m, 1m)へ調整適用。"""
     def _log(msg):
         if log_func: log_func(msg)
-        else: print(msg)
+        else: print(msg, flush=True)
 
     ticker_symbol = f"{ticker}.T" if is_jp and ticker.isdigit() else ticker
     try:
         df_check = yf.download(ticker_symbol, period="5d", interval="1d", auto_adjust=False, progress=False)
         if df_check.empty: return
 
-        # --- MultiIndex問題解消: シングルティッカーでもMultiIndexカラムが返る場合がある ---
         if isinstance(df_check.columns, pd.MultiIndex):
             try:
                 df_check = df_check.xs(ticker_symbol, axis=1, level=1)
             except Exception:
                 df_check.columns = df_check.columns.get_level_values(0)
 
-        # --- タイムゾーンのnaive統一: 双方のdatetimeをnaiveに揃えてから比較する ---
         if df_check.index.tz is not None:
             df_check.index = df_check.index.tz_localize(None)
         check_dates = df_check.index
@@ -502,7 +476,6 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
                 matching_check_row = df_check[df_check.index.date == check_date_only]
                 if not matching_check_row.empty:
                     close_val = matching_check_row["Close"]
-                    # --- MultiIndex/Series混在ガード: 常にスカラー価格を安全に抽出 ---
                     if isinstance(close_val, pd.DataFrame):
                         close_val = close_val.iloc[:, 0]
                     price_real = close_val.iloc[-1]
@@ -512,7 +485,7 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
                         apply_split = False
             
             if apply_split:
-                _log(f"  🔄 [{ticker}] {interval} に分割調整を適用中 (ratio: {split_ratio:.4f})...")
+                _log(f"  🔄 [{ticker}] {interval} に分割調整を適用 (ratio: {split_ratio:.4f})...")
                 price_cols = ["open", "high", "low", "close", "adj close"]
                 for col in price_cols:
                     if col in db_df.columns:
@@ -524,13 +497,16 @@ def propagate_split_to_other_timeframes(ticker: str, split_ratio: float, is_jp: 
             pass
 
 def update_price_database(is_jp: bool = True, target_tickers: list = None, force_refetch: bool = False, status_callback=None):
-    """時間足(1d, 60m, 5m, 1m)データベースの同期を実行します。"""
+    """【差分同期用】時間足(1d, 60m, 5m, 1m)データベースの同期を実行します。"""
     market_name = "JP" if is_jp else "US"
     tickers = target_tickers if target_tickers else []
     
     def log(msg):
-        print(msg)
-        if status_callback: status_callback(msg)
+        # 画面およびコンソールへリアルタイム出力 (セグフォ直前ログの追跡性を上げるため flush=True)
+        print(f"[SYNC-DB] {msg}", flush=True)
+        sys.stdout.flush()
+        if status_callback: 
+            status_callback(msg)
             
     if is_jp and not tickers:
         tickers = get_all_collection_tickers()
@@ -539,14 +515,13 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         log(f"[{market_name}] 更新対象銘柄がありません。")
         return
 
-    # --- 修正A: サーバーTZに依存しない、市場基準のローカライズされた現在時刻を使用 ---
     now_tz, local_today = get_market_localized_now(is_jp)
     now = now_tz.replace(tzinfo=None)
     suffix = ".T" if is_jp else ""
     tickers = [sanitize_ticker(t, is_jp) for t in tickers]
 
     for interval in settings.TIMEFRAMES:
-        log(f"⏱️ 【{market_name}】{interval} データベース同期開始...")
+        log(f"⏱️ 【{market_name}】{interval} データベース同期開始... {get_memory_usage_str()}")
         try:
             db_df = load_price_db(interval, is_jp=is_jp)
         except FileNotFoundError as e:
@@ -631,7 +606,6 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                     continue
                 start_date_str = start_date_dt.strftime("%Y-%m-%d")
 
-            # ── 修正D: yfinance取得可能期限切れ（デッドロック）の事前検知 ──
             if interval in YFINANCE_GAP_LIMITS:
                 limit_days = YFINANCE_GAP_LIMITS[interval]
                 try:
@@ -645,18 +619,23 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                         sample_tickers = ", ".join(chunk_tickers[:5]) + ("..." if len(chunk_tickers) > 5 else "")
                         log(
                             f"⚠️【警告】[{interval}] {sample_tickers} の空白期間が {gap_days} 日となり、"
-                            f"yfinanceの取得可能上限（{limit_days}日）を超えたため同期できません。"
-                            f"一括再構築を実行してください。"
+                            f"yfinanceの上限（{limit_days}日）を超えたため同期できません。"
                         )
                         continue
-                    else:
-                        log(f"  ✅ [{interval}] 空白期間 {gap_days}日（上限{limit_days}日）は取得可能範囲内です。追加データを取得します。")
 
+            # BATCH処理の逐次ダウンロード監視
             BATCH_SIZE = 100
             for i in range(0, len(chunk_tickers), BATCH_SIZE):
                 chunk = chunk_tickers[i:i+BATCH_SIZE]
                 symbols = [f"{t}{suffix}" for t in chunk]
+                
+                mem_before = get_memory_usage_str()
+                log(f"📥 [DL開始] {interval} バッチ {i+1}〜{min(i+BATCH_SIZE, len(chunk_tickers))} | 銘柄数: {len(chunk)} | {mem_before}")
+                log(f"   👉 銘柄サンプル: {', '.join(chunk[:8])}")
+                
                 try:
+                    log(f"   ⚡ yf.download() 呼び出し開始 (threads=True)...")
+                    # yfinanceの呼び出し直前で落ちる場合は、マルチスレッド(threads=True)によるCライブラリ競合です
                     df_raw = yf.download(
                         symbols, 
                         start=start_date_str,
@@ -667,22 +646,37 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                         threads=True, 
                         timeout=30
                     )
-                    chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
-                    if not chunk_processed.empty:
-                        all_downloaded.append(chunk_processed)
+                    
+                    mem_after_dl = get_memory_usage_str()
+                    log(f"   ✅ yf.download() 完了 | 生データ形状: {df_raw.shape if not df_raw.empty else '空'} | {mem_after_dl}")
+                    
+                    if not df_raw.empty:
+                        log(f"   ⚙️ parse_yfinance_batch() 処理開始...")
+                        chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
+                        mem_after_parse = get_memory_usage_str()
+                        log(f"   ✅ parse 完了 | 成形データ件数: {len(chunk_processed)}件 | {mem_after_parse}")
+                        
+                        if not chunk_processed.empty:
+                            all_downloaded.append(chunk_processed)
+                    else:
+                        log("   ⚠️ 取得したDataFrameは空でした。")
+                        
                 except Exception as e:
-                    log(f"     Batch Error: {e}")
+                    log(f"   ❌ Batch Error: {e}")
+                
+                # ループごとの不要メモリの強制解放
+                del df_raw
+                gc.collect()
                 time.sleep(1)
 
         if all_downloaded:
+            log(f"🔄 全バッチ取得終了。マージ処理に移ります... {get_memory_usage_str()}")
             new_combined = pd.concat(all_downloaded, ignore_index=True)
             if "date" in new_combined.columns:
-                # --- 修正A: 時間ベースの確定（finalize）判定ロジックを適用 ---
                 new_combined["is_finalized"] = compute_is_finalized(new_combined["date"], interval, is_jp=is_jp)
             
             reset_tickers = []
             if interval == "1d":
-                # --- 修正B: 確定データ（is_finalized == True）のみを権利落ち検知の対象にフィルタリング ---
                 if "is_finalized" in new_combined.columns:
                     finalized_for_detection = new_combined[new_combined["is_finalized"] == True]
                 else:
@@ -718,11 +712,11 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
                     db_df = load_price_db(interval, is_jp=is_jp)
             
             if not new_combined.empty:
+                log(f"💾 Parquetマージ及び書き込み開始... {get_memory_usage_str()}")
                 db_df = merge_price_data(db_df, new_combined, interval, is_jp=is_jp)
                 save_price_db(db_df, interval, is_jp=is_jp)
-                log(f"  ✅ {interval} データベース更新完了。")
+                log(f"  ✅ {interval} データベース更新完了。 {get_memory_usage_str()}")
 
-                # --- 追加: ストップ高安（寄り付かず比例配分）バーの自動移植（未確定データ安全ガード付き） ---
                 if interval == "1d":
                     try:
                         updated_tickers = set(new_combined["ticker"].unique())
@@ -736,7 +730,6 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         else:
             log(f"  🧊 追加データはありません。")
 
-    # ── 後処理: スプレッドシートのパッチ定義を「断絶事前チェック付き」で自動再適用 ──
     log("🔄 【整合性自動復元】全体更新完了に伴い、保存済みの手動修復パッチを自動適用します...")
     try:
         apply_all_saved_patches(is_jp=is_jp, status_callback=status_callback)
@@ -744,10 +737,12 @@ def update_price_database(is_jp: bool = True, target_tickers: list = None, force
         log(f"⚠️ パッチの自動復元プロセス中にエラーが発生しました: {e}")
 
 def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_callback=None) -> bool:
-    """指定市場の該当時間足データベースを完全新規再構築（クリーンビルド）し、自動パッチ適用エンジンを走らせます。"""
+    """【完全クリーンビルド用】指定市場の該当時間足データベースを完全新規再構築します。"""
     def log(msg):
-        print(msg)
-        if status_callback: status_callback(msg)
+        print(f"[REBUILD-DB] {msg}", flush=True)
+        sys.stdout.flush()
+        if status_callback: 
+            status_callback(msg)
 
     market_name = "JP" if is_jp else "US"
     if is_jp:
@@ -768,16 +763,19 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
     elif interval == "60m": start_date_dt = now - timedelta(days=718)
     else: start_date_dt = datetime(2016, 1, 1)
         
-    log(f"🚨 [フル再構築] {market_name} ({interval}) 開始。総数: {len(tickers)}")
+    log(f"🚨 [フル再構築] {market_name} ({interval}) 開始。総数: {len(tickers)} | {get_memory_usage_str()}")
     
     all_downloaded = []
     BATCH_SIZE = 30
     for i in range(0, len(tickers), BATCH_SIZE):
         chunk = tickers[i:i+BATCH_SIZE]
         symbols = [f"{t}{suffix}" for t in chunk]
-        log(f"  📥 ダウンロード中 ({i + 1}〜{min(i + BATCH_SIZE, len(tickers))}): {', '.join(chunk[:5])}...")
+        
+        mem_before = get_memory_usage_str()
+        log(f"📥 一括DL ({i + 1}〜{min(i + BATCH_SIZE, len(tickers))}): {', '.join(chunk[:5])}... | {mem_before}")
         
         try:
+            log(f"   ⚡ yf.download() 開始 (threads=True)...")
             df_raw = yf.download(
                 symbols,
                 start=start_date_dt.strftime("%Y-%m-%d"),
@@ -788,22 +786,37 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
                 threads=True,
                 timeout=30
             )
-            chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
-            if not chunk_processed.empty:
-                all_downloaded.append(chunk_processed)
+            
+            mem_after_dl = get_memory_usage_str()
+            log(f"   ✅ yf.download() 完了 | 生データ形状: {df_raw.shape if not df_raw.empty else '空'} | {mem_after_dl}")
+            
+            if not df_raw.empty:
+                log(f"   ⚙️ parse_yfinance_batch() 処理開始...")
+                chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
+                mem_after_parse = get_memory_usage_str()
+                log(f"   ✅ parse 完了 | 成形データ件数: {len(chunk_processed)}件 | {mem_after_parse}")
+                
+                if not chunk_processed.empty:
+                    all_downloaded.append(chunk_processed)
+            else:
+                log("   ⚠️ 取得したDataFrameは空でした。")
         except Exception as e:
             log(f"    -> ⚠️ エラー: {e}")
+            
+        del df_raw
+        gc.collect()
         time.sleep(1.5)
         
     if all_downloaded:
+        log(f"💾 Parquet一括マージ・保存処理中... {get_memory_usage_str()}")
         final_df = pd.concat(all_downloaded, ignore_index=True)
         if "date" in final_df.columns:
             final_df["is_finalized"] = compute_is_finalized(final_df["date"], interval, is_jp=is_jp)
         
         final_df = final_df.sort_values(["ticker", "date"]).reset_index(drop=True)
         save_price_db(final_df, interval, is_jp=is_jp)
+        log(f"🎉 再構築データ保存完了！ {get_memory_usage_str()}")
 
-        # ── 後処理: スプレッドシートのパッチ定義を「断絶事前チェック付き」で自動再適用 ──
         log("🔄 【整合性自動復元】フル再構築完了に伴い、保存済みの手動修復パッチを自動適用します...")
         try:
             apply_all_saved_patches(is_jp=is_jp, status_callback=status_callback)
@@ -854,7 +867,7 @@ def rebuild_single_ticker_db(ticker: str, is_jp: bool = True, interval: str = "1
         return False
 
 def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_split_ratio: float = None) -> dict:
-    """指定された特定銘柄の1d〜1mすべての時間足を重複排除・部分置換マージで安全修復し、共通パッチ適用エンジンを実行します。"""
+    """特定銘柄の安全修復。"""
     pure_ticker = sanitize_ticker(ticker, is_jp)
     symbol = get_download_symbol(pure_ticker, is_jp)
     now = datetime.now()
@@ -878,7 +891,6 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
 
                 new_df["is_finalized"] = True
                 
-                # 1d は完全なクリーン上書き
                 if not db_df.empty:
                     db_df = db_df[db_df["ticker"] != pure_ticker]
                 db_df = pd.concat([db_df, new_df], ignore_index=True)
@@ -887,7 +899,6 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
                 results["1d"] = f"完全再構築成功 ({len(new_df):,}件)"
                 continue
 
-            # 短期足（60m, 5m, 1m）
             try:
                 db_df = load_price_db(interval, is_jp=is_jp)
             except FileNotFoundError:
@@ -909,7 +920,6 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
 
             new_df["is_finalized"] = True
 
-            # 重複期間だけ部分置換マージ
             if not old_df.empty:
                 new_dates = pd.to_datetime(new_df["date"])
                 old_df["date_dt"] = pd.to_datetime(old_df["date"])
@@ -929,7 +939,6 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
         except Exception as e:
             results[interval] = f"エラー: {str(e)}"
 
-    # ── 後処理: 保存済みパッチの冪等再適用 ──
     try:
         apply_all_saved_patches(is_jp=is_jp)
     except Exception as e:
@@ -938,7 +947,7 @@ def repair_single_ticker_all_timeframes(ticker: str, is_jp: bool = True, forced_
     return results
 
 def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
-    """配信異常などによる価格の急変（崖・負の数値など）を検出し後ろ向きスケール調整します。"""
+    """異常値の後ろ向きスケール調整。"""
     if df.empty:
         return df, []
     df = df.sort_values("date").reset_index(drop=True)
@@ -985,7 +994,7 @@ def backward_scale_repair(df: pd.DataFrame, threshold: float = 0.35) -> tuple:
     return df, repairs
 
 def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: float = 0.35) -> pd.DataFrame:
-    """全銘柄を対象に、異常価格（崖・負の値）をスキャンし、推測比率や1日前/当日の四本値を含めてリスト化します。"""
+    """異常データをスキャン。"""
     try:
         db_df = load_price_db(interval, is_jp=is_jp)
     except FileNotFoundError:
@@ -997,7 +1006,6 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
     has_adj = "adj close" in db_df.columns
     result_rows = []
 
-    # 負の株価チェック
     negative_mask = db_df["close"] < 0
     shifted_neg_mask_for_pos = db_df.groupby("ticker")["close"].apply(lambda x: (x < 0).shift(1, fill_value=True)).reset_index(level=0, drop=True)
     pos_to_neg = negative_mask & (~shifted_neg_mask_for_pos)
@@ -1024,7 +1032,6 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
                 
         result_rows.append(boundary_rows[["ticker", "date", "before_close", "after_close", "before_adj_close", "after_adj_close", "open", "high", "low", "volume", "pct_change"]])
 
-    # 崖（急変）チェック
     abs_close = db_df["close"].abs()
     pct = abs_close.groupby(db_df["ticker"]).pct_change()
     cliff_mask = pct.abs() >= threshold
@@ -1088,7 +1095,7 @@ def scan_all_anomalies(is_jp: bool = True, interval: str = "1d", threshold: floa
     return result.sort_values(["ticker", "cliff_date"]).reset_index(drop=True)
 
 def apply_scale_repair_with_intraday_propagation(ticker: str, is_jp: bool = True, threshold: float = 0.35, dry_run: bool = False) -> dict:
-    """指定銘柄の日足異常を修復したうえで、その倍率を分足等の短期足データベースへ波及させます。"""
+    """指定銘柄の日足異常を修復したうえで、倍率を分足へ波及。"""
     pure_ticker = sanitize_ticker(ticker, is_jp)
     results = {}
     try:
@@ -1155,7 +1162,7 @@ def apply_scale_repair_with_intraday_propagation(ticker: str, is_jp: bool = True
     return results
 
 def run_database_health_scan(is_jp: bool) -> list:
-    """全タイムフレームのParquetデータベースを自動スキャンし、異常陥没・高騰・段差などを診断します。"""
+    """全タイムフレームのParquetデータベース健康診断。"""
     anomalies = []
     for interval in ["1d", "60m", "5m", "1m"]:
         try:
@@ -1273,12 +1280,9 @@ def run_database_health_scan(is_jp: bool) -> list:
     return anomalies
 
 def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, multiplier: float, is_jp: bool = True) -> dict:
-    """指定された銘柄と崖日付、修正倍率に基づいて、断絶事前チェックを行い、必要な時間足にのみ補正（後ろ向き調整）を強制適用します。"""
-
-    # --- 安全ガードを追加 ---
+    """補正（後ろ向き調整）を適用します。"""
     if multiplier <= 0:
         return {"error": f"処理を中断しました。倍率に 0 以下の数値（{multiplier}）は指定できません。"}
-    # ----------------------
 
     pure_ticker = sanitize_ticker(ticker, is_jp)
     results = {}
@@ -1303,7 +1307,6 @@ def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, mul
             results[interval] = "対象データなし"
             continue
 
-        # ── 断絶事前チェック（既に平らな足への二重適用を防ぐ） ──
         need_apply = check_anomaly_need_patch(ticker_data, cliff_date, multiplier)
         if not need_apply:
             results[interval] = "スキップ（既に調整済み、または適用不要な落差です）"
@@ -1338,9 +1341,9 @@ def apply_forced_scale_patch_to_all_timeframes(ticker: str, cliff_date: str, mul
     return results
 
 def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
-    """スプレッドシートから修復ログ/パッチ定義一覧を読み込み、断絶事前チェック付きでParquetデータベースに一括自動適用（冪等復元）します。"""
+    """パッチの自動復元。"""
     def log(msg):
-        print(msg)
+        print(msg, flush=True)
         if status_callback: status_callback(msg)
 
     try:
@@ -1387,10 +1390,8 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
         log("🧊 有効な再適用対象パッチはありませんでした。")
         return 0
 
-    # 崖日時の降順（最新パッチから順）に検証・適用
     valid_patches = sorted(valid_patches, key=lambda x: x["cliff_date"], reverse=True)
-
-    log(f"🛠️ [パッチ一括再適用] {len(valid_patches)}件の定義を「断絶事前チェック」を挟んで適用します...")
+    log(f"🛠️ [パッチ一括再適用] {len(valid_patches)}件の定義を適用します...")
     
     success_count = 0
     for patch in valid_patches:
@@ -1406,15 +1407,12 @@ def apply_all_saved_patches(is_jp: bool = True, status_callback=None) -> int:
             success_count += 1
             log(f"  👉 適用完了: [{t}] 崖日: {dt_str} | 比率: {mul:.6f} ({memo})")
             log(f"     ➔ 1d: {res.get('1d', 'なし')}, 60m: {res.get('60m', 'なし')}")
-        else:
-            # 既に適用済みの場合は二重適用にならず、安全にスルーされます
-            pass
             
-    log(f"🎉 [パッチ一括再適用] 処理完了。新規適用: {success_count} / {len(valid_patches)} 件（他は適用済みのため安全にスルーされました）")
+    log(f"🎉 [パッチ一括再適用] 処理完了。新規適用: {success_count} / {len(valid_patches)} 件")
     return success_count
 
 def delete_data_before_date(ticker: str, limit_date_str: str, is_jp: bool = True) -> dict:
-    """指定された特定銘柄において、指定日以前（含む）のデータをすべての時間足から完全に物理削除します。"""
+    """指定日以前のデータを物理削除します。"""
     pure_ticker = sanitize_ticker(ticker, is_jp)
     limit_dt = pd.to_datetime(limit_date_str)
     results = {}
@@ -1427,7 +1425,6 @@ def delete_data_before_date(ticker: str, limit_date_str: str, is_jp: bool = True
                 continue
             
             db_df["temp_date"] = pd.to_datetime(db_df["date"])
-            
             mask_to_delete = (db_df["ticker"] == pure_ticker) & (db_df["temp_date"] <= limit_dt)
             deleted_count = mask_to_delete.sum()
             
