@@ -211,6 +211,7 @@ def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataF
                 actual_ratio = pre_close / post_close
                 unadjusted_mask = (df.index < idx) & (df["split_multiplier"] == 1.0)
                 
+                # 💡 価格差と分割値の誤差を検証して遡及適用する安全ガード
                 if unadjusted_mask.any() and abs(actual_ratio - split_val) / split_val <= 0.15:
                     ratio = 1.0 / split_val
                     for col in price_cols:
@@ -380,8 +381,8 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
     
     return df_result
 
-def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = False, skip_assertion: bool = False, status_callback=None, log_accumulator: list = None, repair_log_df: pd.DataFrame = None) -> bool:
-    """RawデータからActiveデータの加工ビルドとアサーション検証（Dry Run時の一時ファイル保存・プレビュー制限対応）。"""
+def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = False, skip_assertion: bool = False, status_callback=None, log_accumulator: list = None, repair_log_df: pd.DataFrame = None, raw_df: pd.DataFrame = None) -> bool:
+    """RawデータからActiveデータの加工ビルドとアサーション検証（依存性の注入・分割ログ追跡版）。"""
     import gc
     import sys
     import pandas as pd
@@ -404,7 +405,13 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
 
     log(f"🏗️ [{interval}] RawデータからActiveデータの加工ビルドを開始します...")
     
-    df_raw = load_price_db(interval, is_jp=is_jp, is_raw=True)
+    # 💡 依存性の注入（DI）: すでにメモリ上にデータがあればそれをコピーして再利用、なければディスクからロード
+    if raw_df is not None:
+        df_raw = raw_df.copy()
+        log("💡 メモリ上に展開済みのRawデータをインメモリ再利用します（ディスク二重ロードを回避しました）。")
+    else:
+        df_raw = load_price_db(interval, is_jp=is_jp, is_raw=True)
+        
     if df_raw.empty:
         log("❌ Rawデータベースファイルが空、または検出されません。")
         return False
@@ -436,9 +443,22 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
                 
             group = df_raw[ticker_mask].copy()
             group_sorted = group.sort_values("date")
+            
+            # 💡 補正前の状態（未調整状態）をマーク
+            had_unadjusted = "split_multiplier" not in group_sorted.columns or (group_sorted["split_multiplier"] == 1.0).all()
+            
             adjusted_group = adjust_ticker_splits_backward_in_memory(group_sorted)
             
             if not adjusted_group.empty:
+                # 💡 実際に補正が行われたかどうかを検証し、補正が適用された場合にのみ詳細ログを書き出す
+                has_adjusted = "split_multiplier" in adjusted_group.columns and (adjusted_group["split_multiplier"] != 1.0).any()
+                
+                if had_unadjusted and has_adjusted:
+                    splits_info = adjusted_group[(adjusted_group["stock splits"] > 0) & (adjusted_group["stock splits"] != 1.0)]
+                    for _, s_row in splits_info.iterrows():
+                        split_date_str = pd.to_datetime(s_row["date"]).strftime("%Y-%m-%d %H:%M")
+                        log(f"  👉 【株式分割補正適用】銘柄: {ticker} | 実施日(権利落ち日): {split_date_str} | 分割比率: {s_row['stock splits']} | それ以前の過去価格を 1/{s_row['stock splits']} に遡及補正しました。")
+                
                 adjusted_group.index = group_sorted.index
                 valid_cols = [c for c in cols_to_write if c in df_raw.columns and c in adjusted_group.columns]
                 df_raw.loc[adjusted_group.index, valid_cols] = adjusted_group[valid_cols]
@@ -465,13 +485,10 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
             print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [REBUILD_ACTIVE] ストップ高安バーの補完を開始...")
             sys.stdout.flush()
             
-            # 🚀 1dアクティブデータから必要最小限の列だけを省メモリでロードする
             cols_needed = ["ticker", "date", "open", "high", "low", "close", "volume"]
             try:
-                # 'is_finalized' カラムがある場合は一緒に読み込む
                 df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False, is_temp=dry_run, columns=cols_needed + ["is_finalized"])
             except Exception:
-                # 存在しない、あるいは読み込み失敗した場合は基本カラムのみ
                 df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False, is_temp=dry_run, columns=cols_needed)
                 
             df_processed = propagate_stop_allocation_bars_in_memory(df_1d_active, df_processed, is_jp=is_jp)
@@ -514,7 +531,6 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
         log(f"🧪 [DRY RUN] {interval} 加工・アサーション検証を正常に通過。ディスク（_temp.parquet）に一時保存します...")
         df_processed = df_processed.sort_values(["ticker", "date"]).reset_index(drop=True)
         
-        # 巨大DFはメモリから直ちに退避（Googleドライブ同期はスキップ）
         local_success, local_msg = save_price_db(df_processed, interval, is_jp=is_jp, is_raw=False, is_temp=True)
         
         if local_success:
@@ -524,7 +540,6 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
             
         if settings.HAS_STREAMLIT:
             import streamlit as st
-            # 🚀 .copy(deep=True) を追加して元の配列データとの参照を遮断し、メモリを開放可能にする
             st.session_state[f"temp_verified_active_preview_{interval}"] = df_processed.head(100).copy(deep=True)
             st.session_state[f"temp_verified_active_exists_{interval}"] = True
             
@@ -958,9 +973,7 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
     all_downloaded = []
     failed_tickers = []
     
-    # 💡 1バッチのサイズを 30 から 100 に拡大してAPIコール回数を約 1/3 に削減
     BATCH_SIZE = 100
-    
     for i in range(0, len(tickers), BATCH_SIZE):
         chunk = tickers[i:i+BATCH_SIZE]
         symbols = [f"{t}{suffix}" for t in chunk]
@@ -981,7 +994,7 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
                 auto_adjust=False,
                 actions=True,
                 progress=False,
-                threads=False,  # 💡 429(レート制限)を防ぐためシングルスレッドのまま安全に取得
+                threads=False,
                 timeout=30
             )
             
@@ -999,7 +1012,6 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
                 
                 if not chunk_processed.empty:
                     all_downloaded.append(chunk_processed)
-                    # 💡 取得・パースを通過した銘柄を割り出し、何らかの理由で欠損した銘柄を「失敗リスト」に自動追加
                     downloaded_tickers = chunk_processed["ticker"].unique().tolist()
                     missing = [t for t in chunk if t not in downloaded_tickers]
                     if missing:
@@ -1010,7 +1022,6 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
                 print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] [API_WARNING] Returned DataFrame is EMPTY.")
                 sys.stdout.flush()
                 failed_tickers.extend(chunk)
-                
         except Exception as e:
             print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] [BATCH_ERROR] Error during rebuild: {e}")
             import traceback
@@ -1018,22 +1029,17 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
             sys.stdout.flush()
             log(f"    -> ⚠️ エラー: {e}")
             failed_tickers.extend(chunk)
-            
-        # 💡 バッチ間のウェイトを 3.5秒 にあけてレートリミットを大幅緩和
         time.sleep(3.5)
         
-    # 🩹 失敗した銘柄に対する自動リカバリ（リトライ）ループ
     if failed_tickers:
-        failed_tickers = list(set(failed_tickers)) # 重複の排除
+        failed_tickers = list(set(failed_tickers))
         log(f"🔄 【自動リトライ】ダウンロードに失敗した {len(failed_tickers)} 銘柄のリカバリ処理を開始します...")
         
-        # リトライ時は規制を警戒し、10銘柄ずつの超小分けバッチでゆっくりと回収
         retry_batch_size = 10
         for r_i in range(0, len(failed_tickers), retry_batch_size):
             r_chunk = failed_tickers[r_i:r_i+retry_batch_size]
             r_symbols = [f"{t}{suffix}" for t in r_chunk]
             
-            # サーバーの流量監視が落ち着くまで多めのインターバル（5秒）を挿入
             time.sleep(5.0)
             log(f"  📥 リトライ中 ({r_i+1}〜{min(r_i+retry_batch_size, len(failed_tickers))}): {', '.join(r_chunk[:5])}...")
             
@@ -1070,7 +1076,8 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
         else:
             log(f"⚠️ [Raw保存警告] RawデータのGoogleドライブ同期に失敗しました。エラー: {cloud_msg}")
         
-        return rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, skip_assertion=True, status_callback=status_callback)
+        # 💡 保存直後の final_df を raw_df へ「注入」し、再度のディスクロードをスキップさせます
+        return rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=dry_run, skip_assertion=True, status_callback=status_callback, raw_df=final_df)
     
     return False
 
