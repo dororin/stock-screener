@@ -929,7 +929,7 @@ def execute_apply_verified_temp_dbs_to_active(is_jp: bool = True, status_callbac
 def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_callback=None, dry_run: bool = False) -> bool:
     """物理削除からの完全な白紙クリーンビルド。"""
     def log(msg):
-        print(f"[CONSOLE_DEBUG] [FULL_REBUILD] {msg}")
+        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] {msg}")
         sys.stdout.flush()
         if status_callback: status_callback(msg)
 
@@ -963,13 +963,13 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
         chunk = tickers[i:i+BATCH_SIZE]
         symbols = [f"{t}{suffix}" for t in chunk]
         
-        print(f"[CONSOLE_DEBUG] [START_FULL_REBUILD] Batch {i//BATCH_SIZE + 1} / {(len(tickers)-1)//BATCH_SIZE + 1} (Tickers: {chunk})")
+        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] [START] Batch {i//BATCH_SIZE + 1} / {(len(tickers)-1)//BATCH_SIZE + 1} (Tickers: {chunk[:5]}...)")
         sys.stdout.flush()
         
         log(f"  📥 ダウンロード中 ({i + 1}〜{min(i + BATCH_SIZE, len(tickers))}): {', '.join(chunk[:5])}...")
         
         try:
-            print(f"[CONSOLE_DEBUG] [API_CALL_REBUILD] Requesting {len(symbols)} symbols...")
+            print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] [API_CALL] Requesting {len(symbols)} symbols...")
             sys.stdout.flush()
             
             df_raw = yf.download(
@@ -983,25 +983,25 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
                 timeout=30
             )
             
-            print(f"[CONSOLE_DEBUG] [API_SUCCESS_REBUILD] df_raw shape: {df_raw.shape if not df_raw.empty else 'EMPTY'}")
+            print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] [API_SUCCESS] df_raw shape: {df_raw.shape if not df_raw.empty else 'EMPTY'}")
             sys.stdout.flush()
             
             if not df_raw.empty:
-                print(f"[CONSOLE_DEBUG] [PARSE_REBUILD] Parsing downloaded chunk...")
+                print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] [PARSE] Parsing downloaded chunk...")
                 sys.stdout.flush()
                 
                 chunk_processed = parse_yfinance_batch(df_raw, chunk, is_jp=is_jp)
                 
-                print(f"[CONSOLE_DEBUG] [PARSE_SUCCESS_REBUILD] Processed rows: {len(chunk_processed)}")
+                print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] [PARSE_SUCCESS] Processed rows: {len(chunk_processed)}")
                 sys.stdout.flush()
                 
                 if not chunk_processed.empty:
                     all_downloaded.append(chunk_processed)
             else:
-                print(f"[CONSOLE_DEBUG] [API_WARNING_REBUILD] Returned DataFrame is EMPTY.")
+                print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] [API_WARNING] Returned DataFrame is EMPTY.")
                 sys.stdout.flush()
         except Exception as e:
-            print(f"[CONSOLE_DEBUG] [BATCH_ERROR_REBUILD] Error during rebuild: {e}")
+            print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] [BATCH_ERROR] Error during rebuild: {e}")
             import traceback
             traceback.print_exc()
             sys.stdout.flush()
@@ -1012,7 +1012,7 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
         final_df = pd.concat(all_downloaded, ignore_index=True)
         final_df = final_df.sort_values(["ticker", "date"]).reset_index(drop=True)
         
-        print(f"[CONSOLE_DEBUG] [REBUILD_COMPLETE] All chunks merged. Saving raw database...")
+        print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] [REBUILD_COMPLETE] All chunks merged. Saving raw database...")
         sys.stdout.flush()
         
         cloud_success, cloud_msg = save_price_db(final_df, interval, is_jp=is_jp, is_raw=True)
