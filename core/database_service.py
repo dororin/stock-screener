@@ -934,14 +934,10 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
         if status_callback: status_callback(msg)
 
     market_name = "JP" if is_jp else "US"
+    
+    # 🚨 修正：廃止された sync_extra_tickers_to_local() の呼び出しを完全に削除し、
+    # 🚨 常にクリーンな get_all_collection_tickers() を一撃で呼び出すように単純化
     if is_jp:
-        try:
-            from core.collector import sync_extra_tickers_to_local
-            sync_extra_tickers_to_local()
-            log("🔄 Google Sheetsから最新の追加収集ETFマスタを取得し、同期しました。")
-        except Exception as e:
-            log(f"⚠️ 追加収集ETFマスタの同期に失敗したため、既存のローカルキャッシュを使用します: {e}")
-            
         tickers = get_all_collection_tickers()
     else:
         tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]

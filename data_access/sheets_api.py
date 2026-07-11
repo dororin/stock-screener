@@ -58,15 +58,7 @@ def get_drive_service():
         return None
 
 def upload_sync_log_to_drive(log_lines: list, is_jp: bool = True, prefix: str = "sync") -> str:
-    """
-    同期処理中にメモリへ蓄積された詳細ログ（文字列のリスト）を、
-    実行した市場モード（is_jp）のローカルタイムゾーン（JST/EST）の日時をファイル名に含め、
-    settings.LOGS_FOLDER_ID で指定されたGoogleドライブのフォルダへ1回だけバッチアップロードします。
-
-    ファイル名形式: {prefix}_YYYY-MM-DD_HHMMSS.log （例: sync_2026-07-02_203045.log）
-
-    戻り値: アップロードに成功した場合はファイル名の文字列、失敗またはログが空の場合は None。
-    """
+    """同期処理中にメモリへ蓄積された詳細ログ（文字列のリスト）をバッチアップロードします。"""
     if not log_lines:
         return None
 
@@ -83,7 +75,6 @@ def upload_sync_log_to_drive(log_lines: list, is_jp: bool = True, prefix: str = 
     try:
         from googleapiclient.http import MediaInMemoryUpload
 
-        # 同期を実行した市場モードのローカルタイムゾーンを基準に日時を算出
         tz = pytz.timezone("Asia/Tokyo") if is_jp else pytz.timezone("America/New_York")
         now_tz = datetime.now(pytz.utc).astimezone(tz)
         filename = f"{prefix}_{now_tz.strftime('%Y-%m-%d_%H%M%S')}.log"
@@ -154,9 +145,10 @@ def load_history(screening_id: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-# --- セクター定義シート連携 ---
+# --- セクター定義シート連携（非表示ONセクターを自動除外） ---
 def load_sector_master_from_sheets(is_jp: bool) -> dict:
-    """Google Sheetsのセクター定義シートから、セクターと構成ティッカーの対応マップを構築して返します。"""
+    """Google Sheetsのセクター定義シートから、セクターと構成ティッカーの対応マップを構築して返します。
+    extra_tickers（手動台帳）で「非表示: ON」に設定されているセクターは自動的に除外します。"""
     sh = get_sector_spreadsheet()
     default_sectors = settings.JP_SECTORS if is_jp else settings.US_SECTORS
     if sh is None:
@@ -164,6 +156,27 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
     
     sheet_name = "sector_JP" if is_jp else "sector_US"
     try:
+        # --- 1. 手動定義シート（extra_tickers）から非表示セクター名を特定 ---
+        hidden_sectors = set()
+        try:
+            ws_manual = sh.worksheet(settings.EXTRA_TICKERS_SHEET)
+            manual_records = ws_manual.get_all_values()
+            if manual_records and len(manual_records) > 1:
+                manual_headers = [str(h).strip() for h in manual_records[0]]
+                sec_col_idx = next((i for i, h in enumerate(manual_headers) if h in ["セクター名", "sector", "sector_name"]), -1)
+                hide_col_idx = next((i for i, h in enumerate(manual_headers) if h in ["非表示", "hidden", "is_hidden"]), -1)
+                
+                if sec_col_idx != -1 and hide_col_idx != -1:
+                    for row in manual_records[1:]:
+                        if len(row) > max(sec_col_idx, hide_col_idx):
+                            sec_val = str(row[sec_col_idx]).strip()
+                            hide_val = str(row[hide_col_idx]).strip().upper()
+                            if sec_val and hide_val in ["ON", "TRUE", "YES"]:
+                                hidden_sectors.add(sec_val)
+        except Exception:
+            pass
+
+        # --- 2. 本番シート（sector_JP）から構成銘柄を読み込む ---
         ws = sh.worksheet(sheet_name)
         records = ws.get_all_records()
         if not records:
@@ -187,6 +200,11 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
         for _, row in df.iterrows():
             sec = str(row["sector"]).strip()
             code = str(row["code"]).strip().split(".")[0]
+            
+            # 非表示に指定されているセクターはUI用の戻り値辞書から除外
+            if sec in hidden_sectors:
+                continue
+                
             if sec and code:
                 result.setdefault(sec, []).append(code)
         return result if result else default_sectors
@@ -242,18 +260,13 @@ def save_repair_log_to_sheets(log_rows: list) -> bool:
         try:
             ws = sh.worksheet(settings.REPAIR_LOG_SHEET_NAME)
         except Exception:
-            # シートが存在しない場合に新規作成し、ヘッダーを書き込み（名前付き引数でバージョン不整合を防止）
             ws = sh.add_worksheet(title=settings.REPAIR_LOG_SHEET_NAME, rows=1000, cols=len(REPAIR_LOG_COLUMNS))
             ws.update(values=[REPAIR_LOG_COLUMNS], range_name="A1")
 
-        # 🚨 自前で行数を数えるのをやめ、空白列のズレやライブラリの引数順序バグを100%回避するため、
-        # 🚨 Google Sheets API 本来の「末尾自動追記メソッド（append_rows）」を使用します。
         rows_to_append = [
             [str(row.get(col, "")) for col in REPAIR_LOG_COLUMNS]
             for row in log_rows
         ]
-        
-        # USER_ENTERED を指定することで、数値や日付が文字列ではなく正しいデータ型としてスプレッドシートに追記されます
         ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
         return True
     except Exception as e:
@@ -267,67 +280,72 @@ def load_repair_log_from_sheets() -> pd.DataFrame:
         return pd.DataFrame(columns=REPAIR_LOG_COLUMNS)
     try:
         ws = sh.worksheet(settings.REPAIR_LOG_SHEET_NAME)
-        
-        # 🚨 get_all_records() はエラーが起きやすく空白セルでロードに失敗するため、
-        # 🚨 最も安全で100%生データをロードできる get_all_values() に変更します。
         raw_values = ws.get_all_values()
         if not raw_values or len(raw_values) < 2:
             return pd.DataFrame(columns=REPAIR_LOG_COLUMNS)
         
-        # 1行目をカラム名（小文字に統一）、2行目以降をデータとしてロード
         headers = [str(h).strip().lower() for h in raw_values[0]]
-        
-        # 🛡️ 表記ブレ対策：手動入力時に「全角のアンダーバー」になっていても、半角に自動補正します
         headers = [h.replace("executed＿at", "executed_at") for h in headers]
-        headers = [h.replace("executed_at", "executed_at") for h in headers]
         
         data_rows = raw_values[1:]
-        
-        # DataFrameの作成
         df = pd.DataFrame(data_rows, columns=headers)
         
-        # 想定外の余分な列がシートにある場合は、規定の9列のみを抽出
         valid_cols = [c for c in REPAIR_LOG_COLUMNS if c in df.columns]
         df = df[valid_cols]
         
-        # Datetime変換
         if "executed_at" in df.columns:
             df["executed_at"] = pd.to_datetime(df["executed_at"], errors="coerce")
         if "cliff_date" in df.columns:
             df["cliff_date"] = pd.to_datetime(df["cliff_date"], errors="coerce")
             
-        # 数値変換（空白セルは自動的にNaN/欠損値に変換されます）
         for col in ["before_close", "after_close", "multiplier"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
                 
-        # 実行日時の降順に並べ替えて返却
         return df.sort_values("executed_at", ascending=False).reset_index(drop=True)
     except Exception as e:
-        # 何らかのエラーが発生した場合は、静かに消さずコンソールに原因を出力します
         print(f"❌ [load_repair_log_from_sheets] データのロードに失敗しました: {e}")
         return pd.DataFrame(columns=REPAIR_LOG_COLUMNS)
 
-# --- 追加ETF収集対象(extra_tickers)連携 ---
+# --- 🚀 手動登録台帳（extra_tickers）の連携 ---
+EXTRA_TICKERS_COLUMNS = ["セクター名", "銘柄コード", "備考", "ETFコード", "ファンド", "非表示"]
+
 def load_extra_tickers_from_sheets() -> pd.DataFrame:
-    """追加ETF定義シートから収集コードリストをロードします。"""
+    """手動追加用シート（extra_tickers）からマスタ登録リストをロードします。"""
     sh = get_sector_spreadsheet()
     if sh is None:
-        return pd.DataFrame(columns=["code", "name", "memo"])
+        return pd.DataFrame(columns=EXTRA_TICKERS_COLUMNS)
     try:
-        ws = sh.worksheet(settings.EXTRA_TICKERS_SHEET)
-        records = ws.get_all_records()
-        if not records:
-            return pd.DataFrame(columns=["code", "name", "memo"])
-        df = pd.DataFrame(records)
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        df["code"] = df["code"].astype(str).str.strip().str.split(".").str[0]
-        return df[df["code"].str.len() > 0].reset_index(drop=True)
-    except Exception:
-        return pd.DataFrame(columns=["code", "name", "memo"])
+        try:
+            ws = sh.worksheet(settings.EXTRA_TICKERS_SHEET)
+        except Exception:
+            ws = sh.add_worksheet(title=settings.EXTRA_TICKERS_SHEET, rows=500, cols=len(EXTRA_TICKERS_COLUMNS))
+            ws.update(values=[EXTRA_TICKERS_COLUMNS], range_name="A1")
+            return pd.DataFrame(columns=EXTRA_TICKERS_COLUMNS)
+            
+        raw_values = ws.get_all_values()
+        if not raw_values or len(raw_values) < 2:
+            return pd.DataFrame(columns=EXTRA_TICKERS_COLUMNS)
+            
+        headers = [str(h).strip() for h in raw_values[0]]
+        data_rows = raw_values[1:]
+        
+        df = pd.DataFrame(data_rows, columns=headers)
+        
+        for col in EXTRA_TICKERS_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+                
+        if "銘柄コード" in df.columns:
+            df["銘柄コード"] = df["銘柄コード"].astype(str).str.strip().str.split(".").str[0]
+            
+        return df[EXTRA_TICKERS_COLUMNS].reset_index(drop=True)
+    except Exception as e:
+        print(f"❌ [load_extra_tickers_from_sheets] ロード失敗: {e}")
+        return pd.DataFrame(columns=EXTRA_TICKERS_COLUMNS)
 
 def save_extra_tickers_to_sheets(df: pd.DataFrame):
-    """追加ETFの変更定義をスプレッドシートに保存します。"""
+    """手動追加の変更定義（extra_tickers）をスプレッドシートに保存します。"""
     sh = get_sector_spreadsheet()
     if sh is None:
         return
@@ -335,164 +353,195 @@ def save_extra_tickers_to_sheets(df: pd.DataFrame):
         try:
             ws = sh.worksheet(settings.EXTRA_TICKERS_SHEET)
         except Exception:
-            ws = sh.add_worksheet(title=settings.EXTRA_TICKERS_SHEET, rows=200, cols=3)
-        rows = [["code", "name", "memo"]] + df[["code", "name", "memo"]].values.tolist()
+            ws = sh.add_worksheet(title=settings.EXTRA_TICKERS_SHEET, rows=500, cols=len(EXTRA_TICKERS_COLUMNS))
+        
+        valid_df = df.copy()
+        for col in EXTRA_TICKERS_COLUMNS:
+            if col not in valid_df.columns:
+                valid_df[col] = ""
+        valid_df = valid_df[EXTRA_TICKERS_COLUMNS]
+        
+        rows = [EXTRA_TICKERS_COLUMNS] + valid_df.values.tolist()
         ws.clear()
         ws.update(rows, "A1")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"❌ [save_extra_tickers_to_sheets] 保存失敗: {e}")
+
+# --- 🚀 フィルタポリシー＆マージ対応型 統合セクター同期システム ---
+ETF_MASTER_COLUMNS = ["ETFコード", "セクター名", "フィルターポリシー", "ファンド"]
+SECTOR_JP_COLUMNS = ["セクター名", "銘柄コード", "備考", "ETFコード"]
 
 def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     """
-    sector_JP (または sector_US) シートから「ETFコード」が書かれたセクターを自動検知し、
-    最新の構成銘柄をファンド（E列）のルールに従ってSolactiveまたはNomuraから取得し、
-    同一シートを部分上書き更新します。同一ETFコードの無駄な重複ダウンロードは行いません。
-    
-    戻り値: {セクター名: 状態メッセージ} の辞書形式
+    etf_master シートから自動同期対象（ポリシー等）をロードし、
+    各ETFの構成銘柄を取得した上でフィルターポリシー（TOPIX100等）を適用。
+    さらに、手動台帳シート（extra_tickers）から手動登録の個別銘柄をロードして、
+    メモリ上で結合・重複排除（マージ）した完成データを sector_JP (または sector_US) へ一括上書き出力します。
     """
     sh = get_sector_spreadsheet()
     if sh is None:
         return {"error": "スプレッドシートを開けませんでした。"}
         
     sheet_name = "sector_JP" if is_jp else "sector_US"
+    etf_master_sheet_name = "etf_master"
+    
+    # 必要シートの存在チェックと新規自動作成
     try:
-        ws = sh.worksheet(sheet_name)
+        ws_master = sh.worksheet(etf_master_sheet_name)
     except Exception:
-        return {"error": f"'{sheet_name}' シートが見つかりません。"}
+        ws_master = sh.add_worksheet(title=etf_master_sheet_name, rows=200, cols=len(ETF_MASTER_COLUMNS))
+        ws_master.update(values=[ETF_MASTER_COLUMNS], range_name="A1")
+        default_samples = [
+            ["2646", "メタルビジネス", "TOPIX500", "Global X"],
+            ["2644", "半導体", "TOPIX_SMALL1", "Global X"]
+        ]
+        ws_master.update(values=default_samples, range_name="A2")
         
-    # 1. 全レコードの読み込み
-    all_values = ws.get_all_values()
-    if not all_values or len(all_values) < 1:
-        return {"error": f"'{sheet_name}' シートが空です。ヘッダーを作成してください。"}
+    try:
+        ws_manual = sh.worksheet(settings.EXTRA_TICKERS_SHEET)
+    except Exception:
+        ws_manual = sh.add_worksheet(title=settings.EXTRA_TICKERS_SHEET, rows=500, cols=len(EXTRA_TICKERS_COLUMNS))
+        ws_manual.update(values=[EXTRA_TICKERS_COLUMNS], range_name="A1")
         
-    headers = [str(h).strip() for h in all_values[0]]
-    
-    # 2. カラム位置の自動特定
-    col_sector = -1
-    col_code = -1
-    col_memo = -1
-    col_etf = -1
-    col_fund = -1  # E列の追加対応
-    
-    for i, h in enumerate(headers):
-        if h in ["セクター名", "sector", "sector_name"]:
-            col_sector = i
-        elif h in ["銘柄コード", "code", "ticker", "コード"]:
-            col_code = i
-        elif h in ["備考", "memo"]:
-            col_memo = i
-        elif h in ["ETFコード", "etf", "etf_code"]:
-            col_etf = i
-        elif h in ["ファンド", "fund", "fund_name"]:
-            col_fund = i
-            
-    if col_sector == -1 or col_code == -1:
-        return {"error": "必須カラム（セクター名、銘柄コード）がシート内に見つかりません。"}
-        
-    # ETFコード列がシートにない場合は右端に自動作成
-    if col_etf == -1:
-        headers.append("ETFコード")
-        col_etf = len(headers) - 1
-        all_values[0] = headers
-        ws.update([headers], "A1")
+    try:
+        ws_out = sh.worksheet(sheet_name)
+    except Exception:
+        ws_out = sh.add_worksheet(title=sheet_name, rows=2000, cols=len(SECTOR_JP_COLUMNS))
+        ws_out.update(values=[SECTOR_JP_COLUMNS], range_name="A1")
 
-    # ファンド列がシートにない場合は右端に自動作成
-    if col_fund == -1:
-        headers.append("ファンド")
-        col_fund = len(headers) - 1
-        all_values[0] = headers
-        ws.update([headers], "A1")
+    # etf_master から自動同期設定をロード
+    master_values = ws_master.get_all_values()
+    if not master_values or len(master_values) < 2:
+        return {"info": "etf_master シートが空のため、自動同期の対象はありません。"}
         
-    # 3. データの解析（自動化したいセクターと、対応するETF・ファンドのペアを抽出）
-    etf_mapping = {}  # {セクター名: (ETFコード, ファンド)}
-    rows_data = []    # 読み込んだ元のデータを退避
+    master_headers = [str(h).strip() for h in master_values[0]]
+    col_etf_idx = next((i for i, h in enumerate(master_headers) if h in ["ETFコード", "etf", "etf_code"]), -1)
+    col_sec_idx = next((i for i, h in enumerate(master_headers) if h in ["セクター名", "sector", "sector_name"]), -1)
+    col_policy_idx = next((i for i, h in enumerate(master_headers) if h in ["フィルターポリシー", "policy", "filter_policy"]), -1)
+    col_fund_idx = next((i for i, h in enumerate(master_headers) if h in ["ファンド", "fund", "fund_name"]), -1)
     
-    for row in all_values[1:]:
-        # 行の長さがヘッダーと合わない場合の補正
-        while len(row) < len(headers):
-            row.append("")
-            
-        sec_val = str(row[col_sector]).strip()
-        code_val = str(row[col_code]).strip()
-        memo_val = str(row[col_memo]).strip() if col_memo != -1 else ""
-        etf_val = str(row[col_etf]).strip()
-        fund_val = str(row[col_fund]).strip() if col_fund != -1 else ""
+    if col_etf_idx == -1 or col_sec_idx == -1:
+        return {"error": "etf_master シートに必要なカラム（ETFコード、セクター名）が存在しません。"}
         
-        # ETFコードが記載されている場合のみマッピングに登録
-        if sec_val and etf_val:
-            etf_mapping[sec_val] = (etf_val, fund_val)
-            
-        rows_data.append({
-            "sector": sec_val,
-            "code": code_val,
-            "memo": memo_val,
-            "etf": etf_val,
-            "fund": fund_val
-        })
-        
-    if not etf_mapping:
-        return {"info": "自動同期対象（ETFコードが記入されたセクター）が検出されませんでした。"}
-        
-    # 4. 重複を排除した効率的なダウンロード処理
-    from core.collector import fetch_etf_constituents
+    etf_targets = []
+    for row in master_values[1:]:
+        if len(row) > max(col_etf_idx, col_sec_idx):
+            etf_code = str(row[col_etf_idx]).strip().split(".")[0]
+            sec_name = str(row[col_sec_idx]).strip()
+            policy = str(row[col_policy_idx]).strip().upper() if col_policy_idx != -1 and len(row) > col_policy_idx else "TOPIX500"
+            fund_val = str(row[col_fund_idx]).strip() if col_fund_idx != -1 and len(row) > col_fund_idx else ""
+            if etf_code and sec_name:
+                etf_targets.append({
+                    "etf_code": etf_code,
+                    "sector_name": sec_name,
+                    "policy": policy,
+                    "fund_val": fund_val
+                })
+                
+    # Webからの構成ダウンロード＆フィルタリング
+    from core.collector import fetch_etf_constituents, get_jpx_scale_map
+    scale_map = get_jpx_scale_map()
     
     sync_results = {}
-    final_rows = []
+    auto_rows = []
     
-    # 【ステップA】自動同期対象外（手動管理セクター）の行を無傷で残す
-    for r in rows_data:
-        if r["sector"] not in etf_mapping:
-            final_rows.append(r)
-            
-    # 【ステップB】重複を排除したユニークな取得対象リストを作成
-    # { ETFコード: ファンド名 }
-    unique_etfs = {}
-    for sector_name, (etf_code, fund_val) in etf_mapping.items():
-        unique_etfs[etf_code] = fund_val
-        
-    # 各ETFを1回のみダウンロードしてキャッシュに保持
     downloaded_cache = {}
-    for etf_code, fund_val in unique_etfs.items():
-        constituents = fetch_etf_constituents(etf_code, fund_provider=fund_val)
-        downloaded_cache[etf_code] = constituents
-        
-    # 【ステップC】自動同期対象セクターについて、キャッシュからデータをマージ
-    for sector_name, (etf_code, fund_val) in etf_mapping.items():
+    for target in etf_targets:
+        etf_code = target["etf_code"]
+        fund_val = target["fund_val"]
+        if etf_code not in downloaded_cache:
+            constituents = fetch_etf_constituents(etf_code, fund_provider=fund_val)
+            downloaded_cache[etf_code] = constituents
+            
+    for target in etf_targets:
+        etf_code = target["etf_code"]
+        sec_name = target["sector_name"]
+        policy = target["policy"]
         constituents = downloaded_cache.get(etf_code)
         
-        # ダウンロード失敗時の安全ガード（古いデータをそのまま維持）
         if not constituents:
-            sync_results[sector_name] = f"通信エラー等のため既存データを維持 (ファンド: {fund_val or '未指定'})"
-            for r in rows_data:
-                if r["sector"] == sector_name:
-                    final_rows.append(r)
+            sync_results[sec_name] = "⚠️ 通信エラー等により既存データを維持できないためスキップ"
             continue
             
-        # 最新の構成銘柄でシート用の行を展開
-        for code, name in constituents.items():
-            final_rows.append({
-                "sector": sector_name,
+        filtered_count = 0
+        
+        # TOP N フィルタの抽出
+        if policy.startswith("TOP") and policy[3:].isdigit():
+            top_n = int(policy[3:])
+            sub_consts = {k: v for i, (k, v) in enumerate(constituents.items()) if i < top_n}
+        else:
+            sub_consts = {}
+            for code, name in constituents.items():
+                m_scale = scale_map.get(code, "Others")
+                
+                if policy == "TOPIX100":
+                    if m_scale in ["TOPIX Core30", "TOPIX Large70"]:
+                        sub_consts[code] = name
+                elif policy == "TOPIX_SMALL1":
+                    if m_scale in ["TOPIX Small1"]:
+                        sub_consts[code] = name
+                elif policy in ["ALL", "NONE"]:
+                    sub_consts[code] = name
+                else: # デフォルト: TOPIX500
+                    if m_scale in ["TOPIX Core30", "TOPIX Large70", "TOPIX Mid400"]:
+                        sub_consts[code] = name
+                        
+        for code, name in sub_consts.items():
+            auto_rows.append({
+                "sector": sec_name,
                 "code": code,
-                "memo": name,  # 備考欄に銘柄名を自動マッピング
-                "etf": etf_code,
-                "fund": fund_val
+                "memo": name,
+                "etf": etf_code
             })
-        sync_results[sector_name] = f"同期成功 ({len(constituents)}銘柄) / ファンド: {fund_val or '自動判定'}"
+            filtered_count += 1
+            
+        sync_results[sec_name] = f"同期成功 ({filtered_count} / {len(constituents)}銘柄) [ポリシー: {policy}]"
         
-    # 5. スプレッドシートへの一括書き出し
-    output_values = [headers]
+    # 手動構成台帳（extra_tickers）をロード
+    manual_df = load_extra_tickers_from_sheets()
+    manual_rows = []
+    if not manual_df.empty:
+        for _, row in manual_df.iterrows():
+            sec_val = str(row.get("セクター名", "")).strip()
+            code_val = str(row.get("銘柄コード", "")).strip()
+            memo_val = str(row.get("備考", "")).strip()
+            etf_val = str(row.get("ETFコード", "")).strip()
+            
+            if sec_val and code_val:
+                manual_rows.append({
+                    "sector": sec_val,
+                    "code": code_val,
+                    "memo": memo_val,
+                    "etf": etf_val
+                })
+                
+    # 自動同期分と手動分をマージ（手動分を最優先で重複排除）
+    final_rows = []
+    seen_pairs = set()
+    
+    for r in manual_rows:
+        pair_key = (r["sector"], r["code"])
+        if pair_key not in seen_pairs:
+            seen_pairs.add(pair_key)
+            final_rows.append(r)
+            
+    for r in auto_rows:
+        pair_key = (r["sector"], r["code"])
+        if pair_key not in seen_pairs:
+            seen_pairs.add(pair_key)
+            final_rows.append(r)
+            
+    # sector_JP / sector_US へ一括出力
+    output_values = [SECTOR_JP_COLUMNS]
     for r in final_rows:
-        row_out = [""] * len(headers)
-        row_out[col_sector] = r["sector"]
-        row_out[col_code] = r["code"]
-        if col_memo != -1:
-            row_out[col_memo] = r["memo"]
-        row_out[col_etf] = r["etf"]
-        row_out[col_fund] = r["fund"]
-        output_values.append(row_out)
+        output_values.append([
+            r["sector"],
+            r["code"],
+            r["memo"],
+            r["etf"]
+        ])
         
-    # 衝突を避けるため、一度シートをクリアして全書き直し
-    ws.clear()
-    ws.update(output_values, "A1")
+    ws_out.clear()
+    ws_out.update(output_values, "A1")
     
     return sync_results
