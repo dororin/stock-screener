@@ -77,7 +77,8 @@ def render_etf_manager():
                     for _, row in found.iterrows():
                         code_str = str(row["symbol"])
                         name_str = str(row["name"])
-                        already = code_str in df["code"].values if not df.empty else False
+                        # 🚨 英語の 'code' から 日本語の '銘柄コード' に修正
+                        already = code_str in df["銘柄コード"].values if not df.empty else False
                         
                         col_add_left, col_add_right = st.columns([4, 1])
                         col_add_left.write(f"{code_str}　{name_str}")
@@ -85,7 +86,15 @@ def render_etf_manager():
                             col_add_right.button("✅ 登録済", key=f"etf_add_btn_{code_str}", disabled=True, use_container_width=True)
                         else:
                             if col_add_right.button("追加", key=f"etf_add_btn_{code_str}", use_container_width=True):
-                                new_row = pd.DataFrame([{"code": code_str, "name": name_str, "memo": ""}])
+                                # 🚨 スプレッドシートの期待するカラム構造に合わせて新しい行を定義
+                                new_row = pd.DataFrame([{
+                                    "セクター名": "追加ETF",
+                                    "銘柄コード": code_str,
+                                    "備考": name_str,
+                                    "ETFコード": "",
+                                    "ファンド": "",
+                                    "非表示": "OFF"
+                                }])
                                 df = pd.concat([df, new_row], ignore_index=True)
                                 save_extra_tickers_to_sheets(df)
                                 sync_extra_tickers_to_local()
@@ -109,13 +118,15 @@ def render_etf_manager():
             to_delete = []
             for _, row in df.iterrows():
                 col_c1, col_c2, col_c3 = st.columns([2, 5, 1])
-                col_c1.write(row['code'])
-                col_c2.write(row['name'])
-                if col_c3.button("🗑️", key=f"etf_del_{row['code']}", help=f"{row['code']}を削除"):
-                    to_delete.append(row["code"])
+                # 🚨 各カラム名へのアクセスを日本語にマッピング修正
+                col_c1.write(row['銘柄コード'])
+                col_c2.write(row['備考'])
+                if col_c3.button("🗑️", key=f"etf_del_{row['銘柄コード']}", help=f"{row['銘柄コード']}を削除"):
+                    to_delete.append(row["銘柄コード"])
                     
             if to_delete:
-                df = df[~df["code"].isin(to_delete)].reset_index(drop=True)
+                # 🚨 削除判定リストと一致する銘柄コードを除外
+                df = df[~df["銘柄コード"].isin(to_delete)].reset_index(drop=True)
                 save_extra_tickers_to_sheets(df)
                 sync_extra_tickers_to_local()
                 st.success("削除しました。")

@@ -927,7 +927,7 @@ def execute_apply_verified_temp_dbs_to_active(is_jp: bool = True, status_callbac
 # =====================================================================
 
 def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_callback=None, dry_run: bool = False) -> bool:
-    """物理削除からの完全な白紙クリーンビルド。"""
+    """物理削除からの完全な白紙クリーンビルド（APIレートリミット対策・一括一過リトライ機能搭載版）。"""
     def log(msg):
         print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] {msg}")
         sys.stdout.flush()
@@ -935,8 +935,6 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
 
     market_name = "JP" if is_jp else "US"
     
-    # 🚨 修正：廃止された sync_extra_tickers_to_local() の呼び出しを完全に削除し、
-    # 🚨 常にクリーンな get_all_collection_tickers() を一撃で呼び出すように単純化
     if is_jp:
         tickers = get_all_collection_tickers()
     else:
@@ -958,7 +956,11 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
     log(f"🚨 [フル再構築] {market_name} ({interval}) Rawデータダウンロード開始。総数: {len(tickers)}")
     
     all_downloaded = []
-    BATCH_SIZE = 30
+    failed_tickers = []
+    
+    # 💡 1バッチのサイズを 30 から 100 に拡大してAPIコール回数を約 1/3 に削減
+    BATCH_SIZE = 100
+    
     for i in range(0, len(tickers), BATCH_SIZE):
         chunk = tickers[i:i+BATCH_SIZE]
         symbols = [f"{t}{suffix}" for t in chunk]
@@ -979,7 +981,7 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
                 auto_adjust=False,
                 actions=True,
                 progress=False,
-                threads=False,
+                threads=False,  # 💡 429(レート制限)を防ぐためシングルスレッドのまま安全に取得
                 timeout=30
             )
             
@@ -997,17 +999,64 @@ def full_rebuild_all_database(is_jp: bool = True, interval: str = "1d", status_c
                 
                 if not chunk_processed.empty:
                     all_downloaded.append(chunk_processed)
+                    # 💡 取得・パースを通過した銘柄を割り出し、何らかの理由で欠損した銘柄を「失敗リスト」に自動追加
+                    downloaded_tickers = chunk_processed["ticker"].unique().tolist()
+                    missing = [t for t in chunk if t not in downloaded_tickers]
+                    if missing:
+                        failed_tickers.extend(missing)
+                else:
+                    failed_tickers.extend(chunk)
             else:
                 print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] [API_WARNING] Returned DataFrame is EMPTY.")
                 sys.stdout.flush()
+                failed_tickers.extend(chunk)
+                
         except Exception as e:
             print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [FULL_REBUILD] [BATCH_ERROR] Error during rebuild: {e}")
             import traceback
             traceback.print_exc()
             sys.stdout.flush()
             log(f"    -> ⚠️ エラー: {e}")
-        time.sleep(1.5)
+            failed_tickers.extend(chunk)
+            
+        # 💡 バッチ間のウェイトを 3.5秒 にあけてレートリミットを大幅緩和
+        time.sleep(3.5)
         
+    # 🩹 失敗した銘柄に対する自動リカバリ（リトライ）ループ
+    if failed_tickers:
+        failed_tickers = list(set(failed_tickers)) # 重複の排除
+        log(f"🔄 【自動リトライ】ダウンロードに失敗した {len(failed_tickers)} 銘柄のリカバリ処理を開始します...")
+        
+        # リトライ時は規制を警戒し、10銘柄ずつの超小分けバッチでゆっくりと回収
+        retry_batch_size = 10
+        for r_i in range(0, len(failed_tickers), retry_batch_size):
+            r_chunk = failed_tickers[r_i:r_i+retry_batch_size]
+            r_symbols = [f"{t}{suffix}" for t in r_chunk]
+            
+            # サーバーの流量監視が落ち着くまで多めのインターバル（5秒）を挿入
+            time.sleep(5.0)
+            log(f"  📥 リトライ中 ({r_i+1}〜{min(r_i+retry_batch_size, len(failed_tickers))}): {', '.join(r_chunk[:5])}...")
+            
+            try:
+                df_raw_retry = yf.download(
+                    r_symbols,
+                    start=start_date_dt.strftime("%Y-%m-%d"),
+                    interval=interval,
+                    auto_adjust=False,
+                    actions=True,
+                    progress=False,
+                    threads=False,
+                    timeout=30
+                )
+                if not df_raw_retry.empty:
+                    chunk_processed = parse_yfinance_batch(df_raw_retry, r_chunk, is_jp=is_jp)
+                    if not chunk_processed.empty:
+                        all_downloaded.append(chunk_processed)
+                        downloaded_r = chunk_processed["ticker"].unique().tolist()
+                        log(f"    ✅ リカバリ成功: {len(downloaded_r)} 銘柄 ({', '.join(downloaded_r)})")
+            except Exception as e:
+                log(f"    ❌ リトライ失敗: {e}")
+
     if all_downloaded:
         final_df = pd.concat(all_downloaded, ignore_index=True)
         final_df = final_df.sort_values(["ticker", "date"]).reset_index(drop=True)
@@ -1897,10 +1946,17 @@ def finalize_latest_with_tradingview_in_df(df: pd.DataFrame, interval: str, is_j
         
         tv_data = {}
         for idx, r in tv_df.iterrows():
-            ticker_key = symbol_to_ticker.get(idx)
+            # 💡 インデックス(idx)ではなく、行から "ticker" 列（文字列）を安全に取得
+            tv_ticker_symbol = r.get("ticker", idx)
+            if not isinstance(tv_ticker_symbol, str):
+                continue
+                
+            ticker_key = symbol_to_ticker.get(tv_ticker_symbol)
             if not ticker_key:
-                clean_idx = idx.split(":")[-1] if ":" in idx else idx
+                # 💡 安全に文字列判定と分割処理を実行
+                clean_idx = tv_ticker_symbol.split(":")[-1] if ":" in tv_ticker_symbol else tv_ticker_symbol
                 ticker_key = symbol_to_ticker.get(clean_idx)
+                
             if ticker_key:
                 tv_data[ticker_key] = {
                     "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]),
