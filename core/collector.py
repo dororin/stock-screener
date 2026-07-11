@@ -182,12 +182,18 @@ def get_topix500_tickers() -> list:
 def get_jpx_scale_map() -> dict:
     """JPXのキャッシュファイルから {銘柄コード: 規模区分} の辞書を構築します。"""
     jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
+    
+    # 🚨 修正：ファイルが存在しない場合は、JPX公式サイトからダウンロードして保存する
     if not os.path.exists(jpx_save_path):
-        jpx_save_path = os.path.join(settings.WORK_DIR, "jpx_stock_list_raw.xls")
-        
-    if not os.path.exists(jpx_save_path):
-        return {}
-        
+        print("📥 JPX銘柄リストが存在しないため、新規ダウンロードします...")
+        try:
+            resp = requests.get(settings.JPX_URL, timeout=10)
+            with open(jpx_save_path, "wb") as f:
+                f.write(resp.content)
+        except Exception as e:
+            print(f"⚠️ [get_jpx_scale_map] JPXリストのダウンロードに失敗しました: {e}")
+            return {}
+
     try:
         df_full = pd.read_excel(jpx_save_path)
         if df_full.shape[1] >= 10:
