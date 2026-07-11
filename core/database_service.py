@@ -178,10 +178,12 @@ def check_processed_data_health(old_df: pd.DataFrame, new_df: pd.DataFrame) -> l
                 
     return alerts
 
-def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataFrame:
-    """メモリ上で配信された株式分割情報に基づき過去データを修正。"""
+def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> tuple[pd.DataFrame, list]:
+    """メモリ上で配信された株式分割情報に基づき過去データを修正（小さな比率の誤爆防止 ＆ 適用実績追跡版）。"""
+    applied_splits = [] # 💡 実際に適用が実行されたイベントのみを格納するリスト
+    
     if df_ticker.empty or len(df_ticker) < 2:
-        return df_ticker
+        return df_ticker, applied_splits
         
     df = df_ticker.sort_values("date").reset_index(drop=True)
     price_cols = [c for c in ["open", "high", "low", "close", "adj close"] if c in df.columns]
@@ -211,8 +213,11 @@ def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataF
                 actual_ratio = pre_close / post_close
                 unadjusted_mask = (df.index < idx) & (df["split_multiplier"] == 1.0)
                 
-                # 💡 価格差と分割値の誤差を検証して遡及適用する安全ガード
-                if unadjusted_mask.any() and abs(actual_ratio - split_val) / split_val <= 0.15:
+                # 💡 【絶対防御】比率が1.1など小さな場合でも、平坦な等倍(1.0)と未調整(split_val)を完全識別する
+                dist_to_split = abs(actual_ratio - split_val)
+                dist_to_flat = abs(actual_ratio - 1.0)
+                
+                if unadjusted_mask.any() and (dist_to_split < dist_to_flat) and (dist_to_split / split_val <= 0.15):
                     ratio = 1.0 / split_val
                     for col in price_cols:
                         df.loc[unadjusted_mask, col] = df.loc[unadjusted_mask, col] * ratio
@@ -220,8 +225,14 @@ def adjust_ticker_splits_backward_in_memory(df_ticker: pd.DataFrame) -> pd.DataF
                         df.loc[unadjusted_mask, "volume"] = df.loc[unadjusted_mask, "volume"] / ratio
                         
                     df.loc[unadjusted_mask, "split_multiplier"] = ratio
+                    
+                    # 💡 実際にガードを突破して適用した日時と比率だけを記録
+                    applied_splits.append({
+                        "date": df.loc[idx, "date"],
+                        "ratio": split_val
+                    })
 
-    return df
+    return df, applied_splits
 
 def apply_saved_patches_to_df(df: pd.DataFrame, is_jp: bool = True, repair_log_df: pd.DataFrame = None) -> pd.DataFrame:
     """
@@ -382,7 +393,7 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
     return df_result
 
 def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = False, skip_assertion: bool = False, status_callback=None, log_accumulator: list = None, repair_log_df: pd.DataFrame = None, raw_df: pd.DataFrame = None) -> bool:
-    """RawデータからActiveデータの加工ビルドとアサーション検証（依存性の注入・分割ログ追跡版）。"""
+    """RawデータからActiveデータの加工ビルドとアサーション検証（依存性注入・分割実績ログ統合版）。"""
     import gc
     import sys
     import pandas as pd
@@ -444,20 +455,15 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
             group = df_raw[ticker_mask].copy()
             group_sorted = group.sort_values("date")
             
-            # 💡 補正前の状態（未調整状態）をマーク
-            had_unadjusted = "split_multiplier" not in group_sorted.columns or (group_sorted["split_multiplier"] == 1.0).all()
-            
-            adjusted_group = adjust_ticker_splits_backward_in_memory(group_sorted)
+            # 💡 戻り値のタプル（検証済み適用実績リストを含む）を受け取る
+            adjusted_group, applied_splits = adjust_ticker_splits_backward_in_memory(group_sorted)
             
             if not adjusted_group.empty:
-                # 💡 実際に補正が行われたかどうかを検証し、補正が適用された場合にのみ詳細ログを書き出す
-                has_adjusted = "split_multiplier" in adjusted_group.columns and (adjusted_group["split_multiplier"] != 1.0).any()
-                
-                if had_unadjusted and has_adjusted:
-                    splits_info = adjusted_group[(adjusted_group["stock splits"] > 0) & (adjusted_group["stock splits"] != 1.0)]
-                    for _, s_row in splits_info.iterrows():
-                        split_date_str = pd.to_datetime(s_row["date"]).strftime("%Y-%m-%d %H:%M")
-                        log(f"  👉 【株式分割補正適用】銘柄: {ticker} | 実施日(権利落ち日): {split_date_str} | 分割比率: {s_row['stock splits']} | それ以前の過去価格を 1/{s_row['stock splits']} に遡及補正しました。")
+                # 💡 実際に適用に成功した分割イベントだけを詳細にログ出力
+                if applied_splits:
+                    for s_info in applied_splits:
+                        split_date_str = pd.to_datetime(s_info["date"]).strftime("%Y-%m-%d %H:%M")
+                        log(f"  👉 【株式分割補正適用】銘柄: {ticker} | 実施日(権利落ち日): {split_date_str} | 分割比率: {s_info['ratio']} | それ以前の過去価格を 1/{s_info['ratio']} に遡及補正しました。")
                 
                 adjusted_group.index = group_sorted.index
                 valid_cols = [c for c in cols_to_write if c in df_raw.columns and c in adjusted_group.columns]
