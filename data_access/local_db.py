@@ -87,7 +87,7 @@ def compute_ledger_from_df(df: pd.DataFrame) -> dict:
         "last_updates_map": last_updates_map
     }
 
-def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_temp: bool = False, columns: list = None) -> pd.DataFrame:
+def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_temp: bool = False, columns: list = None, filters: list = None) -> pd.DataFrame:
     """Drive、またはローカルフォルダから該当するParquetデータベースをロードし、DataFrameにパースして返します。"""
     filename = get_db_filename(interval, is_jp, is_raw, is_temp)
     work_file = os.path.join(settings.WORK_DIR, filename)
@@ -95,7 +95,15 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
 
     if is_temp:
         if os.path.exists(work_file):
-            df = pd.read_parquet(work_file, columns=columns)
+            if filters is not None:
+                try:
+                    table = pq.read_table(work_file, columns=columns, filters=filters)
+                    df = table.to_pandas()
+                except Exception:
+                    df = pd.read_parquet(work_file, columns=columns)
+            else:
+                df = pd.read_parquet(work_file, columns=columns)
+                
             if "date" in df.columns:
                 df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
             return df
@@ -106,7 +114,15 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
         shutil.copy2(drive_file, work_file)
     
     if os.path.exists(work_file):
-        df = pd.read_parquet(work_file, columns=columns)
+        if filters is not None:
+            try:
+                table = pq.read_table(work_file, columns=columns, filters=filters)
+                df = table.to_pandas()
+            except Exception:
+                df = pd.read_parquet(work_file, columns=columns)
+        else:
+            df = pd.read_parquet(work_file, columns=columns)
+            
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
         return df

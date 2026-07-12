@@ -325,7 +325,6 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
 
     # 2. 軽量日付キーの生成とベクトル化マッチング
     log_mem("日付マッチング用の軽量インデックスキーを抽出中...")
-    # メモリ節約のため、日付列と銘柄列のみを保持する最小のDataFrameを作成
     df_keys = pd.DataFrame({
         "ticker": df_intra_active["ticker"],
         "date_norm": pd.to_datetime(df_intra_active["date"]).dt.normalize()
@@ -338,12 +337,22 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
     
     # マージにより一撃で判定
     merged = df_keys.merge(stop_days_df_match, on=["ticker", "date_norm"], how="left")
-    is_stop_mask = merged["is_stop"].fillna(False).values
+    
+    # 💡 警告修正1: 暗黙のダウンキャスト防止のため、明示的にブール型へキャストします
+    is_stop_mask = merged["is_stop"].fillna(False).astype(bool).values
     
     # 不要なマージ中間変数を即時解放
     del merged, df_keys
     gc.collect()
     log_mem(f"マッチング判定完了。削除対象となるストップ日のバー総数: {is_stop_mask.sum()} 件")
+
+    # 💡 追加: 物理除外されたザラ場中ノイズの個別銘柄および発生日時ログを出力します
+    if is_stop_mask.sum() > 0:
+        removed_bars = df_intra_active[is_stop_mask]
+        print(f"[CONSOLE_DEBUG] [PROPAGATE_STOP] 🚨 除外対象ストップ日バー詳細:")
+        for _, row in removed_bars.iterrows():
+            print(f"  👉 [物理除外] 銘柄: {row['ticker']} | 日時: {row['date']}")
+        sys.stdout.flush()
 
     # 3. ストップ高安日以外の「安全な」足のみを抽出
     log_mem("ストップ高安日の時間足バーを物理除外中（1サイクルで高速処理）...")
@@ -352,7 +361,6 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
 
     # 4. 補完合成バー（大引けバー）の算出
     log_mem("補完バー配置のため、各時間足データベースの収録期間を計算中...")
-    # 全体をグループバイして一度に範囲を決定
     active_ranges = df_cleaned.groupby("ticker")["date"].agg(["min", "max"])
     active_ranges["min_date"] = pd.to_datetime(active_ranges["min"]).dt.normalize()
     active_ranges["max_date"] = pd.to_datetime(active_ranges["max"]).dt.normalize()
@@ -380,6 +388,20 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
     if new_rows:
         df_synthetic = pd.DataFrame(new_rows)
         df_synthetic["date"] = pd.to_datetime(df_synthetic["date"])
+        
+        # 💡 追加: 補完追加された合成大引けバーの個別銘柄および大引け日時ログを出力します
+        print(f"[CONSOLE_DEBUG] [PROPAGATE_STOP] ➕ 合成補完バー詳細:")
+        for _, row in df_synthetic.iterrows():
+            print(f"  👉 [補完追加] 銘柄: {row['ticker']} | 日時: {row['date']}")
+        sys.stdout.flush()
+
+        # 💡 警告修正2: 空（All-NA）列の存在による結合型不一致警告を防ぐため、カラムスキーマと型を完全に一致させます
+        for col in df_cleaned.columns:
+            if col not in df_synthetic.columns:
+                df_synthetic[col] = None
+        df_synthetic = df_synthetic[df_cleaned.columns]  # カラム順を統一
+        df_synthetic = df_synthetic.astype(df_cleaned.dtypes)  # データ型を完全強制追従
+
         log_mem(f"合成補完バー（{len(df_synthetic)}行）を時間足データに結合中...")
         df_result = pd.concat([df_cleaned, df_synthetic], ignore_index=True)
     else:
@@ -416,7 +438,6 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
 
     log(f"🏗️ [{interval}] RawデータからActiveデータの加工ビルドを開始します...")
     
-    # 💡 依存性の注入（DI）: すでにメモリ上にデータがあればそれをコピーして再利用、なければディスクからロード
     if raw_df is not None:
         df_raw = raw_df.copy()
         log("💡 メモリ上に展開済みのRawデータをインメモリ再利用します（ディスク二重ロードを回避しました）。")
@@ -455,11 +476,9 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
             group = df_raw[ticker_mask].copy()
             group_sorted = group.sort_values("date")
             
-            # 💡 戻り値のタプル（検証済み適用実績リストを含む）を受け取る
             adjusted_group, applied_splits = adjust_ticker_splits_backward_in_memory(group_sorted)
             
             if not adjusted_group.empty:
-                # 💡 実際に適用に成功した分割イベントだけを詳細にログ出力
                 if applied_splits:
                     for s_info in applied_splits:
                         split_date_str = pd.to_datetime(s_info["date"]).strftime("%Y-%m-%d %H:%M")
@@ -492,10 +511,20 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = True, dry_run: bool = F
             sys.stdout.flush()
             
             cols_needed = ["ticker", "date", "open", "high", "low", "close", "volume"]
+            
+            filters_1d = None
+            if not df_processed.empty:
+                min_dt = pd.to_datetime(df_processed["date"]).min()
+                max_dt = pd.to_datetime(df_processed["date"]).max()
+                filters_1d = [
+                    ('date', '>=', pd.Timestamp(min_dt.date() - pd.Timedelta(days=1))),
+                    ('date', '<=', pd.Timestamp(max_dt.date() + pd.Timedelta(days=1)))
+                ]
+                
             try:
-                df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False, is_temp=dry_run, columns=cols_needed + ["is_finalized"])
+                df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False, is_temp=dry_run, columns=cols_needed + ["is_finalized"], filters=filters_1d)
             except Exception:
-                df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False, is_temp=dry_run, columns=cols_needed)
+                df_1d_active = load_price_db("1d", is_jp=is_jp, is_raw=False, is_temp=dry_run, columns=cols_needed, filters=filters_1d)
                 
             df_processed = propagate_stop_allocation_bars_in_memory(df_1d_active, df_processed, is_jp=is_jp)
             del df_1d_active

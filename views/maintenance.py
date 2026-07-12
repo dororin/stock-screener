@@ -848,24 +848,38 @@ st.divider()
 
 @st.dialog("🚨 データベース完全再構築の最終確認", width="medium")
 def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
-    st.warning("⚠️ **警告：この操作は取り消せません**")
-    st.markdown(
-        f"既存の **{market_mode} {interval}** の原本データ（Raw）および実行用データ（Active）をディスクから完全に物理削除し, "
-        "白紙の状態からyfinanceの提供限界まで全件再ダウンロードを行います。"
-    )
-    st.write("1分足や5分足の場合、取得可能上限（7日前/60日前）を過ぎて消失した古い履歴データは完全に失われます。本当に実行してよろしいですか？")
-    st.write(" ")
+    # ダイアログ表示および再構築ログの挙動を制御するセッション管理
+    if "rebuild_status" not in st.session_state:
+        st.session_state.rebuild_status = "confirm"
+    if "rebuild_logs" not in st.session_state:
+        st.session_state.rebuild_logs = []
 
-    col_yes, col_no = st.columns(2)
-    
-    if col_no.button("いいえ（キャンセル）", use_container_width=True):
-        st.rerun()
+    if st.session_state.rebuild_status == "confirm":
+        st.warning("⚠️ **警告：この操作は取り消せません**")
+        st.markdown(
+            f"既存の **{market_mode} {interval}** の原本データ（Raw）および実行用データ（Active）をディスクから完全に物理削除し, "
+            "白紙の状態からyfinanceの提供限界まで全件再ダウンロードを行います。"
+        )
+        st.write("1分足や5分足の場合、取得可能上限（7日前/60日前）を過ぎて消失した古い履歴データは完全に失われます。本当に実行してよろしいですか？")
+        st.write(" ")
+
+        col_yes, col_no = st.columns(2)
         
-    if col_yes.button("はい（本当に実行する）", type="primary", use_container_width=True):
-        rebuild_log_lines = []
+        if col_no.button("いいえ（キャンセル）", use_container_width=True):
+            st.session_state.rebuild_status = "confirm"
+            st.session_state.rebuild_logs = []
+            st.rerun()
+            
+        if col_yes.button("はい（本当に実行する）", type="primary", use_container_width=True):
+            st.session_state.rebuild_status = "processing"
+            st.rerun()
+
+    elif st.session_state.rebuild_status == "processing":
         status_box = st.status(f"📡 {market_mode} {interval} を一括クリーンビルド中...", expanded=True)
+        rebuild_log_lines = []
+        
         with status_box:
-            st.write("既存 of Parquetファイルをディスクから物理クリア中...")
+            st.write("既存のParquetファイルをディスクから物理クリア中...")
             for is_raw_target in [True, False]:
                 from data_access.local_db import get_db_filename
                 filename = get_db_filename(interval, is_jp, is_raw=is_raw_target)
@@ -887,17 +901,41 @@ def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
                     status_callback=update_rebuild_status, 
                     dry_run=False 
                 )
+                st.session_state.rebuild_logs = rebuild_log_lines
                 if success:
-                    status_box.update(label="✅ クリーンビルド本番保存が正常に完了しました！", state="complete")
-                    st.success("再構築が成功しました。画面を更新します。")
-                    time.sleep(1.0)
-                    st.rerun()
+                    st.session_state.rebuild_status = "success"
                 else:
-                    status_box.update(label="❌ ダウンロードまたは構築失敗", state="error")
-                    st.error("クリーンビルドに失敗しました。")
+                    st.session_state.rebuild_status = "failed"
+                st.rerun()
             except Exception as e:
-                status_box.update(label="❌ エラー発生", state="error")
-                st.error(f"再構築中に予期せぬエラーが発生しました: {e}")
+                st.session_state.rebuild_logs = rebuild_log_lines + [f"再構築中に予期せぬエラーが発生しました: {e}"]
+                st.session_state.rebuild_status = "failed"
+                st.rerun()
+
+    elif st.session_state.rebuild_status == "success":
+        st.success("🎉 一括フルダウンロード・再構築に成功しました！")
+        st.markdown("**実行ログ履歴詳細:**")
+        st.code("\n".join(st.session_state.rebuild_logs), language="text")
+        st.info("※実行結果をご確認の上、以下のボタンを押して画面を閉じてください。")
+        
+        if st.button("確認して閉じる", type="primary", use_container_width=True):
+            st.session_state.rebuild_status = "confirm"
+            st.session_state.rebuild_logs = []
+            st.rerun()
+
+    elif st.session_state.rebuild_status == "failed":
+        st.error("❌ 一括フルダウンロードまたは再構築に失敗しました。")
+        st.markdown("**実行ログ履歴詳細:**")
+        st.code("\n".join(st.session_state.rebuild_logs), language="text")
+        
+        col_retry, col_close = st.columns(2)
+        if col_retry.button("リトライ", use_container_width=True):
+            st.session_state.rebuild_status = "processing"
+            st.rerun()
+        if col_close.button("閉じる", use_container_width=True):
+            st.session_state.rebuild_status = "confirm"
+            st.session_state.rebuild_logs = []
+            st.rerun()
 
 @st.fragment
 def render_full_rebuild_section(is_jp: bool, market_mode: str):
