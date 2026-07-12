@@ -651,8 +651,14 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
             bm_last_date = get_benchmark_latest_date(interval, is_jp=is_jp)
             log(f"  🔍 ベンチマーク最新: {bm_last_date} | Raw DB最新(Ledger): {db_max_date}")
             if bm_last_date is not None:
-                if bm_last_date <= db_max_date:
-                    log(f"  ✨ 最新状態のため、差分ダウンロードはスキップします。")
+                # 【修正箇所】日付（年月日）レベルに正規化して比較します
+                db_max_day = db_max_date.normalize()
+                bm_last_day = bm_last_date.normalize()
+                
+                # データベースの最新日付が、ベンチマーク最新日付よりも厳密に「未来（翌日以降）」の場合のみスキップします
+                # 同一日の場合は、引け後の確定値オーバーラップ上書きを可能にするためスキップせず実行します
+                if db_max_day > bm_last_day:
+                    log(f"  ✨ 最新状態（未来日付検出）のため、差分ダウンロードはスキップします。")
                     continue
 
         last_updates_map = ledger.get("last_updates_map", {})
@@ -715,7 +721,7 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                 else: start_date_dt = datetime(2016, 1, 1)
                 start_date_str = start_date_dt.strftime("%Y-%m-%d")
             else:
-                # 【修正1】日足でも最新日を再取得（オーバーラップ）するため、t_lastから取得を開始します
+                # 日足でも最新日を再取得（オーバーラップ）するため、t_lastから取得を開始します
                 start_date_dt = t_last
                 start_date_str = start_date_dt.strftime("%Y-%m-%d")
 
@@ -790,7 +796,7 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
             for ticker, group in new_combined.groupby("ticker"):
                 t_last = last_updates_map.get(ticker)
                 if t_last is not None:
-                    # 【修正2】最新の1件分を上書き対象に含めるため、演算子を 「>=」 に修正します
+                    # 最新の1件分を上書き対象に含めるため、演算子を 「>=」 に修正
                     group = group[pd.to_datetime(group["date"]) >= pd.to_datetime(t_last)]
                 filtered_parts.append(group)
             
