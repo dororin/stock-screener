@@ -338,15 +338,15 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
     # マージにより一撃で判定
     merged = df_keys.merge(stop_days_df_match, on=["ticker", "date_norm"], how="left")
     
-    # 💡 警告修正1: 暗黙のダウンキャスト防止のため、明示的にブール型へキャストします
-    is_stop_mask = merged["is_stop"].fillna(False).astype(bool).values
+    # 💡 修正：fillnaを使わずに .eq(True) で比較することで型変換警告（FutureWarning）を完全回避します
+    is_stop_mask = merged["is_stop"].eq(True).values
     
     # 不要なマージ中間変数を即時解放
     del merged, df_keys
     gc.collect()
     log_mem(f"マッチング判定完了。削除対象となるストップ日のバー総数: {is_stop_mask.sum()} 件")
 
-    # 💡 追加: 物理除外されたザラ場中ノイズの個別銘柄および発生日時ログを出力します
+    # 削除対象となったザラ場中ノイズの個別銘柄および発生日時ログを出力
     if is_stop_mask.sum() > 0:
         removed_bars = df_intra_active[is_stop_mask]
         print(f"[CONSOLE_DEBUG] [PROPAGATE_STOP] 🚨 除外対象ストップ日バー詳細:")
@@ -389,13 +389,13 @@ def propagate_stop_allocation_bars_in_memory(df_1d_active: pd.DataFrame, df_intr
         df_synthetic = pd.DataFrame(new_rows)
         df_synthetic["date"] = pd.to_datetime(df_synthetic["date"])
         
-        # 💡 追加: 補完追加された合成大引けバーの個別銘柄および大引け日時ログを出力します
+        # 補完追加された合成大引けバーの個別銘柄および大引け日時ログを出力
         print(f"[CONSOLE_DEBUG] [PROPAGATE_STOP] ➕ 合成補完バー詳細:")
         for _, row in df_synthetic.iterrows():
             print(f"  👉 [補完追加] 銘柄: {row['ticker']} | 日時: {row['date']}")
         sys.stdout.flush()
 
-        # 💡 警告修正2: 空（All-NA）列の存在による結合型不一致警告を防ぐため、カラムスキーマと型を完全に一致させます
+        # 空（All-NA）列の存在による結合型不一致警告を防ぐため、カラムスキーマと型を完全に一致させます
         for col in df_cleaned.columns:
             if col not in df_synthetic.columns:
                 df_synthetic[col] = None
