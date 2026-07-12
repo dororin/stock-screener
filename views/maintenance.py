@@ -858,7 +858,7 @@ def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
         st.warning("⚠️ **警告：この操作は取り消せません**")
         st.markdown(
             f"既存の **{market_mode} {interval}** の原本データ（Raw）および実行用データ（Active）をディスクから完全に物理削除し, "
-            "白紙の状態からyfinanceの提供限界まで全件再ダウンロードを行います。"
+            "白紙の状態からyfinance of 提供限界まで全件再ダウンロードを行います。"
         )
         st.write("1分足や5分足の場合、取得可能上限（7日前/60日前）を過ぎて消失した古い履歴データは完全に失われます。本当に実行してよろしいですか？")
         st.write(" ")
@@ -868,6 +868,7 @@ def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
         if col_no.button("いいえ（キャンセル）", use_container_width=True):
             st.session_state.rebuild_status = "confirm"
             st.session_state.rebuild_logs = []
+            st.session_state.show_rebuild_dialog = False  # 💡 明示的にダイアログ状態を閉じる
             st.rerun()
             
         if col_yes.button("はい（本当に実行する）", type="primary", use_container_width=True):
@@ -921,6 +922,7 @@ def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
         if st.button("確認して閉じる", type="primary", use_container_width=True):
             st.session_state.rebuild_status = "confirm"
             st.session_state.rebuild_logs = []
+            st.session_state.show_rebuild_dialog = False  # 💡 明示的にダイアログ状態を閉じる
             st.rerun()
 
     elif st.session_state.rebuild_status == "failed":
@@ -935,6 +937,7 @@ def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
         if col_close.button("閉じる", use_container_width=True):
             st.session_state.rebuild_status = "confirm"
             st.session_state.rebuild_logs = []
+            st.session_state.show_rebuild_dialog = False  # 💡 明示的にダイアログ状態を閉じる
             st.rerun()
 
 @st.fragment
@@ -957,8 +960,18 @@ def render_full_rebuild_section(is_jp: bool, market_mode: str):
         st.write(" ") 
         st.write(" ")
         
+        # 💡 セッションにダイアログの明示的な開閉フラグを用意します
+        if "show_rebuild_dialog" not in st.session_state:
+            st.session_state.show_rebuild_dialog = False
+        
         if st.button("💥 一括フルダウンロードを実行", key="btn_real_full_rebuild_trigger", type="primary", use_container_width=True):
-            run_full_rebuild_dialog(rebuild_interval, is_jp, market_mode)
+            st.session_state.show_rebuild_dialog = True
+            st.session_state.rebuild_status = "confirm"  # 最初の確認状態に初期化
+            st.rerun()
+
+    # 💡 ボタンが押された直後でなくても、フラグがTrueなら再描画をまたいでダイアログを維持します
+    if st.session_state.show_rebuild_dialog:
+        run_full_rebuild_dialog(rebuild_interval, is_jp, market_mode)
 
 render_full_rebuild_section(is_jp, market_mode)
 
