@@ -641,7 +641,7 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
     for interval in timeframes_to_run:
         log(f"⏱️ 【{market_name}】{interval} Rawデータ差分収集判定を開始...")
         
-        # 🚀 【リファクタリング】数百万行をロードせず、メタデータフッター（台帳）のみを高速取得
+        # 数百万行をロードせず、メタデータフッター（台帳）のみを高速取得
         from data_access.local_db import load_price_db_ledger
         ledger = load_price_db_ledger(interval, is_jp=is_jp, is_raw=True)
         db_max_date_str = ledger.get("db_max_date")
@@ -706,7 +706,7 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
         print(f"[CONSOLE_DEBUG] [Mem: {get_current_memory_usage()}] [UPDATE_RAW] グループ数: {len(groups)}")
         sys.stdout.flush()
 
-        all_downloaded = []  # ⚠️ 処理グループを回す直前に初期化
+        all_downloaded = []  # 処理グループを回す直前に初期化
         for group_idx, (t_last, chunk_tickers) in enumerate(groups.items()):
             if t_last is None:
                 if interval == "1m": start_date_dt = now - timedelta(days=6)
@@ -715,10 +715,8 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
                 else: start_date_dt = datetime(2016, 1, 1)
                 start_date_str = start_date_dt.strftime("%Y-%m-%d")
             else:
-                if interval == "1d":
-                    start_date_dt = t_last + timedelta(days=1)
-                else:
-                    start_date_dt = t_last
+                # 【修正1】日足でも最新日を再取得（オーバーラップ）するため、t_lastから取得を開始します
+                start_date_dt = t_last
                 start_date_str = start_date_dt.strftime("%Y-%m-%d")
 
             if interval in YFINANCE_GAP_LIMITS:
@@ -792,7 +790,8 @@ def update_raw_database(is_jp: bool = True, target_tickers: list = None, force_r
             for ticker, group in new_combined.groupby("ticker"):
                 t_last = last_updates_map.get(ticker)
                 if t_last is not None:
-                    group = group[pd.to_datetime(group["date"]) > pd.to_datetime(t_last)]
+                    # 【修正2】最新の1件分を上書き対象に含めるため、演算子を 「>=」 に修正します
+                    group = group[pd.to_datetime(group["date"]) >= pd.to_datetime(t_last)]
                 filtered_parts.append(group)
             
             if filtered_parts:
