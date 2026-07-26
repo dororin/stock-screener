@@ -1,8 +1,10 @@
 # data_access/sheets_api.py
+
+import os
 import pandas as pd
 import pytz
 from datetime import datetime
-from google.oauth2.service_account import Credentials as SACredentials
+from google.oauth2.credentials import Credentials as OAuth2Credentials
 import gspread
 from config import settings
 
@@ -12,143 +14,192 @@ try:
 except ImportError:
     HAS_STREAMLIT = False
 
-# --- Streamlit標準接続(GSheetsConnection)の初期化 ---
-conn = None
-if HAS_STREAMLIT:
-    try:
-        from streamlit_gsheets import GSheetsConnection
-        conn = st.connection("gsheets", type=GSheetsConnection)
-    except Exception:
-        pass
+def get_oauth2_config() -> dict:
+    """認証情報(google_oauth)をst.secretsまたはローカルのsecrets.tomlからロードします。"""
+    cfg = None
+    if HAS_STREAMLIT:
+        try:
+            if hasattr(st, "secrets") and "google_oauth" in st.secrets:
+                cfg = dict(st.secrets["google_oauth"])
+        except Exception:
+            pass
+    if not cfg:
+        try:
+            import toml
+            secrets_path = os.path.join(settings.PROJECT_ROOT, ".streamlit", "secrets.toml")
+            if os.path.exists(secrets_path):
+                cfg = toml.load(secrets_path).get("google_oauth")
+        except Exception:
+            pass
+    return cfg
 
 def get_gspread_client():
     """gspreadを使用したシート書き込み用クライアントを作成して返します。"""
-    if not HAS_STREAMLIT:
+    cfg = get_oauth2_config()
+    if not cfg or "refresh_token" not in cfg:
+        print("❌ [sheets_api] OAuth2の設定(google_oauth)が見つかりません。")
         return None
     try:
-        cfg = dict(st.secrets["connections"]["gsheets"])
-        sa_info = {k: cfg[k] for k in ["type", "project_id", "private_key_id", "private_key", "client_email", "client_id", "auth_uri", "token_uri"] if k in cfg}
-        if "private_key" in sa_info:
-            sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
-        creds = SACredentials.from_service_account_info(
-            sa_info, 
-            scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        # OAuth2個人アカウントの認証インスタンスを作成してgspreadに適用
+        creds = OAuth2Credentials(
+            token=None,
+            refresh_token=cfg["refresh_token"],
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=cfg["client_id"],
+            client_secret=cfg["client_secret"]
         )
         return gspread.authorize(creds)
-    except Exception:
+    except Exception as e:
+        print(f"❌ [sheets_api] gspread OAuth2 認証オブジェクトの生成に失敗しました: {e}")
         return None
 
 def get_drive_service():
-    """Google Drive API（ファイルアップロード等）操作用のサービスクライアントを作成して返します。"""
-    if not HAS_STREAMLIT:
+    """Google Drive API操作用のサービスクライアントを作成して返します。"""
+    cfg = get_oauth2_config()
+    if not cfg or "refresh_token" not in cfg:
         return None
     try:
         from googleapiclient.discovery import build
-        cfg = dict(st.secrets["connections"]["gsheets"])
-        sa_info = {k: cfg[k] for k in ["type", "project_id", "private_key_id", "private_key", "client_email", "client_id", "auth_uri", "token_uri"] if k in cfg}
-        if "private_key" in sa_info:
-            sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
-        creds = SACredentials.from_service_account_info(
-            sa_info,
-            scopes=["https://www.googleapis.com/auth/drive"]
+        creds = OAuth2Credentials(
+            token=None,
+            refresh_token=cfg["refresh_token"],
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=cfg["client_id"],
+            client_secret=cfg["client_secret"]
         )
         return build("drive", "v3", credentials=creds, cache_discovery=False)
     except Exception as e:
-        print(f"❌ [sheets_api] Google Drive サービスの認証に失敗しました: {e}")
+        print(f"❌ [sheets_api] Google Drive OAuth2 認証に失敗しました: {e}")
         return None
 
 def upload_sync_log_to_drive(log_lines: list, is_jp: bool = True, prefix: str = "sync") -> str:
-    """同期処理中にメモリへ蓄積された詳細ログ（文字列のリスト）をバッチアップロードします。"""
+    """同期処理中にメモリへ蓄積された詳細ログをバッチアップロードします。"""
     if not log_lines:
         return None
-
     service = get_drive_service()
-    if service is None:
-        print("⚠️ [upload_sync_log_to_drive] Google Drive サービスが利用できないため、ログ保存をスキップしました。")
+    if service is None or not getattr(settings, "LOGS_FOLDER_ID", None):
         return None
-
-    folder_id = getattr(settings, "LOGS_FOLDER_ID", None)
-    if not folder_id:
-        print("⚠️ [upload_sync_log_to_drive] settings.LOGS_FOLDER_ID が未設定のため、ログ保存をスキップしました。")
-        return None
-
     try:
         from googleapiclient.http import MediaInMemoryUpload
-
         tz = pytz.timezone("Asia/Tokyo") if is_jp else pytz.timezone("America/New_York")
         now_tz = datetime.now(pytz.utc).astimezone(tz)
         filename = f"{prefix}_{now_tz.strftime('%Y-%m-%d_%H%M%S')}.log"
-
         content = "\n".join(str(line) for line in log_lines)
-        file_metadata = {"name": filename, "parents": [folder_id]}
+        file_metadata = {"name": filename, "parents": [settings.LOGS_FOLDER_ID]}
         media = MediaInMemoryUpload(content.encode("utf-8"), mimetype="text/plain")
         service.files().create(body=file_metadata, media_body=media, fields="id").execute()
         return filename
     except Exception as e:
-        print(f"⚠️ [upload_sync_log_to_drive] ログのGoogleドライブへのアップロードに失敗しました: {e}")
+        print(f"⚠️ ログのアップロードに失敗しました: {e}")
         return None
 
 def get_sector_spreadsheet():
-    """構成定義等のスプレッドシート（ブック単位）を開いて返します。"""
+    """各種マスタースプレッドシートを取得してオープンします。"""
     gc = get_gspread_client()
     if gc is None:
         print("❌ [sheets_api] gspreadクライアントの認証に失敗しました。")
         return None
     try:
-        cfg = st.secrets["connections"]["gsheets"]
-        url = cfg.get("sector_spreadsheet", cfg.get("spreadsheet"))
-        return gc.open_by_url(url)
+        # settings.py で解決済みのマスターURLを使用
+        return gc.open_by_url(settings.MARKET_DATA_URL)
     except Exception as e:
-        print(f"❌ [sheets_api] スプレッドシートのオープンに失敗しました: {e}")
+        print(f"❌ [sheets_api] マスタースプレッドシートのオープンに失敗しました: {e}")
         return None
 
-# --- スクリーニング履歴管理 ---
+# --- 🚀 スクリーニング履歴管理 (gspread個人OAuth対応版) ---
 def save_history(df: pd.DataFrame) -> str:
-    """スクリーニング判定結果を履歴シートに追加保存します。"""
-    if conn is None:
+    """WVFスクリーナーの結果（履歴）を VWF用スプレッドシートの最初のシートに末尾アペンド上書き保存します。"""
+    gc = get_gspread_client()
+    if gc is None:
+        print("❌ [sheets_api] gspreadクライアントの取得に失敗したため、履歴を保存できません。")
         return None
+
     screening_id = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_df = df.copy()
     save_df['screening_id'] = screening_id
+
     try:
-        existing_data = conn.read()
-        updated_data = pd.concat([existing_data, save_df], ignore_index=True)
-    except Exception:
-        updated_data = save_df
-    conn.update(data=updated_data)
-    return screening_id
+        # 指定されたVWF結果保存シートをオープン
+        sh = gc.open_by_url(settings.SPREADSHEET_VWF_URL)
+        ws = sh.get_worksheet(0)  # 最初のワークシートをオープン
+
+        # 既存データのロード試行
+        try:
+            raw_records = ws.get_all_records()
+            if raw_records:
+                existing_df = pd.DataFrame(raw_records)
+                # 古い履歴データに今回の新しいスクリーニング履歴を追加
+                updated_data = pd.concat([existing_df, save_df], ignore_index=True)
+            else:
+                updated_data = save_df
+        except Exception:
+            updated_data = save_df
+
+        # pandasの特殊オブジェクトやTimestampのシリアライズエラー防止のためのサニタイズ処理
+        for col in updated_data.columns:
+            if pd.api.types.is_datetime64_any_dtype(updated_data[col]):
+                updated_data[col] = updated_data[col].dt.strftime("%Y-%m-%d %H:%M:%S")
+        updated_data = updated_data.fillna("")
+
+        # ヘッダー行と値をネストされた配列にパース
+        headers = updated_data.columns.tolist()
+        rows = [headers] + updated_data.values.tolist()
+
+        # スプレッドシートの一括クリアと最上部からの物理再書き込み（上書き）
+        ws.clear()
+        ws.update(values=rows, range_name="A1")
+        return screening_id
+    except Exception as e:
+        print(f"❌ [sheets_api] WVF履歴スプレッドシートへの保存書き込みに失敗しました: {e}")
+        return None
 
 def get_history_list() -> list:
-    """履歴シートから、過去に実行されたユニークなスクリーニング実行日時リストを返します。"""
-    if conn is None:
+    """保存されたスクリーニング履歴の screening_id の降順リストを返します。"""
+    gc = get_gspread_client()
+    if gc is None:
         return []
     try:
-        df = conn.read(ttl=0)
-        if df is None or df.empty or 'screening_id' not in df.columns:
+        sh = gc.open_by_url(settings.SPREADSHEET_VWF_URL)
+        ws = sh.get_worksheet(0)
+        raw_records = ws.get_all_records()
+        if not raw_records:
+            return []
+        
+        df = pd.DataFrame(raw_records)
+        if df.empty or 'screening_id' not in df.columns:
             return []
         return sorted(df['screening_id'].unique().tolist(), reverse=True)
-    except Exception:
+    except Exception as e:
+        print(f"❌ [sheets_api] 履歴リストの取得に失敗しました: {e}")
         return []
 
 def load_history(screening_id: str) -> pd.DataFrame:
-    """指定されたスクリーニング実行IDに紐づく過去の判定データをロードして返します。"""
-    if conn is None:
+    """指定された screening_id の時系列スクリーニング履歴を復元・ロードします。"""
+    gc = get_gspread_client()
+    if gc is None:
         return pd.DataFrame()
     try:
-        df = conn.read()
+        sh = gc.open_by_url(settings.SPREADSHEET_VWF_URL)
+        ws = sh.get_worksheet(0)
+        raw_records = ws.get_all_records()
+        if not raw_records:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(raw_records)
         target_df = df[df['screening_id'] == screening_id].copy()
+        
         if not target_df.empty and 'コード' in target_df.columns:
             target_df['コード'] = target_df['コード'].astype(str).str.replace(r'\.0$', '', regex=True)
         if not target_df.empty and 'お気に入り' not in target_df.columns:
             target_df['お気に入り'] = False
         return target_df
-    except Exception:
+    except Exception as e:
+        print(f"❌ [sheets_api] 履歴({screening_id})のデータ復元に失敗しました: {e}")
         return pd.DataFrame()
 
-# --- セクター定義シート連携（非表示ONセクターを自動除外） ---
+# --- セクター定義シート連携 ---
 def load_sector_master_from_sheets(is_jp: bool) -> dict:
-    """Google Sheetsのセクター定義シートから、セクターと構成ティッカーの対応マップを構築して返します。
-    extra_tickers（手動台帳）で「非表示: ON」に設定されているセクターは自動的に除外します。"""
+    """セクターと構成ティッカーの対応マップをSheetsからロードします。"""
     sh = get_sector_spreadsheet()
     default_sectors = settings.JP_SECTORS if is_jp else settings.US_SECTORS
     if sh is None:
@@ -156,7 +207,6 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
     
     sheet_name = "sector_JP" if is_jp else "sector_US"
     try:
-        # --- 1. 手動定義シート（extra_tickers）から非表示セクター名を特定 ---
         hidden_sectors = set()
         try:
             ws_manual = sh.worksheet(settings.EXTRA_TICKERS_SHEET)
@@ -176,7 +226,6 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
         except Exception:
             pass
 
-        # --- 2. 本番シート（sector_JP）から構成銘柄を読み込む ---
         ws = sh.worksheet(sheet_name)
         records = ws.get_all_records()
         if not records:
@@ -201,7 +250,6 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
             sec = str(row["sector"]).strip()
             code = str(row["code"]).strip().split(".")[0]
             
-            # 非表示に指定されているセクターはUI用の戻り値辞書から除外
             if sec in hidden_sectors:
                 continue
                 
@@ -213,7 +261,6 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
 
 # --- ウォッチリスト連携 ---
 def load_watchlist_from_sheets() -> dict:
-    """ウォッチリストシートから、登録銘柄コードと名称の組み合わせ辞書を返します。"""
     sh = get_sector_spreadsheet()
     if sh is None:
         return {}
@@ -231,7 +278,6 @@ def load_watchlist_from_sheets() -> dict:
         return {}
 
 def save_watchlist_to_sheets(watchlist: dict):
-    """現在のウォッチリスト辞書をスプレッドシートに永続化保存します。"""
     sh = get_sector_spreadsheet()
     if sh is None:
         return
@@ -250,7 +296,6 @@ def save_watchlist_to_sheets(watchlist: dict):
 REPAIR_LOG_COLUMNS = ["executed_at", "ticker", "market", "cliff_date", "interval", "before_close", "after_close", "multiplier", "memo"]
 
 def save_repair_log_to_sheets(log_rows: list) -> bool:
-    """データ修復の実行ログをスプレッドシートに安全に追記します。"""
     if not log_rows:
         return False
     sh = get_sector_spreadsheet()
@@ -269,12 +314,10 @@ def save_repair_log_to_sheets(log_rows: list) -> bool:
         ]
         ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
         return True
-    except Exception as e:
-        print(f"⚠️ 修復ログ保存エラー: {e}")
+    except Exception:
         return False
 
 def load_repair_log_from_sheets() -> pd.DataFrame:
-    """過去の修復ログ履歴をスプレッドシートからロードしDataFrameとして返します。"""
     sh = get_sector_spreadsheet()
     if sh is None:
         return pd.DataFrame(columns=REPAIR_LOG_COLUMNS)
@@ -286,7 +329,6 @@ def load_repair_log_from_sheets() -> pd.DataFrame:
         
         headers = [str(h).strip().lower() for h in raw_values[0]]
         headers = [h.replace("executed＿at", "executed_at") for h in headers]
-        
         data_rows = raw_values[1:]
         df = pd.DataFrame(data_rows, columns=headers)
         
@@ -303,15 +345,13 @@ def load_repair_log_from_sheets() -> pd.DataFrame:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
                 
         return df.sort_values("executed_at", ascending=False).reset_index(drop=True)
-    except Exception as e:
-        print(f"❌ [load_repair_log_from_sheets] データのロードに失敗しました: {e}")
+    except Exception:
         return pd.DataFrame(columns=REPAIR_LOG_COLUMNS)
 
-# --- 🚀 手動登録台帳（extra_tickers）の連携 ---
+# --- 手動登録台帳（extra_tickers）の連携 ---
 EXTRA_TICKERS_COLUMNS = ["セクター名", "銘柄コード", "備考", "ETFコード", "ファンド", "非表示"]
 
 def load_extra_tickers_from_sheets() -> pd.DataFrame:
-    """手動追加用シート（extra_tickers）からマスタ登録リストをロードします。"""
     sh = get_sector_spreadsheet()
     if sh is None:
         return pd.DataFrame(columns=EXTRA_TICKERS_COLUMNS)
@@ -329,7 +369,6 @@ def load_extra_tickers_from_sheets() -> pd.DataFrame:
             
         headers = [str(h).strip() for h in raw_values[0]]
         data_rows = raw_values[1:]
-        
         df = pd.DataFrame(data_rows, columns=headers)
         
         for col in EXTRA_TICKERS_COLUMNS:
@@ -340,12 +379,10 @@ def load_extra_tickers_from_sheets() -> pd.DataFrame:
             df["銘柄コード"] = df["銘柄コード"].astype(str).str.strip().str.split(".").str[0]
             
         return df[EXTRA_TICKERS_COLUMNS].reset_index(drop=True)
-    except Exception as e:
-        print(f"❌ [load_extra_tickers_from_sheets] ロード失敗: {e}")
+    except Exception:
         return pd.DataFrame(columns=EXTRA_TICKERS_COLUMNS)
 
 def save_extra_tickers_to_sheets(df: pd.DataFrame):
-    """手動追加の変更定義（extra_tickers）をスプレッドシートに保存します。"""
     sh = get_sector_spreadsheet()
     if sh is None:
         return
@@ -364,19 +401,21 @@ def save_extra_tickers_to_sheets(df: pd.DataFrame):
         rows = [EXTRA_TICKERS_COLUMNS] + valid_df.values.tolist()
         ws.clear()
         ws.update(rows, "A1")
-    except Exception as e:
-        print(f"❌ [save_extra_tickers_to_sheets] 保存失敗: {e}")
+    except Exception:
+        pass
 
-# --- 🚀 フィルタポリシー＆マージ対応型 統合セクター同期システム ---
+
+# --- 🚀 フィルタポリシー＆マージ対応型 統合マスタ同期システム（TOPIX500クラウド分離対応版） ---
 ETF_MASTER_COLUMNS = ["ETFコード", "セクター名", "フィルターポリシー", "ファンド"]
 SECTOR_JP_COLUMNS = ["セクター名", "銘柄コード", "備考", "ETFコード"]
+TOPIX500_OUT_COLUMNS = ["銘柄コード", "銘柄名", "規模区分"]
 
 def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     """
-    etf_master シートから自動同期対象（ポリシー等）をロードし、
-    各ETFの構成銘柄を取得した上でフィルターポリシー（TOPIX100等）を適用。
-    さらに、手動台帳シート（extra_tickers）から手動登録の個別銘柄をロードして、
-    メモリ上で結合・重複排除（マージ）した完成データを sector_JP (または sector_US) へ一括上書き出力します。
+    【ステップ1：クラウドマスタ完全同期】
+    1. etf_master から自動同期ポリシーをロードしてETF構成をWebスクレイピング取得。
+    2. 【日本株限定】JPX公式サイトからTOPIX500リストを自動ダウンロードし、新規「topix500」シートを生成・一括保存。
+    3. extra_tickers(手動台帳)の個別設定、およびETF構成銘柄を重複排除マージして sector_JP / sector_US へ保存。
     """
     sh = get_sector_spreadsheet()
     if sh is None:
@@ -384,8 +423,9 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
         
     sheet_name = "sector_JP" if is_jp else "sector_US"
     etf_master_sheet_name = "etf_master"
+    topix500_sheet_name = "topix500"
     
-    # 必要シートの存在チェックと新規自動作成
+    # 必要シートの自動チェックと生成
     try:
         ws_master = sh.worksheet(etf_master_sheet_name)
     except Exception:
@@ -409,10 +449,64 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
         ws_out = sh.add_worksheet(title=sheet_name, rows=2000, cols=len(SECTOR_JP_COLUMNS))
         ws_out.update(values=[SECTOR_JP_COLUMNS], range_name="A1")
 
-    # etf_master から自動同期設定をロード
+    # TOPIX500用シートオブジェクトの生成・確認は、日本株(is_jp=True)の時のみ制限して実行
+    if is_jp:
+        try:
+            ws_topix500 = sh.worksheet(topix500_sheet_name)
+        except Exception:
+            ws_topix500 = sh.add_worksheet(title=topix500_sheet_name, rows=1000, cols=len(TOPIX500_OUT_COLUMNS))
+            ws_topix500.update(values=[TOPIX500_OUT_COLUMNS], range_name="A1")
+
+    sync_results = {}
+
+    # ────── 1. 【クラウド側自動取得】JPX公式のTOPIX500 Excelをロード ──────
+    # 日本株（is_jp=True）の場合のみに完全限定化
+    if is_jp:
+        import requests
+        try:
+            print("[CONSOLE_DEBUG] [SHEETS_SYNC] JPX公式サイトからTOPIX500リストを自動ダウンロード中...")
+            resp = requests.get(settings.JPX_URL, timeout=15)
+            if resp.status_code == 200:
+                df_jpx = pd.read_excel(resp.content)
+                df_scale = df_jpx.iloc[:, [1, 2, 9]].copy()
+                df_scale.columns = ['symbol', 'name', 'scale_type']
+                target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
+                
+                topix500_df = df_scale[df_scale['scale_type'].isin(target_scales)].copy()
+                
+                # symbol列を文字列型に変換
+                def clean_symbol(val):
+                    if pd.isna(val):
+                        return ""
+                    val_str = str(val).strip()
+                    if val_str.endswith(".0"):
+                        val_str = val_str[:-2]
+                    return val_str
+
+                topix500_df['symbol'] = topix500_df['symbol'].apply(clean_symbol)
+                
+                # 正規表現で「4桁の半角英数字（例: 7203, 285A）」のみを完全に抽出
+                topix500_df = topix500_df[topix500_df['symbol'].str.match(r'^[0-9A-Za-z]{4}$')].copy()
+                topix500_df['symbol'] = topix500_df['symbol'].str.upper()
+                topix500_df = topix500_df.fillna("")
+                
+                # topix500 シートへ一括更新
+                topix500_values = [TOPIX500_OUT_COLUMNS]
+                for _, r in topix500_df.iterrows():
+                    topix500_values.append([r['symbol'], r['name'], r['scale_type']])
+                
+                ws_topix500.clear()
+                ws_topix500.update(topix500_values, "A1")
+                sync_results["TOPIX500 (JPX)"] = f"同期成功 ({len(topix500_df)}銘柄を 'topix500' シートへ保存完了)"
+            else:
+                sync_results["TOPIX500 (JPX)"] = "⚠️ JPXダウンロード失敗（ステータスコード異常）"
+        except Exception as e:
+            sync_results["TOPIX500 (JPX)"] = f"❌ JPX自動取得中にエラー: {e}"
+
+    # ────── 2. ETF構成銘柄および手動セクターのマージ処理 ──────
     master_values = ws_master.get_all_values()
     if not master_values or len(master_values) < 2:
-        return {"info": "etf_master シートが空のため、自動同期の対象はありません。"}
+        return {"info": "etf_master シートが空のため、セクター自動同期はスキップされました。"}
         
     master_headers = [str(h).strip() for h in master_values[0]]
     col_etf_idx = next((i for i, h in enumerate(master_headers) if h in ["ETFコード", "etf", "etf_code"]), -1)
@@ -438,19 +532,27 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                     "fund_val": fund_val
                 })
                 
-    # Webからの構成ダウンロード＆フィルタリング
     from core.collector import fetch_etf_constituents, get_jpx_scale_map
     scale_map = get_jpx_scale_map()
     
-    sync_results = {}
     auto_rows = []
-    
     downloaded_cache = {}
+    
+    # ETF構成のダウンロード
     for target in etf_targets:
         etf_code = target["etf_code"]
         fund_val = target["fund_val"]
+        sec_name = target["sector_name"]
+        
         if etf_code not in downloaded_cache:
-            constituents = fetch_etf_constituents(etf_code, fund_provider=fund_val)
+            try:
+                constituents = fetch_etf_constituents(etf_code, fund_provider=fund_val)
+            except Exception as ex:
+                return {"error": f"ETFコード [{etf_code}] ({sec_name}) の構成銘柄取得処理で例外エラーが発生したため同期を安全に中断しました。詳細: {ex}"}
+                
+            if not constituents or len(constituents) == 0:
+                return {"error": f"ETFコード [{etf_code}] ({sec_name}) の構成銘柄データを取得できませんでした。既存データを保護するため、処理を強制中断しました。"}
+                
             downloaded_cache[etf_code] = constituents
             
     for target in etf_targets:
@@ -459,13 +561,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
         policy = target["policy"]
         constituents = downloaded_cache.get(etf_code)
         
-        if not constituents:
-            sync_results[sec_name] = "⚠️ 通信エラー等により既存データを維持できないためスキップ"
-            continue
-            
         filtered_count = 0
-        
-        # TOP N フィルタの抽出
         if policy.startswith("TOP") and policy[3:].isdigit():
             top_n = int(policy[3:])
             sub_consts = {k: v for i, (k, v) in enumerate(constituents.items()) if i < top_n}
@@ -482,7 +578,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                         sub_consts[code] = name
                 elif policy in ["ALL", "NONE"]:
                     sub_consts[code] = name
-                else: # デフォルト: TOPIX500
+                else: # デフォルト TOPIX500
                     if m_scale in ["TOPIX Core30", "TOPIX Large70", "TOPIX Mid400"]:
                         sub_consts[code] = name
                         
@@ -497,7 +593,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
             
         sync_results[sec_name] = f"同期成功 ({filtered_count} / {len(constituents)}銘柄) [ポリシー: {policy}]"
         
-    # 手動構成台帳（extra_tickers）をロード
     manual_df = load_extra_tickers_from_sheets()
     manual_rows = []
     if not manual_df.empty:
@@ -515,7 +610,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                     "etf": etf_val
                 })
                 
-    # 自動同期分と手動分をマージ（手動分を最優先で重複排除）
     final_rows = []
     seen_pairs = set()
     
@@ -531,7 +625,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
             seen_pairs.add(pair_key)
             final_rows.append(r)
             
-    # sector_JP / sector_US へ一括出力
+    # sector_JP / sector_US へ一括上書き出力
     output_values = [SECTOR_JP_COLUMNS]
     for r in final_rows:
         output_values.append([

@@ -7,29 +7,95 @@ try:
 except ImportError:
     HAS_STREAMLIT = False
 
-# --- Google Drive 共有フォルダ設定 ---
-FOLDER_ID = "1Lx-Xdsm8h20Q-ZRI91Ty7smdYVhkuoFD"
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# --- 環境判定とディレクトリ設定（ロードの都合上、先に定義） ---
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def setup_directories():
+    is_colab = False
+    try:
+        from google.colab import drive
+        is_colab = True
+    except ImportError:
+        pass
+        
+    is_kaggle = os.environ.get('KAGGLE_KERNEL_RUN_TYPE') is not None
+    
+    current_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
+    project_root = os.path.dirname(current_dir)
+    
+    if is_colab:
+        drive_path = "/content/drive/MyDrive/stock_data_hub"
+        if not os.path.exists("/content/drive/MyDrive") and os.path.exists("/content/drive/My Drive"):
+            drive_path = "/content/drive/My Drive/stock_data_hub"
+        work_path = "/content/stock_data_work"
+    elif is_kaggle:
+        drive_path = "/kaggle/working/drive/MyDrive/stock_data_hub" 
+        work_path = "/kaggle/working/stock_data_work"
+    else:
+        drive_path = os.path.join(project_root, "data_drive")
+        work_path = os.path.join(project_root, "data_work")
 
-# --- 同期ログ保存用 Google Drive フォルダ ---
-LOGS_FOLDER_ID = "1xKzLMQzOejLyXq_SBF8SxYq3rZG5evV0"
+    os.makedirs(drive_path, exist_ok=True)
+    os.makedirs(work_path, exist_ok=True)
+    return project_root, drive_path, work_path
+
+PROJECT_ROOT, DRIVE_DIR, WORK_DIR = setup_directories()
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🚀 secrets.toml からの共通環境設定ロード（Streamlit/ローカル双方対応）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+cfg_secrets = {}
+
+# 1. Streamlit Secrets のロード試行
 if HAS_STREAMLIT:
     try:
-        if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
-            FOLDER_ID = st.secrets["connections"]["gsheets"].get("folder_id", FOLDER_ID)
+        if hasattr(st, "secrets") and st.secrets:
+            cfg_secrets = dict(st.secrets)
     except Exception:
         pass
 
+# 2. 非GUI環境（ローカル実行時等）のための直接 TOML ロード試行
+if not cfg_secrets:
+    secrets_path = os.path.join(PROJECT_ROOT, ".streamlit", "secrets.toml")
+    if os.path.exists(secrets_path):
+        try:
+            import toml
+            cfg_secrets = toml.load(secrets_path)
+        except Exception as e:
+            print(f"⚠️ config/settings: secrets.toml の直接ロードに失敗しました: {e}")
+
+if not cfg_secrets:
+    raise RuntimeError(
+        "❌ 認証・設定ファイル (secrets.toml) が正常にロードされていません。プログラムの実行を中断します。"
+    )
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🚀 新しい secrets.toml のキーから環境設定を安全に取得
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+try:
+    FOLDER_ID = cfg_secrets["FOLDER_ID"]
+    LOGS_FOLDER_ID = cfg_secrets["LOGS_FOLDER_ID"]
+    MARKET_DATA_URL = cfg_secrets["spreadsheet"]
+    SPREADSHEET_VWF_URL = cfg_secrets["spreadsheet_VWF_url"]
+except KeyError as e:
+    raise KeyError(
+        f"❌ secrets.toml に必要な設定 {e} が不足しています。プログラムの実行を安全に中断します。"
+    )
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # --- 各種外部URL・基本設定 ---
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 JPX_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
 TIMEFRAMES = ["1d", "60m", "5m", "1m"]
-MARKET_DATA_URL = "https://docs.google.com/spreadsheets/d/1vaX2dKcHO_fo_KMffNiC98pY1fzfMkHCRkHE1IFE0PI/edit"
 
 # --- Google Sheets 内のシート名設定 ---
 WATCHLIST_SHEET_NAME = "watchlist"
 REPAIR_LOG_SHEET_NAME = "repair_log"
 EXTRA_TICKERS_SHEET = "extra_tickers"
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # --- セクター定義（スプレッドシート接続不可時のデフォルト） ---
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 JP_SECTORS = {
     "半導体・装置": ["8035", "6857", "6146", "6920", "6963", "4063", "6981"],
     "電気機器": ["6758", "6861", "6954", "6902", "7751", "6971"],
@@ -79,39 +145,6 @@ TOPIX17_NAMES = {
     "1628": "運輸・物流", "1629": "商社・卸売", "1630": "小売", "1631": "銀行",
     "1632": "金融（除く銀行）", "1633": "不動産"
 }
-
-# --- 環境判定とディレクトリ設定 ---
-def setup_directories():
-    is_colab = False
-    try:
-        from google.colab import drive
-        is_colab = True
-    except ImportError:
-        pass
-        
-    is_kaggle = os.environ.get('KAGGLE_KERNEL_RUN_TYPE') is not None
-    
-    # settings.pyは project_root/config に配置されるため、親階層を project_root と判定する
-    current_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
-    project_root = os.path.dirname(current_dir)
-    
-    if is_colab:
-        drive_path = "/content/drive/MyDrive/stock_data_hub"
-        if not os.path.exists("/content/drive/MyDrive") and os.path.exists("/content/drive/My Drive"):
-            drive_path = "/content/drive/My Drive/stock_data_hub"
-        work_path = "/content/stock_data_work"
-    elif is_kaggle:
-        drive_path = "/kaggle/working/drive/MyDrive/stock_data_hub" 
-        work_path = "/kaggle/working/stock_data_work"
-    else:
-        drive_path = os.path.join(project_root, "data_drive")
-        work_path = os.path.join(project_root, "data_work")
-
-    os.makedirs(drive_path, exist_ok=True)
-    os.makedirs(work_path, exist_ok=True)
-    return project_root, drive_path, work_path
-
-PROJECT_ROOT, DRIVE_DIR, WORK_DIR = setup_directories()
 
 # --- Solactive PCF CSV 設定 ---
 SOLACTIVE_PCF_BASE_URL = "https://www.solactive.com/downloads/etfservices/tse-pcf/single/"

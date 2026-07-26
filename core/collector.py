@@ -3,8 +3,7 @@ import os
 import json
 import requests
 import pandas as pd
-import yfinance as yf
-from datetime import datetime, time as dt_time
+from datetime import datetime
 from config import settings
 import io
 
@@ -178,12 +177,10 @@ def get_topix500_tickers() -> list:
         print(f"JPX銘柄リスト取得失敗: {e}")
         return []
 
-# --- 🚀 JPX規模区分マッピング関数の追加 ---
 def get_jpx_scale_map() -> dict:
     """JPXのキャッシュファイルから {銘柄コード: 規模区分} の辞書を構築します。"""
     jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
     
-    # 🚨 修正：ファイルが存在しない場合は、JPX公式サイトからダウンロードして保存する
     if not os.path.exists(jpx_save_path):
         print("📥 JPX銘柄リストが存在しないため、新規ダウンロードします...")
         try:
@@ -314,117 +311,3 @@ def load_tickers_from_file(file_path: str) -> list:
     except Exception as e:
         print(f"❌ [load_tickers_from_file] 読み込み失敗: {e}")
         return []
-
-def parse_yfinance_batch(df_raw: pd.DataFrame, chunk_tickers: list, is_jp: bool = True) -> pd.DataFrame:
-    """yfinanceの生バッチ出力をパースします。"""
-    if df_raw.empty:
-        return pd.DataFrame()
-    all_rows = []
-    is_multi = isinstance(df_raw.columns, pd.MultiIndex)
-    suffix = ".T" if is_jp else ""
-    numeric_cols = ["open", "high", "low", "close", "adj close", "volume", "stock splits", "dividends"]
-    
-    if not is_multi:
-        if len(chunk_tickers) == 1:
-            t_df = df_raw.copy()
-            t_df = t_df.dropna(how="all").reset_index()
-            t_df.columns = [str(c).lower() for c in t_df.columns]
-            t_df = t_df.rename(columns={"datetime": "date", "index": "date"})
-            dt_col = pd.to_datetime(t_df["date"])
-            t_df["date"] = dt_col.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None) if dt_col.dt.tz is not None else dt_col
-            t_df["ticker"] = str(chunk_tickers[0])
-            
-            for col in numeric_cols:
-                if col in t_df.columns:
-                    t_df[col] = pd.to_numeric(t_df[col], errors='coerce')
-                    t_df[col] = t_df[col].replace([float('inf'), float('-inf')], float('nan'))
-            
-            if "date" in t_df.columns:
-                times = t_df["date"].dt.time
-                start_time = dt_time(9, 0)
-                end_time = dt_time(15, 30) if is_jp else dt_time(16, 0)
-                if not is_jp:
-                    start_time = dt_time(9, 30)
-                
-                is_intraday = not (times == dt_time(0, 0)).all()
-                if is_intraday:
-                    t_df = t_df[(times >= start_time) & (times <= end_time)]
-            
-            target_cols = ["date", "ticker", "open", "high", "low", "close", "adj close", "volume", "stock splits", "dividends"]
-            valid_cols = [c for c in target_cols if c in t_df.columns]
-            return t_df[valid_cols]
-        else:
-            return pd.DataFrame()
-            
-    for ticker in chunk_tickers:
-        symbol = f"{ticker}{suffix}"
-        try:
-            if symbol in df_raw.columns.get_level_values(1):
-                t_df = df_raw.xs(symbol, axis=1, level=1).copy()
-            elif symbol in df_raw.columns.get_level_values(0):
-                t_df = df_raw[symbol].copy()
-            else:
-                alt_symbol = ticker
-                if alt_symbol in df_raw.columns.get_level_values(1):
-                    t_df = df_raw.xs(alt_symbol, axis=1, level=1).copy()
-                elif alt_symbol in df_raw.columns.get_level_values(0):
-                    t_df = df_raw[alt_symbol].copy()
-                else:
-                    continue
-
-            t_df = t_df.dropna(how="all").reset_index()
-            t_df.columns = [str(c).lower() for c in t_df.columns]
-            t_df = t_df.rename(columns={"datetime": "date", "index": "date"}) 
-            dt_col = pd.to_datetime(t_df["date"])
-            t_df["date"] = dt_col.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None) if dt_col.dt.tz is not None else dt_col
-            t_df["ticker"] = str(ticker)
-            
-            for col in numeric_cols:
-                if col in t_df.columns:
-                    t_df[col] = pd.to_numeric(t_df[col], errors='coerce')
-                    t_df[col] = t_df[col].replace([float('inf'), float('-inf')], float('nan'))
-            
-            if "date" in t_df.columns:
-                times = t_df["date"].dt.time
-                start_time = dt_time(9, 0)
-                end_time = dt_time(15, 30) if is_jp else dt_time(16, 0)
-                if not is_jp:
-                    start_time = dt_time(9, 30)
-                
-                is_intraday = not (times == dt_time(0, 0)).all()
-                if is_intraday:
-                    t_df = t_df[(times >= start_time) & (times <= end_time)]
-            
-            target_cols = ["date", "ticker", "open", "high", "low", "close", "adj close", "volume", "stock splits", "dividends"]
-            valid_cols = [c for c in target_cols if c in t_df.columns]
-            all_rows.append(t_df[valid_cols])
-        except Exception:
-            continue
-            
-    return pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
-    
-def get_benchmark_latest_date(interval: str, is_jp: bool = True) -> pd.Timestamp:
-    """ベンチマークを用いて取引所の最新の日時を判定します。"""
-    symbols = ["7203.T", "^N225"] if is_jp else ["AAPL", "^GSPC"]
-    for bm_symbol in symbols:
-        try:
-            df_bm = yf.download(bm_symbol, period="5d", interval=interval, progress=False, auto_adjust=True)
-            if not df_bm.empty:
-                latest_dt = df_bm.index[-1]
-                if latest_dt.tzinfo is not None:
-                    if is_jp:
-                        latest_dt = latest_dt.tz_convert("Asia/Tokyo").tz_localize(None)
-                    else:
-                        latest_dt = latest_dt.tz_localize(None)
-                else:
-                    latest_dt = pd.to_datetime(latest_dt)
-                
-                if interval != "1d":
-                    limit_hour = 15 if is_jp else 16
-                    limit_time = datetime.strptime(f"{limit_hour}:00:00", "%H:%M:%S").time()
-                    if latest_dt.time() > limit_time:
-                        latest_dt = latest_dt.replace(hour=limit_hour, minute=0, second=0, microsecond=0)
-                return latest_dt
-        except Exception:
-            continue
-    return None

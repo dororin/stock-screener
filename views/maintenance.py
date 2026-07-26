@@ -7,7 +7,7 @@ import streamlit as st
 import re
 
 from config import settings
-from data_access.local_db import load_price_db, save_price_db
+from data_access.local_db import load_price_db, save_price_db, execute_jp_merge
 from data_access.sheets_api import (
     load_extra_tickers_from_sheets,
     save_extra_tickers_to_sheets,
@@ -25,17 +25,18 @@ from core.database_service import (
     analyze_db_update_needs,
     update_price_database,
     repair_single_ticker_all_timeframes,
-    scan_all_anomalies,
     full_rebuild_all_database,
     run_database_health_scan,
-    apply_forced_scale_patch_to_all_timeframes,
     apply_all_saved_patches,
-    repair_stop_allocation_bars_full,
     rebuild_active_from_raw,
-    test_forced_scale_patch_in_memory,  # 追加
-    scan_and_diagnose_cliffs_with_tv,   # 追加：統合スキャン（TradingView照合）
-    apply_bulk_selected_patches,         # 追加：チェックボックス選択パッチの一括本番適用
-    execute_apply_verified_temp_dbs_to_active # 🚀 追加：ローカル一時ファイルの一括本番確定
+    execute_apply_verified_temp_dbs_to_active,
+    delete_data_before_date
+)
+from core.us_price_corrector import (
+    apply_forced_scale_patch_to_all_timeframes,
+    test_forced_scale_patch_in_memory,
+    scan_and_diagnose_cliffs_with_tv,
+    apply_bulk_selected_patches
 )
 
 # ── 日足の最新更新日の簡易取得 ──
@@ -77,7 +78,6 @@ def render_etf_manager():
                     for _, row in found.iterrows():
                         code_str = str(row["symbol"])
                         name_str = str(row["name"])
-                        # 🚨 英語の 'code' から 日本語の '銘柄コード' に修正
                         already = code_str in df["銘柄コード"].values if not df.empty else False
                         
                         col_add_left, col_add_right = st.columns([4, 1])
@@ -86,7 +86,6 @@ def render_etf_manager():
                             col_add_right.button("✅ 登録済", key=f"etf_add_btn_{code_str}", disabled=True, use_container_width=True)
                         else:
                             if col_add_right.button("追加", key=f"etf_add_btn_{code_str}", use_container_width=True):
-                                # 🚨 スプレッドシートの期待するカラム構造に合わせて新しい行を定義
                                 new_row = pd.DataFrame([{
                                     "セクター名": "追加ETF",
                                     "銘柄コード": code_str,
@@ -118,14 +117,12 @@ def render_etf_manager():
             to_delete = []
             for _, row in df.iterrows():
                 col_c1, col_c2, col_c3 = st.columns([2, 5, 1])
-                # 🚨 各カラム名へのアクセスを日本語にマッピング修正
                 col_c1.write(row['銘柄コード'])
                 col_c2.write(row['備考'])
                 if col_c3.button("🗑️", key=f"etf_del_{row['銘柄コード']}", help=f"{row['銘柄コード']}を削除"):
                     to_delete.append(row["銘柄コード"])
                     
             if to_delete:
-                # 🚨 削除判定リストと一致する銘柄コードを除外
                 df = df[~df["銘柄コード"].isin(to_delete)].reset_index(drop=True)
                 save_extra_tickers_to_sheets(df)
                 sync_extra_tickers_to_local()
@@ -135,53 +132,12 @@ def render_etf_manager():
         else:
             st.caption("登録されている追加ETFはありません。")
 
-# ── ストップ高安（寄り付かず比例配分）バー一括修復コンポーネント ──
-@st.fragment
-def render_stop_allocation_repair_ui(is_jp: bool):
-    st.divider()
-    st.subheader("🩹 ストップ高安（寄り付かず比例配分）バー修復")
-    st.write(
-        "日足が「寄り付かずS高/S安（比例配分）」で確定している日について、"
-        "短期足(60m/5m/1m)から消失している大引けバーをRawデータから加工リビルドして再構成します。"
-    )
-    
-    col_st_test, col_st_real = st.columns(2)
-    
-    # 🧪 テスト検証モード（ローカル作業フォルダに一時保存）
-    if col_st_test.button("🧪 まずテスト検証を実行（保存なし）", key="btn_repair_stop_alloc_test", type="secondary", use_container_width=True):
-        status_box = st.status("📡 ストップ高安バー修復 検証中...", expanded=True)
-        with status_box:
-            def update_status(msg):
-                st.write(msg)
-            try:
-                for interval in ["60m", "5m", "1m"]:
-                    rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=True, status_callback=update_status)
-                status_box.update(label="✅ ストップ高安バーのテスト検証が完了しました！検証用一時ファイルが保存されています。", state="complete")
-                time.sleep(1.0)
-                st.rerun()
-            except Exception as e:
-                status_box.update(label="❌ 検証中にエラーが発生しました", state="error")
-                st.error(f"検証中にエラー: {e}")
-
-    # 🚀 直接本番修復を実行（即時保存）
-    if col_st_real.button("🚀 直接本番修復を実行（即時保存＆Driveアップロード）", key="btn_repair_stop_alloc_real", type="primary", use_container_width=True):
-        status_box = st.status("📡 ストップ高安バー修復中...", expanded=True)
-        with status_box:
-            def update_status(msg):
-                st.write(msg)
-            try:
-                for interval in ["60m", "5m", "1m"]:
-                    rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False, status_callback=update_status)
-                status_box.update(label="✅ ストップ高安バーの本番修復・同期が正常に完了しました！", state="complete")
-                time.sleep(1.0)
-                st.rerun()
-            except Exception as e:
-                status_box.update(label="❌ エラーが発生しました", state="error")
-                st.error(f"修復中にエラー: {e}")
-
-# ── 🔍 統合データスキャン（TradingView自動照合・チェックボックス一括修復）コンポーネント ──
+# ── 🔍 US専用：統合データスキャン ──
 @st.fragment
 def render_unified_scan_and_repair_ui(is_jp: bool):
+    if is_jp:
+        return  
+
     st.divider()
     st.subheader("🔍 統合データスキャン（自動検出 → TradingView照合 → 一括自動修復）")
     st.write(
@@ -192,7 +148,7 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
 
     if st.button("🔍 統合スキャンを実行", key="btn_unified_scan", type="primary", use_container_width=True):
         with st.spinner("全時間足（1d/60m/5m/1m）の段差検出とTradingViewデータ照合を実行中..."):
-            st.session_state.unified_scan_result = scan_and_diagnose_cliffs_with_tv(is_jp=is_jp)
+            st.session_state.unified_scan_result = scan_and_diagnose_cliffs_with_tv()
         st.success("統合スキャンが完了しました。")
 
     result_df = st.session_state.get("unified_scan_result")
@@ -258,7 +214,7 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
         with status_box:
             def update_bulk_status(msg):
                 st.write(msg)
-            summary = apply_bulk_selected_patches(patches, is_jp=is_jp, status_callback=update_bulk_status)
+            summary = apply_bulk_selected_patches(patches, status_callback=update_bulk_status)
             status_box.update(
                 label=f"🎉 完了：{summary['repaired']}件修復、{summary['skipped']}件スキップ",
                 state="complete"
@@ -268,128 +224,26 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
         time.sleep(1.0)
         st.rerun()
 
-# ── データベース健康診断コンポーネント（旧・参考保持） ──
-def render_database_diagnostics_ui(is_jp: bool):
-    st.divider()
-    st.subheader("📊 データベース健康診断 (段差・不具合検出)")
-    st.write("各時間足(1d, 60m, 5m, 1m)を巡回し、価格データの断絶や一時的な配信バグを高速スキャンします。")
-    
-    if st.button("🔍 データベース健康診断を実行", key="btn_run_health_check", type="primary", use_container_width=True):
-        with st.spinner("データベースの整合性をフルスキャン中..."):
-            st.session_state.detected_anomalies = run_database_health_scan(is_jp)
-            st.success("健康診断が完了しました。")
-
-    if "detected_anomalies" in st.session_state:
-        anom_list = st.session_state.detected_anomalies
-        
-        if not anom_list:
-            st.success("✅ データベース内に未調整の不整合（崖・バグ）は1件も検出されませんでした。")
-            return
-            
-        st.warning(f"⚠️ データベースの整合性に不審な点がある箇所が {len(anom_list)} 件検出されました。")
-        
-        options = [
-            f"【{a['不具合種類']}】{a['コード']} ({a['時間足']}) - 発生: {a['発生日/時刻']}" 
-            for a in anom_list
-        ]
-        selected_idx = st.selectbox(
-            "詳細を確認・治療する不具合を選択してください", 
-            range(len(options)), 
-            format_func=lambda x: options[x],
-            key="sel_anomaly_view"
-        )
-        
-        target_anom = anom_list[selected_idx]
-        ticker = target_anom["コード"]
-        interval = target_anom["時間足"]
-        anomaly_type = target_anom["不具合種類"]
-        
-        detected_dates = re.findall(r"\d{4}-\d{2}-\d{2}", target_anom["発生日/時刻"])
-        if not detected_dates:
-            st.error("発生日の取得に失敗しました。")
-            return
-            
-        base_date = pd.to_datetime(detected_dates[0])
-        
-        try:
-            df_full = load_price_db(interval, is_jp=is_jp, is_raw=False)
-            df_ticker = df_full[df_full["ticker"] == ticker].copy()
-            df_ticker["date"] = pd.to_datetime(df_ticker["date"])
-            df_ticker = df_ticker.sort_values("date").reset_index(drop=True)
-        except Exception as e:
-            st.error(f"データのロード中にエラーが発生しました: {e}")
-            return
-            
-        st.write("---")
-        st.markdown(f"### 🔍 **{ticker} ({interval})** 崖の周辺データ確認")
-        
-        cols_to_disp = ["date", "open", "high", "low", "close"]
-        if "adj close" in df_ticker.columns:
-            cols_to_disp.append("adj close")
-        cols_to_disp.append("volume")
-        
-        if len(detected_dates) == 2:
-            start_date = pd.to_datetime(detected_dates[0])
-            end_date = pd.to_datetime(detected_dates[1])
-            duration = (end_date - start_date).days
-            
-            if duration > 30:
-                col_in, col_out = st.columns(2)
-                with col_in:
-                    st.markdown(f"📉 **崖の入り口**")
-                    df_in = df_ticker[
-                        (df_ticker["date"] >= start_date - pd.Timedelta(days=10)) & 
-                        (df_ticker["date"] <= start_date + pd.Timedelta(days=10))
-                    ]
-                    st.dataframe(df_in[cols_to_disp], use_container_width=True, hide_index=True)
-                with col_out:
-                    st.markdown(f"📈 **崖の出口**")
-                    df_out = df_ticker[
-                        (df_ticker["date"] >= end_date - pd.Timedelta(days=10)) & 
-                        (df_ticker["date"] <= end_date + pd.Timedelta(days=10))
-                    ]
-                    st.dataframe(df_out[cols_to_disp], use_container_width=True, hide_index=True)
-            else:
-                st.markdown(f"📊 **不具合の全貌**")
-                df_view = df_ticker[
-                    (df_ticker["date"] >= start_date - pd.Timedelta(days=10)) & 
-                    (df_ticker["date"] <= end_date + pd.Timedelta(days=10))
-                ]
-                st.dataframe(df_view[cols_to_disp], use_container_width=True, hide_index=True)
-                
-        elif len(detected_dates) == 1:
-            start_date = pd.to_datetime(detected_dates[0])
-            df_view = df_ticker[
-                (df_ticker["date"] >= start_date - pd.Timedelta(days=15)) & 
-                (df_ticker["date"] <= start_date + pd.Timedelta(days=15))
-            ]
-            st.dataframe(df_view[cols_to_disp], use_container_width=True, hide_index=True)
-
-# ── 💡 開発者機能: インメモリおよび一時ファイルに保存された検証済みデータのコミット機能 ──
+# ── US専用：開発者機能 ──
 def render_commit_verified_data_ui(is_jp: bool):
-    """
-    検証済みの一時Parquetファイルがローカル作業フォルダに存在する場合、
-    セッション変数（st.session_state）のフラグを検知して本番一括コミット（確定）を行います。
-    """
-    # 各時間足の Dry Run 一時 Parquet ファイルが存在するフラグを確認（巨大DFそのものはセッションに保持していません）
+    if is_jp:
+        return  
+
     has_temp_verified = any(
         st.session_state.get(f"temp_verified_active_exists_{tf}", False) 
         for tf in settings.TIMEFRAMES
     )
-    
-    # 手動修復パッチデータがメモリにある場合（1銘柄分の極小パッチであるためメモリ問題なし）
     has_temp_manual_repair = "temp_manual_repair_dfs" in st.session_state and st.session_state.temp_manual_repair_dfs
 
     if not has_temp_verified and not has_temp_manual_repair:
         return
 
-    st.markdown("### ☁️ **検証済みの一時データがディスク（作業フォルダ）に保管されています**")
+    st.markdown("### ☁️ **検証済みの一時データがディスクに保管されています**")
     st.info(
         "現在、Dry Runテスト検証を通過した安全なデータが一時ファイル（Parquet）としてローカルディスクに退避されています。\n\n"
-        "以下の「本番適用」ボタンを押すと、**ディスクを一切汚さず、余分な計算や再ダウンロードを行うことなく、数秒でGoogleドライブへ一括確定保存（本番同期）されます。**"
+        "以下の「本番適用」ボタンを押すと、再計算や再ダウンロードを行うことなく、数秒でGoogleドライブへ一括確定保存されます。"
     )
 
-    # 🔍 【新機能】加工後データの先頭プレビューを画面上で目視確認
     for tf in settings.TIMEFRAMES:
         preview_key = f"temp_verified_active_preview_{tf}"
         if st.session_state.get(preview_key) is not None:
@@ -398,16 +252,12 @@ def render_commit_verified_data_ui(is_jp: bool):
 
     col_btn_apply, col_btn_clear = st.columns([2, 1])
     
-    # 💻 本番書き込みボタン（一瞬で完了）
     if col_btn_apply.button("💻 一時ファイル（またはメモリパッチ）をGoogleドライブへ本番適用する", key="btn_apply_verified_data_commit", type="primary", use_container_width=True):
         status_box = st.status("📡 一時ファイルの本番確定・Googleドライブ同期中...", expanded=True)
         with status_box:
             success_count = 0
-            
-            # A. 全体差分 or ストップ高安修復テストのコミット（一瞬で完了）
             if has_temp_verified:
-                st.write("📦 ローカルの一時退避ファイルを本番ActiveParquetにリネームしてDriveへアップロード中...")
-                results = execute_apply_verified_temp_dbs_to_active(is_jp=is_jp, status_callback=None)
+                results = execute_apply_verified_temp_dbs_to_active(is_jp=False, status_callback=None)
                 for interval, res in results.items():
                     if res["success"]:
                         st.success(f"✅ [{interval}] のGoogleドライブ本番同期が正常に完了しました。")
@@ -415,22 +265,18 @@ def render_commit_verified_data_ui(is_jp: bool):
                     else:
                         st.error(f"❌ [{interval}] の同期に失敗しました: {res['message']}")
                     
-            # B. 手動修復パッチ（極小サイズ）のコミット
             if has_temp_manual_repair:
                 temp_repair_dfs = st.session_state.temp_manual_repair_dfs
                 payload = st.session_state.temp_manual_repair_payload
                 
-                st.write(f"🛠️ [{payload['ticker']}] の手動修復パッチを本番適用中...")
                 for interval, df_repaired in temp_repair_dfs.items():
-                    st.write(f"⏱️ [{interval}] をアップロード中...")
-                    cloud_success, cloud_msg = save_price_db(df_repaired, interval, is_jp=is_jp, is_raw=False)
+                    cloud_success, cloud_msg = save_price_db(df_repaired, interval, is_jp=False, is_raw=False)
                     if cloud_success:
-                        st.success(f"✅ [{interval}] のGoogleドライブ同期完了。")
+                        st.success(f"✅ [{interval}] の手動パッチ本番同期完了。")
                         success_count += 1
                     else:
-                        st.error(f"❌ [{interval}] の同期失敗。詳細: {cloud_msg}")
+                        st.error(f"❌ [{interval}] の同期失敗: {cloud_msg}")
                 
-                # スプレッドシートへのパッチログ追記
                 log_row = {
                     "executed_at": payload["executed_at"],
                     "ticker": payload["ticker"],
@@ -453,18 +299,15 @@ def render_commit_verified_data_ui(is_jp: bool):
                 time.sleep(1.0)
                 st.rerun()
 
-    # 🗑️ メモリ・一時ファイル消去
     if col_btn_clear.button("🗑️ 検証一時データを破棄する", key="btn_clear_verified_data_cache", type="secondary", use_container_width=True):
-        # セッション変数と一時ファイルを物理クリーン
         for tf in settings.TIMEFRAMES:
             if f"temp_verified_active_exists_{tf}" in st.session_state:
                 st.session_state[f"temp_verified_active_exists_{tf}"] = False
             if f"temp_verified_active_preview_{tf}" in st.session_state:
                 del st.session_state[f"temp_verified_active_preview_{tf}"]
                 
-            # ディスク上の一時ファイルを物理削除
             from data_access.local_db import get_db_filename
-            temp_filename = get_db_filename(tf, is_jp, is_raw=False, is_temp=True)
+            temp_filename = get_db_filename(tf, is_jp=False, is_raw=False, is_temp=True)
             temp_path = os.path.join(settings.WORK_DIR, temp_filename)
             if os.path.exists(temp_path):
                 try:
@@ -480,160 +323,22 @@ def render_commit_verified_data_ui(is_jp: bool):
         time.sleep(0.5)
         st.rerun()
 
-# =====================================================================
-# 🛠️ メイン画面描画
-# =====================================================================
 
-st.title("🗄️ データベース管理・保守センター")
-st.caption("Raw / Activeの2層分離設計を搭載した、安全で再描画のないデータ管理システムです。")
-
-m_col1, m_col2 = st.columns([1, 1])
-with m_col1:
-    market_mode = st.radio("対象市場の選択", ["日本株 🇯🇵", "米国株 🇺🇸"], horizontal=True)
-    is_jp = (market_mode == "日本株 🇯🇵")
-with m_col2:
-    last_date = get_db_last_update("1d", is_jp=is_jp)
-    st.metric(label="現在のActive日足(1d)最終更新日", value=last_date)
-    
-st.divider()
-
-# 💡 Rerun（ボタン押下）が発生しても画面からログが消えないようにするためのログ永続化表示システム
-if "sync_logs_history" not in st.session_state:
-    st.session_state["sync_logs_history"] = []
-
-if st.session_state["sync_logs_history"]:
-    with st.expander("📝 詳細ログ履歴コンソール（勝手に閉じず、いつでも確認・確認消去が可能です）", expanded=True):
-        st.code("\n".join(st.session_state["sync_logs_history"]), language="text")
-        if st.button("🗑️ ログ表示履歴をクリア", key="btn_clear_st_logs_history_on_screen", use_container_width=True):
-            st.session_state["sync_logs_history"] = []
-            st.rerun()
-    st.divider()
-
-# 💡 一時ファイル＆インメモリ・コミット用のUI表示（検証データが存在するときのみ自動的に上部に現れます）
-render_commit_verified_data_ui(is_jp)
-
-st.divider()
-
-# 🔄 ETF構成銘柄の同期（1枚完結・統合版）
-st.subheader("🔄 ETFセクター構成の同期（スプレッドシート連動）")
-if st.button("🚀 ETF構成銘柄を同期する", key="btn_sync_etf_master", use_container_width=True, type="primary"):
-    with st.spinner("スプレッドシートを更新中..."):
-        try:
-            from data_access.sheets_api import sync_etf_sectors_consolidated
-            results = sync_etf_sectors_consolidated(is_jp=is_jp)
-            
-            if "error" in results:
-                st.error(f"❌ 同期に失敗しました: {results['error']}")
-            else:
-                sync_results = [f"• {k}: {v}" for k, v in results.items()]
-                st.success("✅ 同期が完了しました！\n\n" + "\n".join(sync_results))
-                time.sleep(1.0)
-                st.rerun()
-        except Exception as e:
-            st.error(f"❌ 同期中にエラーが発生しました: {e}")
-
-st.divider()
-
-# ETFマスタ管理
-render_etf_manager()
-
-st.divider()
-
-# 【セクション1】 全体差分ダウンロード（自動権利落ち防衛）
-@st.fragment
-def render_full_sync_section(is_jp: bool):
-    st.subheader("1️⃣ 全体差分ダウンロード＆自動Active構築")
-    st.write(
-        "最新データまでRawデータベースを安全に差分ダウンロードします。 "
-        "以下のボタンで、保存を伴う「本番同期」か、メモリ上で安全チェックを行う「テスト検証」かを選択できます。"
-    )
-
-    col_btn_test, col_btn_real = st.columns(2)
-    
-    # 🧪 テスト検証モード（メモリをほとんど消費しない、Parquet一時退避式）
-    if col_btn_test.button("🧪 まずテスト検証を実行（保存なし）", key="btn_test_diff_update", type="secondary", use_container_width=True):
-        st.session_state["sync_logs_history"] = []  # ログ初期化
-        status_box = st.status("📡 データベース全体差分 テスト検証中...", expanded=True)
-        with status_box:
-            st.write("追加ティッカーのローカル同期を実行中...")
-            try:
-                sync_extra_tickers_to_local()
-                st.write("✅ ティッカーリストの同期に成功しました。")
-            except Exception as e:
-                st.write(f"⚠️ ティッカー同期スキップ（キャッシュを使用）: {e}")
-
-            def update_status_on_screen(msg):
-                st.write(f"  * {msg}")
-
-            with st.spinner("同期検証中..."):
-                try:
-                    all_tickers = get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
-                    update_price_database(
-                        is_jp=is_jp,
-                        target_tickers=all_tickers,
-                        status_callback=update_status_on_screen,
-                        dry_run=True # Dry Runを強制ON（メモリリークを完全回避するParquet退避動作）
-                    )
-                    status_box.update(label="🎉 テスト検証が正常に完了しました！一時ファイルがローカルに安全保存されています。", state="complete")
-                    time.sleep(1.0)
-                    st.rerun()
-                except Exception as e:
-                    status_box.update(label="❌ 検証エラーが発生しました", state="error")
-                    st.error(f"検証中に例外エラーを検知しました: {e}")
-
-    # 💻 本番同期モード（即時保存）
-    if col_btn_real.button("🚀 直接本番同期（即時保存＆Driveアップロード）", key="btn_real_diff_update", type="primary", use_container_width=True):
-        st.session_state["sync_logs_history"] = []  # ログ初期化
-        status_box = st.status("📡 データベース全体差分 本番同期中...", expanded=True)
-        with status_box:
-            st.write("追加ティッカーの同期を実行中...")
-            try:
-                sync_extra_tickers_to_local()
-                st.write("✅ ティッカーリストの同期成功。")
-            except Exception as e:
-                st.write(f"⚠️ ティッカー同期スキップ: {e}")
-
-            def update_status_on_screen(msg):
-                st.write(f"  * {msg}")
-
-            with st.spinner("ダウンロード同期中..."):
-                try:
-                    all_tickers = get_all_collection_tickers() if is_jp else ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
-                    update_price_database(
-                        is_jp=is_jp,
-                        target_tickers=all_tickers,
-                        status_callback=update_status_on_screen,
-                        dry_run=False
-                    )
-                    status_box.update(label="🎉 本番同期タスクが全て正常に完了しました！", state="complete")
-                    time.sleep(1.0)
-                    st.rerun()
-                except Exception as e:
-                    status_box.update(label="❌ 同期中にエラーが発生しました", state="error")
-                    st.error(f"同期中にエラーを検知しました: {e}")
-
-render_full_sync_section(is_jp)
-
-st.divider()
-
-# 🔍 メイン：統合スキャン・自動修復エリア
-render_unified_scan_and_repair_ui(is_jp=is_jp)
-
-st.divider()
-
-# 【セクション3】手動ピンポイント一括安全修復（非常用オーバーライド：TradingView API停止時のバックアップ）
+# ── US専用：手動ピンポイント一括安全修復 ──
 @st.fragment
 def render_manual_repair_section(is_jp: bool):
+    if is_jp:
+        return  
+
     st.write(
-        "TradingView APIが停止している等の非常時に備え、従来の手動ピンポイント一括安全修復フォームを"
-        "バックアップとして残しています。特定の銘柄においてデータの欠損が発生した場合, "
-        "Rawデータベースからクリーンダウンロード復元し, 最新のTransform加工を通じてActiveを一元的に再構成します。"
+        "TradingView APIが停止している等の非常時に備え、手動ピンポイント一括安全修復フォームを"
+        "バックアップとして残しています。"
     )
 
     with st.form(key="safe_repair_form"):
         col_t1, col_t2, col_t3 = st.columns(3)
         with col_t1:
-            rep_ticker = st.text_input("銘柄コード", placeholder="例:1629", key="rep_ticker_box")
+            rep_ticker = st.text_input("銘柄コード", placeholder="例:AAPL", key="rep_ticker_box")
         with col_t2:
             rep_date_str = st.text_input("要補正Close日時（崖前日）", placeholder="空白で個別ダウンロード復元", key="rep_date_box")
         with col_t3:
@@ -651,8 +356,7 @@ def render_manual_repair_section(is_jp: bool):
         elif not rep_ticker:
             st.error("銘柄コードが入力されていません。")
         else:
-            pure_t = sanitize_ticker(rep_ticker, is_jp=is_jp)
-            market_str = "JP" if is_jp else "US"
+            pure_t = sanitize_ticker(rep_ticker, is_jp=False)
             
             if rep_date_str.strip() and rep_ratio_str.strip():
                 try:
@@ -668,18 +372,17 @@ def render_manual_repair_section(is_jp: bool):
                     
                 with st.spinner(f"🔧 [{pure_t}] のパッチ適用テストをメモリ上で実行中..."):
                     test_results, temp_repaired_dfs = test_forced_scale_patch_in_memory(
-                        pure_t, cliff_dt_str, multiplier, is_jp=is_jp
+                        pure_t, cliff_dt_str, multiplier
                     )
                     
                     if "error" in test_results:
                         st.error(f"❌ 検証失敗: {test_results['error']}")
                     else:
-                        st.success("✅ メモリ上での崖調整テストが完了しました。対比プレビューを確認してください。")
+                        st.success("✅ メモリ上での崖調整テストが完了しました。")
                         
                         for interval, info in test_results.items():
                             if isinstance(info, dict):
                                 st.markdown(f"📊 **【{interval}】 調整対比プレビュー (調整件数: {info['applied_count']}件)**")
-                                
                                 disp_cols = [c for c in ["date", "open", "high", "low", "close"] if c in info["before_sample"].columns]
                                 col_b, col_a = st.columns(2)
                                 with col_b:
@@ -692,79 +395,26 @@ def render_manual_repair_section(is_jp: bool):
                         st.session_state.temp_manual_repair_dfs = temp_repaired_dfs
                         st.session_state.temp_manual_repair_payload = {
                             "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "ticker": pure_t,
-                            "market": market_str,
-                            "cliff_date": cliff_dt_str,
-                            "multiplier": multiplier,
-                            "memo": "手動修復テスト（インメモリ適用）"
+                            "ticker": pure_t, "market": "US", "cliff_date": cliff_dt_str, "multiplier": multiplier, "memo": "手動修復テスト"
                         }
-                        st.info("💡 プレビューに問題がなければ、一番上の「コミットUI」から『本番適用』ボタンを押してGoogleドライブへ上書き保存してください。")
             
             elif not rep_date_str.strip() and not rep_ratio_str.strip():
-                with st.spinner(f"🔧 [{pure_t}] のRawデータ部分ダウンロード及びActive再生成検証中..."):
-                    results = repair_single_ticker_all_timeframes(pure_t, is_jp=is_jp)
+                with st.spinner(f"🔧 [{pure_t}] のRawデータダウンロード中..."):
+                    results = repair_single_ticker_all_timeframes(pure_t, is_jp=False)
                     for interval, msg in results.items():
                         st.write(f" **{interval}**: {msg}")
-                    st.success("✅ 個別ダウンロードが完了しました。")
 
-    if rep_col3_btn:
-        if not repair_confirm:
-            st.error("❌ 安全ロックがかかっています。チェックボックスをONにしてください。")
-        elif not rep_ticker:
-            st.error("銘柄コードが入力されていません。")
-        else:
-            if rep_ratio_str.strip():
-                try:
-                    temp_ratio = float(rep_ratio_str.strip())
-                    if temp_ratio <= 0:
-                        st.error("❌ 危険防止のため、修正比率に 0 以下の数値は設定できません。")
-                        st.stop()
-                except ValueError:
-                    st.error("修正比率には有効な数値を入力してください。")
-                    st.stop()
 
-            pure_t = sanitize_ticker(rep_ticker, is_jp=is_jp)
-            market_str = "JP" if is_jp else "US"
-            
-            if rep_date_str.strip() and rep_ratio_str.strip():
-                try:
-                    multiplier = float(rep_ratio_str.strip())
-                    cliff_dt = pd.to_datetime(rep_date_str.strip())
-                    cliff_dt_str = cliff_dt.strftime("%Y-%m-%d")
-                except Exception as e:
-                    st.error(f"形式が不正です: {e}")
-                    st.stop()
-                    
-                with st.spinner(f"🔧 [{pure_t}] のパッチを本番適用中..."):
-                    results = apply_forced_scale_patch_to_all_timeframes(pure_t, cliff_dt_str, multiplier, is_jp=is_jp)
-                    
-                    executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    log_row = {
-                        "executed_at": executed_at, "ticker": pure_t, "market": market_str, "cliff_date": cliff_dt_str,
-                        "interval": "all", "before_close": "", "after_close": "", "multiplier": multiplier, "memo": "手動ピンポイント崖一律修復（即時保存）",
-                    }
-                    save_repair_log_to_sheets([log_row])
-                    
-                    st.write("🔄 Activeデータベースをすべて再生成して本番同期しています...")
-                    for interval in settings.TIMEFRAMES:
-                        rebuild_active_from_raw(interval, is_jp=is_jp, dry_run=False)
-                        
-                    st.success("✅ 手動修復パッチが正常に適用され、本番データへの反映が完了しました。")
-            
-            elif not rep_date_str.strip() and not rep_ratio_str.strip():
-                with st.spinner(f"🔧 [{pure_t}] のRawデータ部分ダウンロード及びActive本番構築中..."):
-                    results = repair_single_ticker_all_timeframes(pure_t, is_jp=is_jp)
-                    for interval, msg in results.items():
-                        st.write(f" **{interval}**: {msg}")
-                    st.success("✅ 個別ダウンロード本番適用が正常に完了しました。")
-
-# ── 指定日以前データ部分削除パッチUI ──
+# ── US専用：指定日以前データ部分削除パッチUI ──
 @st.fragment
 def render_delete_before_date_ui(is_jp: bool):
+    if is_jp:
+        return  
+
     st.markdown("#### 🗑️ 指定日以前データ一括物理削除パッチ")
     del_col1, del_col2, del_col3 = st.columns([3, 2, 1])
     with del_col1:
-        del_ticker = st.text_input("データ削除を実行する銘柄コード", placeholder="例: 8303", key="del_ticker_box")
+        del_ticker = st.text_input("データ削除を実行する銘柄コード", placeholder="例:AAPL", key="del_ticker_box")
     with del_col2:
         del_date_str = st.text_input("削除の境界となる日付", placeholder="例: 2025-12-16", key="del_date_box")
     with del_col3:
@@ -784,71 +434,47 @@ def render_delete_before_date_ui(is_jp: bool):
                 st.error("日付は有効な形式（YYYY-MM-DD）で入力してください。")
                 st.stop()
                 
-            pure_t = sanitize_ticker(del_ticker, is_jp=is_jp)
-            with st.spinner(f"🗑️ [{pure_t}] 物理削除・ビルド中..."):
-                from core.database_service import delete_data_before_date
-                del_results = delete_data_before_date(pure_t, del_date_str, is_jp=is_jp)
+            pure_t = sanitize_ticker(del_ticker, is_jp=False)
+            with st.spinner(f"🗑️ [{pure_t}] 物理削除中..."):
+                del_results = delete_data_before_date(pure_t, del_date_str, is_jp=False)
                 for interval, msg in del_results.items():
                     st.write(f" **{interval}**: {msg}")
-                st.success("✅ 物理削除とActive再構築が完了しました。")
 
-render_delete_before_date_ui(is_jp)
 
-# ── 修復ログ一覧 ──
-with st.expander("📋 修復ログ一覧", expanded=False):
-    log_col1, log_col2 = st.columns([1, 1])
-    with log_col1:
-        log_ticker_filter = st.text_input("銘柄コードで絞り込み", placeholder="例: 1629", key="log_filter_ticker")
-    with log_col2:
-        st.write(" ")
-        btn_load_log = st.button("🔄 ログを読み込む", key="btn_load_log", use_container_width=True)
+# ── US専用：全体差分ダウンロード ──
+@st.fragment
+def render_full_sync_section(is_jp: bool):
+    st.subheader("1️⃣ 全体差分ダウンロード＆自動Active構築")
+    
+    if is_jp:
+        st.warning("⚠️ **日本株（JP）のデータ更新は、ローカル環境で `rss_collector_jp.py` を実行してください。**")
+        return
 
-    if "repair_log_df" not in st.session_state:
-        st.session_state.repair_log_df = None
+    st.write(
+        "最新データまで米国株Rawデータベースを安全に差分ダウンロードします。 "
+    )
 
-    if btn_load_log:
-        with st.spinner("スプレッドシートから修復ログを読み込み中..."):
+    col_btn_test, col_btn_real = st.columns(2)
+    
+    if col_btn_test.button("🧪 まずテスト検証を実行", key="btn_test_diff_update", type="secondary", use_container_width=True):
+        st.session_state["sync_logs_history"] = []
+        status_box = st.status("📡 米国株全体差分 テスト検証中...", expanded=True)
+        with status_box:
+            def update_status_on_screen(msg):
+                st.write(f"  * {msg}")
             try:
-                log_df = load_repair_log_from_sheets()
-                st.session_state.repair_log_df = log_df if log_df is not None else pd.DataFrame()
+                all_tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
+                update_price_database(is_jp=False, target_tickers=all_tickers, status_callback=update_status_on_screen, dry_run=True)
+                status_box.update(label="🎉 テスト検証が完了しました！", state="complete")
+                time.sleep(1.0)
+                st.rerun()
             except Exception as e:
-                st.error(f"❌ エラーが発生しました: {e}")
+                st.error(f"エラー: {e}")
 
-    if st.session_state.repair_log_df is not None:
-        log_df = st.session_state.repair_log_df.copy()
-        if log_df.empty:
-            st.info("ℹ️ 保存されている修復ログはありません。")
-        else:
-            if log_ticker_filter.strip():
-                log_df = log_df[log_df["ticker"].astype(str).str.contains(log_ticker_filter.strip(), case=False, na=False)]
-            
-            if log_df.empty:
-                st.info(f"🔍 「{log_ticker_filter}」に一致するログは見つかりませんでした。")
-            else:
-                st.dataframe(log_df, use_container_width=True, hide_index=True)
 
-# ── 手動パッチ全適用 ──
-st.write(" ")
-st.markdown("#### 🔄 **保存済みパッチのActiveクリーンリビルド適用**")
-if st.button("🔄 保存されているすべてのパッチをActiveへ一括適用（リビルド）", key="btn_apply_all_patches_manual", type="secondary", use_container_width=True):
-    status_box = st.status("📡 パッチマスタ適用に伴うActive再構築中...", expanded=True)
-    with status_box:
-        def update_patch_status(msg):
-            st.write(msg)
-        try:
-            count = apply_all_saved_patches(is_jp=is_jp, status_callback=update_patch_status)
-            status_box.update(label="✅ Activeの再構築・検証・パッチ復元が全て完了しました！", state="complete")
-        except Exception as e:
-            status_box.update(label="❌ エラーが発生しました", state="error")
-            st.error(f"パッチの一括適用中にエラーが発生しました: {e}")
-
-st.divider()
-
-# ── 【セクション4】 全件一括フルダウンロード・再構築（Rawもクリア） ──
-
+# ── US専用：一括フルダウンロード再構築ダイアログ ──
 @st.dialog("🚨 データベース完全再構築の最終確認", width="medium")
 def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
-    # ダイアログ表示および再構築ログの挙動を制御するセッション管理
     if "rebuild_status" not in st.session_state:
         st.session_state.rebuild_status = "confirm"
     if "rebuild_logs" not in st.session_state:
@@ -856,21 +482,13 @@ def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
 
     if st.session_state.rebuild_status == "confirm":
         st.warning("⚠️ **警告：この操作は取り消せません**")
-        st.markdown(
-            f"既存の **{market_mode} {interval}** の原本データ（Raw）および実行用データ（Active）をディスクから完全に物理削除し, "
-            "白紙の状態からyfinance of 提供限界まで全件再ダウンロードを行います。"
-        )
-        st.write("1分足や5分足の場合、取得可能上限（7日前/60日前）を過ぎて消失した古い履歴データは完全に失われます。本当に実行してよろしいですか？")
+        st.write("1分足や5分足の場合、取得可能上限を過ぎて消失した古い履歴データは完全に失われます。本当に実行してよろしいですか？")
         st.write(" ")
 
         col_yes, col_no = st.columns(2)
-        
         if col_no.button("いいえ（キャンセル）", use_container_width=True):
-            st.session_state.rebuild_status = "confirm"
-            st.session_state.rebuild_logs = []
-            st.session_state.show_rebuild_dialog = False  # 💡 明示的にダイアログ状態を閉じる
+            st.session_state.show_rebuild_dialog = False
             st.rerun()
-            
         if col_yes.button("はい（本当に実行する）", type="primary", use_container_width=True):
             st.session_state.rebuild_status = "processing"
             st.rerun()
@@ -878,108 +496,244 @@ def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
     elif st.session_state.rebuild_status == "processing":
         status_box = st.status(f"📡 {market_mode} {interval} を一括クリーンビルド中...", expanded=True)
         rebuild_log_lines = []
-        
         with status_box:
-            st.write("既存のParquetファイルをディスクから物理クリア中...")
             for is_raw_target in [True, False]:
                 from data_access.local_db import get_db_filename
-                filename = get_db_filename(interval, is_jp, is_raw=is_raw_target)
+                filename = get_db_filename(interval, is_jp=False, is_raw=is_raw_target)
                 work_file = os.path.join(settings.WORK_DIR, filename)
                 if os.path.exists(work_file):
-                    try:
-                        os.remove(work_file)
-                    except Exception as e:
-                        st.write(f"⚠️ ファイルクリア中にエラー: {e}")
+                    try: os.remove(work_file)
+                    except Exception: pass
             
             def update_rebuild_status(msg):
                 st.write(msg)
                 rebuild_log_lines.append(str(msg))
                 
             try:
-                success = full_rebuild_all_database(
-                    is_jp=is_jp, 
-                    interval=interval, 
-                    status_callback=update_rebuild_status, 
-                    dry_run=False 
-                )
+                success = full_rebuild_all_database(is_jp=False, interval=interval, status_callback=update_rebuild_status, dry_run=False)
                 st.session_state.rebuild_logs = rebuild_log_lines
-                if success:
-                    st.session_state.rebuild_status = "success"
-                else:
-                    st.session_state.rebuild_status = "failed"
+                st.session_state.rebuild_status = "success" if success else "failed"
                 st.rerun()
             except Exception as e:
-                st.session_state.rebuild_logs = rebuild_log_lines + [f"再構築中に予期せぬエラーが発生しました: {e}"]
+                st.session_state.rebuild_logs = rebuild_log_lines + [f"エラー: {e}"]
                 st.session_state.rebuild_status = "failed"
                 st.rerun()
 
     elif st.session_state.rebuild_status == "success":
         st.success("🎉 一括フルダウンロード・再構築に成功しました！")
-        st.markdown("**実行ログ履歴詳細:**")
-        st.code("\n".join(st.session_state.rebuild_logs), language="text")
-        st.info("※実行結果をご確認の上、以下のボタンを押して画面を閉じてください。")
-        
         if st.button("確認して閉じる", type="primary", use_container_width=True):
+            st.session_state.show_rebuild_dialog = False
             st.session_state.rebuild_status = "confirm"
-            st.session_state.rebuild_logs = []
-            st.session_state.show_rebuild_dialog = False  # 💡 明示的にダイアログ状態を閉じる
             st.rerun()
 
-    elif st.session_state.rebuild_status == "failed":
-        st.error("❌ 一括フルダウンロードまたは再構築に失敗しました。")
-        st.markdown("**実行ログ履歴詳細:**")
-        st.code("\n".join(st.session_state.rebuild_logs), language="text")
-        
-        col_retry, col_close = st.columns(2)
-        if col_retry.button("リトライ", use_container_width=True):
-            st.session_state.rebuild_status = "processing"
-            st.rerun()
-        if col_close.button("閉じる", use_container_width=True):
-            st.session_state.rebuild_status = "confirm"
-            st.session_state.rebuild_logs = []
-            st.session_state.show_rebuild_dialog = False  # 💡 明示的にダイアログ状態を閉じる
-            st.rerun()
 
+# ── US専用：全件一括フルダウンロード ──
 @st.fragment
 def render_full_rebuild_section(is_jp: bool, market_mode: str):
-    st.subheader("4️⃣ 全件一括フルダウンロード・再構築（Rawもクリア）")
-    st.write(
-        "既存のRawおよびActiveデータベースを完全に物理削除し、yfinanceの提供限界から一発でクリーンビルドし直します。 "
-        "※古い履歴データは完全に消滅するため、実行には十分注意してください。"
-    )
+    if is_jp:
+        return  
 
+    st.subheader("4️⃣ 全件一括フルダウンロード・再構築（Rawもクリア）")
     col1, col2 = st.columns([2, 1])
     with col1:
-        rebuild_interval = st.selectbox(
-            "一括再構築する時間足（タイムフレーム）を選択", 
-            ["1m", "5m", "60m", "1d"], 
-            index=3, 
-            key="rebuild_interval_select"
-        )
+        rebuild_interval = st.selectbox("一括再構築する時間足を選択", ["1m", "5m", "60m", "1d"], index=3, key="rebuild_interval_select")
     with col2:
         st.write(" ") 
         st.write(" ")
-        
-        # 💡 セッションにダイアログの明示的な開閉フラグを用意します
-        if "show_rebuild_dialog" not in st.session_state:
-            st.session_state.show_rebuild_dialog = False
-        
         if st.button("💥 一括フルダウンロードを実行", key="btn_real_full_rebuild_trigger", type="primary", use_container_width=True):
             st.session_state.show_rebuild_dialog = True
-            st.session_state.rebuild_status = "confirm"  # 最初の確認状態に初期化
+            st.session_state.rebuild_status = "confirm"
             st.rerun()
 
-    # 💡 ボタンが押された直後でなくても、フラグがTrueなら再描画をまたいでダイアログを維持します
-    if st.session_state.show_rebuild_dialog:
-        run_full_rebuild_dialog(rebuild_interval, is_jp, market_mode)
 
-render_full_rebuild_section(is_jp, market_mode)
+# ─── 🚀 新設：日本株専用手動上書きマージセンター ───
+@st.fragment
+def render_jp_manual_merge_center(is_jp: bool):
+    if not is_jp:
+        return
 
-# ストップ高安バー修復UIの表示
-render_stop_allocation_repair_ui(is_jp=is_jp)
+    st.divider()
+    st.subheader("⚙️ 日本株データ統合マージセンター (手動コンパクション)")
+    st.write(
+        "楽天RSSからダウンロードされ、Google Driveの時間足フォルダ（例：`1m/`）直下に隔離保管されている「未処理の差分ファイル（`_diff_`）」をロードし、"
+        "古い順に累積ソートした上で、対応する月別本番結合ファイル（例：`price_jp_1m_2026_07.parquet`）へ `keep='last'` で安全上書きマージします。\n\n"
+        "**統合保存が100%成功した場合、Drive上の対象差分ファイルは自動的に完全に物理消去され、二重マージや先祖返りを完全に防止します。**"
+    )
+
+    from data_access.drive_api import get_drive_service, list_drive_diff_files, get_or_create_drive_folder
+    service = get_drive_service()
+    
+    if service:
+        with st.status("📡 Google Drive上の未処理差分データを簡易検索中...", expanded=False) as scan_status:
+            total_diff_count = 0
+            scanned_details = []
+            
+            for tf in settings.TIMEFRAMES:
+                try:
+                    tf_folder_id = get_or_create_drive_folder(tf, settings.FOLDER_ID)
+                    diffs = list_drive_diff_files(tf_folder_id)
+                    tf_diff_count = len(diffs)
+                    total_diff_count += tf_diff_count
+                    if tf_diff_count > 0:
+                        scanned_details.append(f"• 【{tf}】: {tf_diff_count} 件の未処理差分ファイル")
+                except Exception:
+                    pass
+            
+            if total_diff_count > 0:
+                scan_status.update(label=f"📂 未マージの日本株差分ファイルを計 {total_diff_count} 件検出しました。", state="warning")
+                for line in scanned_details:
+                    st.write(line)
+            else:
+                scan_status.update(label="✅ 未マージの差分ファイルはありません（本番データベースは最新です）。", state="complete")
+    
+    merge_tf = st.selectbox("マージを強制実行する時間足を選択", ["1d", "60m", "5m", "1m"], index=0, key="jp_merge_tf_select")
+
+    col_m1, col_m2 = st.columns([2, 1])
+    with col_m1:
+        st.caption(f"※実行ボタンを押すと、Google Drive上の【{merge_tf}】時間足フォルダ直下の差分を一括統合マージします。")
+    with col_m2:
+        if st.button("🚀 マージを実行する", key="btn_execute_jp_manual_merge", type="primary", use_container_width=True):
+            status_box = st.status(f"🔄 【{merge_tf}】の上書き累積マージ処理を実行中...", expanded=True)
+            with status_box:
+                def on_status(msg):
+                    st.write(msg)
+                    
+                result = execute_jp_merge(merge_tf, status_callback=on_status)
+                
+                if result.get("success"):
+                    status_box.update(label="🎉 統合マージおよび不要差分ファイルの自動消去が正常に完了しました！", state="complete")
+                    st.success(result.get("message"))
+                    time.sleep(2.0)
+                    st.rerun()
+                else:
+                    status_box.update(label="❌ マージ処理中にエラーが発生しました", state="error")
+                    st.error(result.get("message"))
+
+
+# =====================================================================
+# 🛠️ メイン画面描画
+# =====================================================================
+
+st.title("🗄️ データベース管理・保守センター")
+st.caption("Raw / Activeの2層分離設計を搭載した、安全で再描画のないデータ管理システムです。")
+
+m_col1, m_col2 = st.columns([1, 1])
+with m_col1:
+    market_mode = st.radio("対象市場の選択", ["日本株 🇯🇵", "米国株 🇺🇸"], horizontal=True)
+    is_jp = (market_mode == "日本株 🇯🇵")
+with m_col2:
+    last_date = get_db_last_update("1d", is_jp=is_jp)
+    st.metric(label="現在のActive日足(1d)最終更新日", value=last_date)
+    
+st.divider()
+
+if "sync_logs_history" not in st.session_state:
+    st.session_state["sync_logs_history"] = []
+
+if st.session_state["sync_logs_history"]:
+    with st.expander("📝 詳細ログ履歴コンソール", expanded=True):
+        st.code("\n".join(st.session_state["sync_logs_history"]), language="text")
+        if st.button("🗑️ ログ表示履歴をクリア", key="btn_clear_st_logs_history_on_screen", use_container_width=True):
+            st.session_state["sync_logs_history"] = []
+            st.rerun()
+    st.divider()
+
+# 一時ファイルのコミットUI（US株選択時のみ有効化）
+render_commit_verified_data_ui(is_jp)
+
+# 🚀 日本株専用：手動上書きマージセンター（日本株選択時のみ増設表示）
+render_jp_manual_merge_center(is_jp)
+
+# 🔄 ETF構成銘柄の同期（共通機能）
+st.subheader("🔄 ETFセクター構成の同期（スプレッドシート連動）")
+if st.button("🚀 ETF構成銘柄を同期する", key="btn_sync_etf_master", use_container_width=True, type="primary"):
+    with st.spinner("スプレッドシートを更新中..."):
+        try:
+            from data_access.sheets_api import sync_etf_sectors_consolidated
+            results = sync_etf_sectors_consolidated(is_jp=is_jp)
+            if "error" in results:
+                st.error(f"❌ 同期に失敗しました: {results['error']}")
+            else:
+                sync_results = [f"• {k}: {v}" for k, v in results.items()]
+                st.success("✅ 同期が完了しました！\n\n" + "\n".join(sync_results))
+                time.sleep(1.0)
+                st.rerun()
+        except Exception as e:
+            st.error(f"❌ エラーが発生しました: {e}")
 
 st.divider()
 
-# ── 非常用オーバーライドエリア（バックアップ：手動ピンポイント一括安全修復） ──
-with st.expander("⚙️ 手動修復（非常用・TradingView API停止時）", expanded=False):
-    render_manual_repair_section(is_jp)
+# ETFマスタ管理
+render_etf_manager()
+st.divider()
+
+# 1️⃣ 全体差分ダウンロード（日本株：説明のみ / 米国株：ダウンロード可能）
+render_full_sync_section(is_jp)
+st.divider()
+
+# 🔍 米国株専用：統合スキャン・自動修復エリア
+render_unified_scan_and_repair_ui(is_jp=is_jp)
+st.divider()
+
+if not is_jp:
+    # 物理削除パッチUI
+    render_delete_before_date_ui(is_jp=False)
+
+    # 修復ログ一覧
+    with st.expander("📋 修復ログ一覧", expanded=False):
+        log_col1, log_col2 = st.columns([1, 1])
+        with log_col1:
+            log_ticker_filter = st.text_input("銘柄コードで絞り込み", placeholder="例: AAPL", key="log_filter_ticker")
+        with log_col2:
+            st.write(" ")
+            btn_load_log = st.button("🔄 ログを読み込む", key="btn_load_log", use_container_width=True)
+
+        if "repair_log_df" not in st.session_state:
+            st.session_state.repair_log_df = None
+
+        if btn_load_log:
+            with st.spinner("スプレッドシートから修復ログを読み込み中..."):
+                try:
+                    log_df = load_repair_log_from_sheets()
+                    st.session_state.repair_log_df = log_df if log_df is not None else pd.DataFrame()
+                except Exception as e:
+                    st.error(f"❌ エラーが発生しました: {e}")
+
+        if st.session_state.repair_log_df is not None:
+            log_df = st.session_state.repair_log_df.copy()
+            if log_df.empty:
+                st.info("ℹ️ 保存されている修復ログはありません。")
+            else:
+                if log_ticker_filter.strip():
+                    log_df = log_df[log_df["ticker"].astype(str).str.contains(log_ticker_filter.strip(), case=False, na=False)]
+                
+                if log_df.empty:
+                    st.info(f"🔍 「{log_ticker_filter}」に一致するログは見つかりませんでした。")
+                else:
+                    st.dataframe(log_df, use_container_width=True, hide_index=True)
+
+    # 手動パッチマスタ一括適用（リビルド）
+    st.write(" ")
+    st.markdown("#### 🔄 **保存済みパッチのActiveクリーンリビルド適用**")
+    if st.button("🔄 保存されているすべてのパッチをActiveへ一括適用（リビルド）", key="btn_apply_all_patches_manual", type="secondary", use_container_width=True):
+        status_box = st.status("📡 パッチマスタ適用に伴うActive再構築中...", expanded=True)
+        with status_box:
+            def update_patch_status(msg):
+                st.write(msg)
+            try:
+                count = apply_all_saved_patches(is_jp=False, status_callback=update_patch_status)
+                status_box.update(label="✅ Activeの再構築・検証・パッチ復元が全て完了しました！", state="complete")
+            except Exception as e:
+                st.error(f"パッチの一括適用中にエラーが発生しました: {e}")
+
+    st.divider()
+
+    # 4️⃣ 全件一括フルダウンロード・再構築
+    render_full_rebuild_section(is_jp=False, market_mode=market_mode)
+
+    # 非常用オーバーライドエリア
+    with st.expander("⚙️ 手動修復（非常用・TradingView API停止時）", expanded=False):
+        render_manual_repair_section(is_jp=False)
+
+if st.session_state.get("show_rebuild_dialog"):
+    run_full_rebuild_dialog(rebuild_interval, is_jp=False, market_mode=market_mode)

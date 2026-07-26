@@ -1,40 +1,52 @@
 # core/calculator.py
 import pandas as pd
-import yfinance as yf
-import numpy as np  # npを明示的にインポート
+import numpy as np
 import streamlit as st  # キャッシュ処理 st.cache_data のためにインポート
 from datetime import datetime, timedelta
 from config import settings
 from data_access.local_db import load_price_db
 
 @st.cache_data(ttl=3600)
-def fetch_proxy_market_value(proxy_ticker: str, start_date: datetime, end_date: datetime) -> pd.Series:
+def fetch_proxy_market_value(proxy_ticker: str, start_date: datetime, end_date: datetime, db_df: pd.DataFrame = None) -> pd.Series:
     """
-    市場全体の総売買代金の代理（プロキシ）として、1306.T や SPY の
-    過去売買代金（Close * Volume）をyfinanceから取得し、1時間キャッシュします。
+    市場全体の総売買代金の代理（プロキシ）として、1306 や SPY の
+    時系列データを取得します。db_dfが渡された場合はそのロード済みメモリデータを再利用し、
+    渡されない場合はローカルDBから取得します（外部通信なし）。
     """
     try:
-        # 余裕を持って前後数日を余分に取得
-        df = yf.download(
-            proxy_ticker, 
-            start=start_date.strftime("%Y-%m-%d"), 
-            end=(end_date + timedelta(days=2)).strftime("%Y-%m-%d"), 
-            auto_adjust=True, 
-            progress=False
-        )
-        if df.empty:
+        pure_ticker = str(proxy_ticker).strip().upper()
+        is_jp = True
+        if pure_ticker in ["SPY", "SPX", "^GSPC"]:
+            is_jp = False
+        
+        clean_ticker = pure_ticker
+        if is_jp and clean_ticker.endswith(".T"):
+            clean_ticker = clean_ticker[:-2]
+        
+        # [改修：親一括ロードデータの再利用]
+        if db_df is not None and not db_df.empty:
+            df_db = db_df
+        else:
+            # 渡されていない場合のみ、フォールバックとして1d Active DBからロード
+            df_db = load_price_db("1d", is_jp=is_jp, is_raw=False)
+
+        if df_db.empty:
             return pd.Series(dtype=float)
         
-        # カラム名の小文字化（MultiIndex対策含む）
-        df.columns = [str(c).lower() if not isinstance(c, tuple) else str(c[0]).lower() for c in df.columns]
-        df = df.reset_index()
-        date_col = "date" if "date" in df.columns else "datetime"
-        df = df.rename(columns={date_col: "date"})
-        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-        df = df.set_index("date").sort_index()
+        df_ticker = df_db[df_db["ticker"] == clean_ticker].copy()
+        if df_ticker.empty:
+            return pd.Series(dtype=float)
         
+        df_ticker["date"] = pd.to_datetime(df_ticker["date"]).dt.tz_localize(None)
+        df_ticker = df_ticker.set_index("date").sort_index()
+        
+        # 期間スライス
+        df_sliced = df_ticker.loc[start_date:end_date]
+        if df_sliced.empty:
+            return pd.Series(dtype=float)
+            
         # 売買代金（価格 * 出来高）の算出
-        return df["close"] * df["volume"]
+        return df_sliced["close"] * df_sliced["volume"]
     except Exception:
         return pd.Series(dtype=float)
 
@@ -74,16 +86,17 @@ def get_sector_momentum(index_series: pd.Series, days: int = 5) -> float:
 
 def get_benchmark_data(ticker: str, period_days: int, interval: str) -> pd.Series:
     """
-    基準となるベンチマーク指数の累積リターン推移をDBまたはyfinanceから取得します。
-    分割等のノイズによる突発的な急落（40%以上）を自動で排除して計算します。
+    基準となるベンチマーク指数の累積リターン推移をローカルDBから取得します（外部通信なし）。
     """
     try:
         is_jp = False
-        pure_ticker = str(ticker).strip()
-        if pure_ticker.upper().endswith(".T"):
+        pure_ticker = str(ticker).strip().upper()
+        if pure_ticker.endswith(".T"):
             pure_ticker = pure_ticker[:-2]
             is_jp = True
         elif pure_ticker.isdigit():
+            is_jp = True
+        elif pure_ticker in ["^N225", "1306"]:
             is_jp = True
             
         try:
@@ -102,38 +115,19 @@ def get_benchmark_data(ticker: str, period_days: int, interval: str) -> pd.Serie
                 if not ticker_db.empty:
                     close = ticker_db.set_index("date")["close"]
                     ret = close.pct_change()
+                    
+                    # 急落異常値のクリップ処理
+                    anomaly_mask = ret <= -0.40
+                    if anomaly_mask.any():
+                        for idx_loc in ret[anomaly_mask].index:
+                            ret.loc[idx_loc] = 0.0
+                            
                     idx = (1 + ret).cumprod() * 100
                     if len(idx) > 0: 
                         idx.iloc[0] = 100.0
                     return idx
 
-        end = datetime.now()
-        start = end - timedelta(days=period_days + 365)
-        df_raw = yf.download(ticker, start=start.strftime("%Y-%m-%d"), interval=interval, auto_adjust=True, progress=False)
-        if df_raw.empty: 
-            return pd.Series(dtype=float)
-        
-        df_raw = df_raw.reset_index()
-        df_raw.columns = [str(c).lower() if not isinstance(c, tuple) else str(c[0]).lower() for c in df_raw.columns]
-        date_col = "date" if "date" in df_raw.columns else "datetime"
-        df_raw = df_raw.rename(columns={date_col: "date"})
-        df_raw["date"] = pd.to_datetime(df_raw["date"]).dt.tz_localize(None)
-        close = df_raw.set_index("date")["close"].copy()
-        
-        if len(close) > 1:
-            raw_pct = close.pct_change().copy()
-            anomaly_mask = raw_pct <= -0.40
-            if anomaly_mask.any():
-                for idx_loc in raw_pct[anomaly_mask].index:
-                    raw_pct.loc[idx_loc] = 0.0
-            ret = raw_pct
-        else:
-            ret = close.pct_change()
-            
-        idx = (1 + ret).cumprod() * 100
-        if len(idx) > 0: 
-            idx.iloc[0] = 100.0
-        return idx
+        return pd.Series(dtype=float)
     except Exception:
         return pd.Series(dtype=float)
 
@@ -192,7 +186,7 @@ def compute_sector_absolute_data(db_df: pd.DataFrame, tickers: list, period_days
     return sector_abs, sma75, sma200, is_wvf_lit, trading_val
 
 def compute_macro_cores_from_db(db_df: pd.DataFrame, period_days: int, resample_weekly: bool = False) -> dict:
-    """TOPIX-17業種データから、5大コアセクターの累積騰落指標を数学的に合成算出します。"""
+    """TOPIX-17業種データから、5大コアセクターの累積騰落指標を数学的に合成算出します（ローカルDBのみ）。"""
     all_etfs = [t for etfs in settings.TOPIX17_ETF_MAPPING.values() for t in etfs]
     etf_df = pd.DataFrame()
     if not db_df.empty:
@@ -202,26 +196,6 @@ def compute_macro_cores_from_db(db_df: pd.DataFrame, period_days: int, resample_
         start_date = end_date - timedelta(days=period_days + 30)
         etf_df = db_df[(db_df["date"] >= start_date) & (db_df["ticker"].isin(all_etfs))].copy()
         
-    if etf_df.empty or len(etf_df["ticker"].unique()) < 10:
-        symbols = [f"{t}.T" for t in all_etfs]
-        end = datetime.now()
-        start = end - timedelta(days=period_days + 30)
-        try:
-            df_raw = yf.download(symbols, start=start.strftime("%Y-%m-%d"), progress=False)
-            if not df_raw.empty:
-                df_raw = df_raw.xs("Close", axis=1, level=0) if isinstance(df_raw.columns, pd.MultiIndex) else df_raw
-                df_raw = df_raw.reset_index()
-                rows = []
-                for _, row in df_raw.iterrows():
-                    dt = row["Date"]
-                    for sym in symbols:
-                        val = row[sym]
-                        if not pd.isna(val):
-                            rows.append({"date": dt, "ticker": sym.replace(".T", ""), "close": val})
-                etf_df = pd.DataFrame(rows)
-        except Exception:
-            pass
-
     if etf_df.empty:
         return {}
         
@@ -251,13 +225,10 @@ def compute_theme_equal_weighted_return_rate(
     tickers: list, 
     period_days: int, 
     resample_weekly: bool,
-    is_jp: bool = True  # 市場モード（日本株/米国株）を判定するため追加
+    is_jp: bool = True
 ) -> tuple:
     """
-    指定された構成銘柄（等金額投資）の、基準日（表示期間期首）からの
-    リターン率（％）を計算します。値がさ株に支配されないよう、期首価格で規格化します。
-    また、出来高乖離率（25日中央値）と売買代金シェア（1306/SPYプロキシ基準）から
-    4ステージ判定のLWC用出来高データを同時に生成します。
+    指定された構成銘柄（等金額投資）の、基準日からのリターン率（％）を計算します。
     """
     if db_df.empty or not tickers:
         return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), []
@@ -265,7 +236,6 @@ def compute_theme_equal_weighted_return_rate(
     db_df = db_df.copy()
     db_df["date"] = pd.to_datetime(db_df["date"]).dt.tz_localize(None)
     
-    # 75SMA, 200SMAや出来高の25日中央値を正しく計算するため、表示期間より365日前からデータを取得
     end_date = db_df["date"].max()
     fetch_start = end_date - timedelta(days=period_days + 365)
     
@@ -273,7 +243,6 @@ def compute_theme_equal_weighted_return_rate(
     if target_df.empty:
         return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), []
 
-    # 各銘柄の個別売買代金（val）を計算
     if "volume" in target_df.columns:
         target_df["val"] = target_df["close"] * target_df["volume"]
     else:
@@ -289,85 +258,68 @@ def compute_theme_equal_weighted_return_rate(
     if close_pivot.empty:
         return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), []
 
-    # 規格化の基準日（表示開始日）を判定
     display_start = end_date - timedelta(days=period_days)
-    
-    # 表示期間内の価格データ・売買代金データを抽出
     display_close = close_pivot[close_pivot.index >= display_start]
     display_val = val_pivot[val_pivot.index >= display_start]
     
     if display_close.empty:
         return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), []
 
-    # 基準日時点の株価を100（0%）として規格化
     base_prices = display_close.bfill().iloc[0]
     base_prices = base_prices.apply(lambda x: x if (pd.notna(x) and x > 0) else np.nan)
 
-    # 基準日を 0% とするリターン率に変換
     all_normalized = close_pivot.div(base_prices) * 100.0 - 100.0
     all_index_series = all_normalized.mean(axis=1)
     return_rate_series = all_index_series[all_index_series.index >= display_start]
     
-    # SMA算出
     sma75 = all_index_series.rolling(window=75, min_periods=1).mean()
     sma200 = all_index_series.rolling(window=200, min_periods=1).mean()
 
-    # 表示期間で再度スライス
     sma75 = sma75[sma75.index >= display_start]
     sma200 = sma200[sma200.index >= display_start]
 
-    # =========================================================================
-    # 🔄 4ステージ出来高マトリクスの算出
-    # =========================================================================
-    # 1. 分母（市場総売買代金プロキシ）の取得
+    # 4ステージ出来高マトリクスの算出
     proxy_ticker = "1306.T" if is_jp else "SPY"
-    proxy_m_val = fetch_proxy_market_value(proxy_ticker, fetch_start, end_date)
+    
+    # [改修：親側からロード済みの db_df を引き渡し、多重Parquetロードを完全に回避]
+    proxy_m_val = fetch_proxy_market_value(proxy_ticker, fetch_start, end_date, db_df=db_df)
     
     if resample_weekly and not proxy_m_val.empty:
         proxy_m_val = proxy_m_val.resample("W-FRI").sum()
 
-    # 2. ② 出来高乖離率の平均 (VDR) の計算
-    # 各銘柄の、当日を除く過去25期間の売買代金「中央値」を算出して乖離率を出す
     vdr_df = pd.DataFrame(index=val_pivot.index)
     for col in val_pivot.columns:
         med = val_pivot[col].shift(1).rolling(window=25, min_periods=5).median()
         vdr_df[col] = val_pivot[col] / med.replace(0, np.nan)
     
-    theme_vdr = vdr_df.mean(axis=1).fillna(1.0) # テーマ内平均の乖離率
+    theme_vdr = vdr_df.mean(axis=1).fillna(1.0)
 
-    # 3. ③ 売買代金シェア (VS) の計算
-    theme_total_val = val_pivot.sum(axis=1) # テーマ構成銘柄の合計売買代金
+    theme_total_val = val_pivot.sum(axis=1)
     if not proxy_m_val.empty:
-        # インデックスを同期
         proxy_m_val_aligned = proxy_m_val.reindex(theme_total_val.index, method="ffill").bfill()
         theme_vs = (theme_total_val / proxy_m_val_aligned.replace(0, np.nan)) * 100.0
     else:
-        # 万が一プロキシ取得に失敗した場合は、合計売買代金をおおまかにスケーリングして表示
         theme_vs = theme_total_val / 1e6
 
-    # シェアの20日移動平均 (VS_MA)
     theme_vs_ma = theme_vs.rolling(window=20, min_periods=1).mean()
 
-    # 4. 表示期間でスライスしてマトリクス判定
     display_vdr = theme_vdr[theme_vdr.index >= display_start]
     display_vs = theme_vs[theme_vs.index >= display_start]
     display_vs_ma = theme_vs_ma[theme_vs_ma.index >= display_start]
 
-    # LWC Histogram 用の辞書リスト構築
     lwc_volume_data = []
     for dt, vdr, vs, vs_ma in zip(display_vs.index, display_vdr, display_vs, display_vs_ma):
         if pd.isna(vs):
             continue
         
-        # 4ステージ判定ロジック
         if vdr >= 1.5 and vs >= vs_ma:
-            color = "rgba(239, 83, 80, 0.85)"      # ステージA: 赤 (初動・ブレイク)
+            color = "rgba(239, 83, 80, 0.85)"      # ステージA: 赤
         elif vdr < 1.5 and vs >= vs_ma:
-            color = "rgba(38, 166, 154, 0.60)"     # ステージB: 緑 (巡航・新ステージ)
+            color = "rgba(38, 166, 154, 0.60)"     # ステージB: 緑
         elif vdr < 1.5 and vs < vs_ma:
-            color = "rgba(128, 128, 128, 0.25)"    # ステージC: 灰 (冷え込み・手仕舞い)
-        else: # vdr >= 1.5 and vs < vs_ma
-            color = "rgba(255, 167, 38, 0.50)"     # ステージD: 黄 (地合い・一時的ノイズ)
+            color = "rgba(128, 128, 128, 0.25)"    # ステージC: 灰
+        else:
+            color = "rgba(255, 167, 38, 0.50)"     # ステージD: 黄
 
         lwc_volume_data.append({
             "time": str(dt)[:10],
