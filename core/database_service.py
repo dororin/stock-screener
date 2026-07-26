@@ -222,6 +222,11 @@ def rebuild_active_from_raw(interval: str, is_jp: bool = False, dry_run: bool = 
         gc.collect()
         if cloud_success:
             log(f"✅ [{interval}] 米国株ActiveデータベースをGoogleドライブへ正常に保存・同期しました。")
+            try:
+                import streamlit as st
+                st.cache_data.clear()
+            except Exception:
+                pass
         else:
             log(f"⚠️ [{interval}] Googleドライブ同期に失敗しました。ローカル保存のみ完了。エラー: {cloud_msg}")
         return True
@@ -531,6 +536,12 @@ def execute_apply_verified_temp_dbs_to_active(is_jp: bool = False, status_callba
             log(f"   ❌ [{interval}] 米国株本番適用に失敗しました: {msg}")
             
     gc.collect()
+    try:
+        import streamlit as st
+        st.cache_data.clear()
+    except Exception:
+        pass
+        
     try:
         upload_sync_log_to_drive(accumulated_logs, is_jp=False, prefix="apply_active")
     except Exception:

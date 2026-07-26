@@ -601,6 +601,7 @@ def render_jp_manual_merge_center(is_jp: bool):
                 result = execute_jp_merge(merge_tf, status_callback=on_status)
                 
                 if result.get("success"):
+                    st.cache_data.clear()
                     status_box.update(label="🎉 統合マージおよび不要差分ファイルの自動消去が正常に完了しました！", state="complete")
                     st.success(result.get("message"))
                     time.sleep(2.0)

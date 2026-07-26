@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 from config import settings
-from data_access.local_db import load_price_db
+from data_access.local_db import load_price_db, get_price_data_cached
 from data_access.sheets_api import (
     load_watchlist_from_sheets,
     save_watchlist_to_sheets,
@@ -12,13 +12,13 @@ from data_access.sheets_api import (
 )
 from core.screener import get_jpx_full_list
 from core.calculator import (
-    compute_macro_cores_from_db,
     get_sector_momentum,
-    compute_sector_index_from_df,
     relativize_series,
-    compute_sector_absolute_data,
-    get_benchmark_data,
-    compute_theme_equal_weighted_return_rate
+    get_sector_index_cached,
+    get_theme_return_rate_cached,
+    get_sector_absolute_data_cached,
+    get_macro_cores_cached,
+    get_benchmark_data_cached
 )
 from utils.plotting import (
     render_lwc_rs_overlay,
@@ -26,15 +26,6 @@ from utils.plotting import (
 )
 
 CUSTOM_SECTOR_KEY = "custom_sector_tickers"
-
-@st.cache_data(ttl=300)
-def load_unified_db(interval: str, is_jp: bool = True) -> pd.DataFrame:
-    """データベースから該当するParquetデータを取得します（簡易セッションキャッシュ付き）。"""
-    try:
-        return load_price_db(interval, is_jp=is_jp)
-    except FileNotFoundError as e:
-        st.warning(str(e))
-        return pd.DataFrame()
 
 @st.fragment
 def _watchlist_ui():
@@ -160,26 +151,26 @@ with st.sidebar:
     # ウォッチリストUI呼び出し
     _watchlist_ui()
 
-# データベースのロード
-db_df = load_unified_db(interval, is_jp=is_jp)
-if db_df.empty:
+# データベースの存在確認（軽量サンプル取得）
+sample_df = get_price_data_cached(interval, limit_days=7, is_jp=is_jp)
+if sample_df.empty:
     st.info("💡 データベースがまだ作成されていません。「データ管理・保守」画面で差分ダウンロードを実行してください。")
     st.stop()
 
 # ベンチマーク基準系列の取得
-bm_series = get_benchmark_data(bm_ticker, period_days, interval) if bm_ticker else None
+bm_series = get_benchmark_data_cached(bm_ticker, period_days, interval, is_jp=is_jp) if bm_ticker else None
 
 # =========================================================================
 # 🇯🇵 日本株モード
 # =========================================================================
 if is_jp:
-    # ─── 【復元】Layer 1: マクロコア、相対強度重ね合わせ比較チャートの描画処理 ───
+    # ─── 【多層キャッシュ】Layer 2: マクロコア、相対強度重ね合わせ比較チャート ───
     overlay_series_cache = {}
     
     with st.spinner("重ね書きデータを算出中..."):
         # 1. 5大マクロ・コアの算出と相対化
         if overlay_target == "5大マクロ・コア":
-            cores = compute_macro_cores_from_db(db_df, period_days, resample_weekly)
+            cores = get_macro_cores_cached(interval, period_days, resample_weekly, is_jp=is_jp)
             for sname, idx_series in cores.items():
                 if not idx_series.empty:
                     overlay_series_cache[sname] = relativize_series(idx_series, bm_series)
@@ -188,7 +179,7 @@ if is_jp:
         elif overlay_target == "17業種 (個別)":
             all_etf_codes = list(settings.TOPIX17_NAMES.keys())
             for code in all_etf_codes:
-                idx_series = compute_sector_index_from_df(db_df, [code], period_days, resample_weekly)
+                idx_series = get_sector_index_cached(interval, (code,), period_days, resample_weekly, is_jp=is_jp)
                 if not idx_series.empty:
                     name = settings.TOPIX17_NAMES.get(code, code)
                     overlay_series_cache[name] = relativize_series(idx_series, bm_series)
@@ -198,7 +189,7 @@ if is_jp:
             sectors_loaded = load_sector_master_from_sheets(is_jp=True)
             if sectors_loaded:
                 for t_name, tickers in sectors_loaded.items():
-                    idx_series = compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly)
+                    idx_series = get_sector_index_cached(interval, tuple(tickers), period_days, resample_weekly, is_jp=is_jp)
                     if not idx_series.empty:
                         overlay_series_cache[t_name] = relativize_series(idx_series, bm_series)
 
@@ -264,15 +255,15 @@ if is_jp:
 
                 if visible:
                     try:
-                        etf_abs, etf_sma75, etf_sma200, etf_wvf, etf_vol = compute_sector_absolute_data(
-                            db_df, [code], period_days, resample_weekly
+                        etf_abs, etf_sma75, etf_sma200, etf_wvf, etf_vol = get_sector_absolute_data_cached(
+                            interval, (code,), period_days, resample_weekly, is_jp=is_jp
                         )
                     except Exception:
                         etf_abs = pd.Series(dtype=float)
                         etf_sma75 = etf_sma200 = etf_wvf = etf_vol = pd.Series(dtype=float)
 
                     etf_mom = get_sector_momentum(
-                        compute_sector_index_from_df(db_df, [code], period_days, resample_weekly),
+                        get_sector_index_cached(interval, (code,), period_days, resample_weekly, is_jp=is_jp),
                         days=min(5, period_days)
                     )
                     badge_e = "🟢" if etf_mom >= 0 else "🔴"
@@ -314,15 +305,15 @@ if is_jp:
                                 col_to_use = p_cols[s_idx % 5]
                                 with col_to_use:
                                     try:
-                                        s_abs, s_sma75, s_sma200, s_wvf, s_vol = compute_sector_absolute_data(
-                                            db_df, [stock_code], period_days, resample_weekly
+                                        s_abs, s_sma75, s_sma200, s_wvf, s_vol = get_sector_absolute_data_cached(
+                                            interval, (stock_code,), period_days, resample_weekly, is_jp=is_jp
                                         )
                                     except Exception:
                                         s_abs = pd.Series(dtype=float)
                                         s_sma75 = s_sma200 = s_wvf = s_vol = pd.Series(dtype=float)
 
                                     s_mom = get_sector_momentum(
-                                        compute_sector_index_from_df(db_df, [stock_code], period_days, resample_weekly),
+                                        get_sector_index_cached(interval, (stock_code,), period_days, resample_weekly, is_jp=is_jp),
                                         days=min(5, period_days)
                                     )
                                     s_badge = "🟢" if s_mom >= 3.0 else "🔴" if s_mom <= -3.0 else "⚪"
@@ -382,10 +373,8 @@ if is_jp:
                     hc2.button(vis_label, key=f"theme_vis_{t_name}", use_container_width=True, on_click=toggle_theme_visibility, args=(t_name,))
 
                     if visible:
-                        # 新規作成した値がさ株対応の等金額規格化リターン算出
-                        # 引数に `is_jp=is_jp` を渡すことで、計算ロジック側での1306/SPYの自動切替を有効化します
-                        ret_rate, sma75, sma200, total_val = compute_theme_equal_weighted_return_rate(
-                            db_df, tickers, period_days, resample_weekly, is_jp=is_jp
+                        ret_rate, sma75, sma200, total_val = get_theme_return_rate_cached(
+                            interval, tuple(tickers), period_days, resample_weekly, is_jp=is_jp
                         )
 
                         if not ret_rate.empty:
@@ -400,11 +389,9 @@ if is_jp:
                                 unsafe_allow_html=True
                             )
 
-                            # LWCにリターン率%（折れ線）、SMA、売買代金（ボリュームヒストグラム）を渡し描画
-                            # 4ステージ判定による色分け情報(total_val)をvolume_seriesとして受け渡します
                             render_lwc_sector_mini(
                                 ret_rate, sma_fast=sma75, sma_slow=sma200,
-                                wvf_lit=None, volume_series=total_val,  # 4ステージ色分けデータ(LWC用のdictリスト)
+                                wvf_lit=None, volume_series=total_val,
                                 key=f"theme_ret_mini_{t_name}", height=150
                             )
                         else:
@@ -431,7 +418,7 @@ else:
     sector_index_cache = {}
     momentum_scores = {}
     for sname, tickers in sectors.items():
-        idx_series = compute_sector_index_from_df(db_df, tickers, period_days, resample_weekly)
+        idx_series = get_sector_index_cached(interval, tuple(tickers), period_days, resample_weekly, is_jp=is_jp)
         if not idx_series.empty:
             plot_series = relativize_series(idx_series, bm_series)
             sector_index_cache[sname] = plot_series
@@ -482,7 +469,9 @@ else:
             color_theme = "#26a69a" if mom >= 3.0 else "#ef5350" if mom <= -3.0 else "#9e9e9e"
 
             try:
-                sec_abs, sma75, sma200, is_wvf_lit, trading_val = compute_sector_absolute_data(db_df, tickers, period_days, resample_weekly, interval=interval, is_jp=is_jp)
+                sec_abs, sma75, sma200, is_wvf_lit, trading_val = get_sector_absolute_data_cached(
+                    interval, tuple(tickers), period_days, resample_weekly, is_jp=is_jp
+                )
                 wvf_active = bool(is_wvf_lit.iloc[-1]) if (is_wvf_lit is not None and not is_wvf_lit.empty) else False
             except Exception:
                 sec_abs, sma75, sma200, is_wvf_lit, trading_val = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
@@ -506,7 +495,7 @@ else:
 
 # =========================================================================
 # 📌 共通ウォッチリスト表示処理
-# =====================================================================
+# =========================================================================
 custom_tickers = st.session_state.get(CUSTOM_SECTOR_KEY, {})
 if custom_tickers:
     st.divider()
@@ -524,7 +513,7 @@ if custom_tickers:
             code = custom_codes[idx]
             name = custom_tickers[code]
 
-            single_series = compute_sector_index_from_df(db_df, [code], period_days, resample_weekly)
+            single_series = get_sector_index_cached(interval, (code,), period_days, resample_weekly, is_jp=is_jp)
             single_series = relativize_series(single_series, bm_series)
             mom_single = get_sector_momentum(single_series, days=min(5, period_days)) if not single_series.empty else 0.0
             badge = "🟢" if mom_single >= 3.0 else "🔴" if mom_single <= -3.0 else "⚪"
@@ -541,7 +530,9 @@ if custom_tickers:
                         st.rerun()
 
                     try:
-                        w_abs, w_sma75, w_sma200, w_wvf_lit, w_trading_val = compute_sector_absolute_data(db_df, [code], period_days, resample_weekly, interval=interval, is_jp=is_jp)
+                        w_abs, w_sma75, w_sma200, w_wvf_lit, w_trading_val = get_sector_absolute_data_cached(
+                            interval, (code,), period_days, resample_weekly, is_jp=is_jp
+                        )
                     except Exception:
                         w_abs, w_sma75, w_sma200, w_wvf_lit, w_trading_val = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
                     

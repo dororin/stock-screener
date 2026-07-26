@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 
 from config import settings
-from data_access.local_db import load_price_db
+from data_access.local_db import load_price_db, get_price_data_cached
 from data_access.sheets_api import (
     save_history,
     get_history_list,
@@ -13,11 +13,10 @@ from data_access.sheets_api import (
 from core.screener import run_fast_screening
 from utils.plotting import render_lwc_candle_mini
 
-@st.cache_data(ttl=300)
 def load_unified_db(interval: str, is_jp: bool = True) -> pd.DataFrame:
-    """Parquetデータベースから1dデータをキャッシュ付きでロードします。"""
+    """レイヤー1共有キャッシュ経由で1dデータをロードします。"""
     try:
-        return load_price_db(interval, is_jp=is_jp)
+        return get_price_data_cached(interval, is_jp=is_jp)
     except FileNotFoundError as e:
         st.warning(str(e))
         return pd.DataFrame()

@@ -4,14 +4,14 @@ import numpy as np
 import streamlit as st  # キャッシュ処理 st.cache_data のためにインポート
 from datetime import datetime, timedelta
 from config import settings
-from data_access.local_db import load_price_db
+from data_access.local_db import load_price_db, get_price_data_cached
 
 @st.cache_data(ttl=3600)
 def fetch_proxy_market_value(proxy_ticker: str, start_date: datetime, end_date: datetime, db_df: pd.DataFrame = None) -> pd.Series:
     """
     市場全体の総売買代金の代理（プロキシ）として、1306 や SPY の
     時系列データを取得します。db_dfが渡された場合はそのロード済みメモリデータを再利用し、
-    渡されない場合はローカルDBから取得します（外部通信なし）。
+    渡されない場合はレイヤー1キャッシュから取得します。
     """
     try:
         pure_ticker = str(proxy_ticker).strip().upper()
@@ -23,12 +23,11 @@ def fetch_proxy_market_value(proxy_ticker: str, start_date: datetime, end_date: 
         if is_jp and clean_ticker.endswith(".T"):
             clean_ticker = clean_ticker[:-2]
         
-        # [改修：親一括ロードデータの再利用]
         if db_df is not None and not db_df.empty:
             df_db = db_df
         else:
-            # 渡されていない場合のみ、フォールバックとして1d Active DBからロード
-            df_db = load_price_db("1d", is_jp=is_jp, is_raw=False)
+            limit_days = (datetime.now() - start_date).days + 30
+            df_db = get_price_data_cached("1d", limit_days=limit_days, is_jp=is_jp)
 
         if df_db.empty:
             return pd.Series(dtype=float)
@@ -77,19 +76,15 @@ def compute_sector_index_from_df(db_df: pd.DataFrame, tickers: list, period_days
 
 def get_sector_momentum(index_series: pd.Series, days: int = 5) -> float:
     """直近指定日数における合成インデックスの騰落率(%)を計算します。"""
-    if len(index_series) < 2:
+    if index_series is None or len(index_series) < 2:
         return 0.0
     recent = index_series.iloc[-min(days, len(index_series)):]
     if recent.iloc[0] == 0:
         return 0.0
     return float((recent.iloc[-1] / recent.iloc[0] - 1) * 100)
 
-def get_benchmark_data(ticker: str, period_days: int, interval: str) -> pd.Series:
-    """
-    基準となるベンチマーク指数の累積リターン推移をローカルDBから取得します（外部通信なし）。
-    """
+def _compute_benchmark_data_internal(ticker: str, period_days: int, interval: str, is_jp: bool = True) -> pd.Series:
     try:
-        is_jp = False
         pure_ticker = str(ticker).strip().upper()
         if pure_ticker.endswith(".T"):
             pure_ticker = pure_ticker[:-2]
@@ -99,10 +94,8 @@ def get_benchmark_data(ticker: str, period_days: int, interval: str) -> pd.Serie
         elif pure_ticker in ["^N225", "1306"]:
             is_jp = True
             
-        try:
-            db_df = load_price_db(interval, is_jp=is_jp)
-        except Exception:
-            db_df = pd.DataFrame()
+        limit_days = period_days + 365
+        db_df = get_price_data_cached(interval, limit_days=limit_days, is_jp=is_jp)
 
         if not db_df.empty and "ticker" in db_df.columns:
             ticker_db = db_df[db_df["ticker"] == pure_ticker].copy()
@@ -130,6 +123,9 @@ def get_benchmark_data(ticker: str, period_days: int, interval: str) -> pd.Serie
         return pd.Series(dtype=float)
     except Exception:
         return pd.Series(dtype=float)
+
+def get_benchmark_data(ticker: str, period_days: int, interval: str) -> pd.Series:
+    return _compute_benchmark_data_internal(ticker, period_days, interval, is_jp=True)
 
 def relativize_series(idx_series: pd.Series, bm_series: pd.Series) -> pd.Series:
     """基準指数に対する相対強度(RS)のインデックス推移を計算します。"""
@@ -186,7 +182,7 @@ def compute_sector_absolute_data(db_df: pd.DataFrame, tickers: list, period_days
     return sector_abs, sma75, sma200, is_wvf_lit, trading_val
 
 def compute_macro_cores_from_db(db_df: pd.DataFrame, period_days: int, resample_weekly: bool = False) -> dict:
-    """TOPIX-17業種データから、5大コアセクターの累積騰落指標を数学的に合成算出します（ローカルDBのみ）。"""
+    """TOPIX-17業種データから、5大コアセクターの累積騰落指標を数学的に合成算出します。"""
     all_etfs = [t for etfs in settings.TOPIX17_ETF_MAPPING.values() for t in etfs]
     etf_df = pd.DataFrame()
     if not db_df.empty:
@@ -278,10 +274,7 @@ def compute_theme_equal_weighted_return_rate(
     sma75 = sma75[sma75.index >= display_start]
     sma200 = sma200[sma200.index >= display_start]
 
-    # 4ステージ出来高マトリクスの算出
     proxy_ticker = "1306.T" if is_jp else "SPY"
-    
-    # [改修：親側からロード済みの db_df を引き渡し、多重Parquetロードを完全に回避]
     proxy_m_val = fetch_proxy_market_value(proxy_ticker, fetch_start, end_date, db_df=db_df)
     
     if resample_weekly and not proxy_m_val.empty:
@@ -328,3 +321,109 @@ def compute_theme_equal_weighted_return_rate(
         })
 
     return return_rate_series, sma75, sma200, lwc_volume_data
+
+
+# =====================================================================
+# ⚡ レイヤー2：料理（計算）キャッシュ設計
+# =====================================================================
+
+@st.cache_data(ttl=3600)
+def _get_sector_index_1d_cached(tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool) -> pd.Series:
+    limit_days = period_days + 365
+    db_df = get_price_data_cached("1d", limit_days=limit_days, is_jp=is_jp)
+    return compute_sector_index_from_df(db_df, list(tickers_tuple), period_days, resample_weekly)
+
+@st.cache_data(ttl=300)
+def _get_sector_index_intraday_cached(interval: str, tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool) -> pd.Series:
+    limit_days = period_days + 365
+    db_df = get_price_data_cached(interval, limit_days=limit_days, is_jp=is_jp)
+    return compute_sector_index_from_df(db_df, list(tickers_tuple), period_days, resample_weekly)
+
+def get_sector_index_cached(interval: str, tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool = True) -> pd.Series:
+    """レイヤー2：セクターインデックス算出キャッシュ"""
+    if not isinstance(tickers_tuple, tuple):
+        tickers_tuple = tuple(tickers_tuple)
+    if interval == "1d":
+        return _get_sector_index_1d_cached(tickers_tuple, period_days, resample_weekly, is_jp)
+    else:
+        return _get_sector_index_intraday_cached(interval, tickers_tuple, period_days, resample_weekly, is_jp)
+
+
+@st.cache_data(ttl=3600)
+def _get_theme_return_rate_1d_cached(tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool) -> tuple:
+    limit_days = period_days + 365
+    db_df = get_price_data_cached("1d", limit_days=limit_days, is_jp=is_jp)
+    return compute_theme_equal_weighted_return_rate(db_df, list(tickers_tuple), period_days, resample_weekly, is_jp=is_jp)
+
+@st.cache_data(ttl=300)
+def _get_theme_return_rate_intraday_cached(interval: str, tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool) -> tuple:
+    limit_days = period_days + 365
+    db_df = get_price_data_cached(interval, limit_days=limit_days, is_jp=is_jp)
+    return compute_theme_equal_weighted_return_rate(db_df, list(tickers_tuple), period_days, resample_weekly, is_jp=is_jp)
+
+def get_theme_return_rate_cached(interval: str, tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool = True) -> tuple:
+    """レイヤー2：テーマ規格化リターン率算出キャッシュ"""
+    if not isinstance(tickers_tuple, tuple):
+        tickers_tuple = tuple(tickers_tuple)
+    if interval == "1d":
+        return _get_theme_return_rate_1d_cached(tickers_tuple, period_days, resample_weekly, is_jp)
+    else:
+        return _get_theme_return_rate_intraday_cached(interval, tickers_tuple, period_days, resample_weekly, is_jp)
+
+
+@st.cache_data(ttl=3600)
+def _get_sector_absolute_data_1d_cached(tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool) -> tuple:
+    limit_days = period_days + 365
+    db_df = get_price_data_cached("1d", limit_days=limit_days, is_jp=is_jp)
+    return compute_sector_absolute_data(db_df, list(tickers_tuple), period_days, resample_weekly, interval="1d", is_jp=is_jp)
+
+@st.cache_data(ttl=300)
+def _get_sector_absolute_data_intraday_cached(interval: str, tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool) -> tuple:
+    limit_days = period_days + 365
+    db_df = get_price_data_cached(interval, limit_days=limit_days, is_jp=is_jp)
+    return compute_sector_absolute_data(db_df, list(tickers_tuple), period_days, resample_weekly, interval=interval, is_jp=is_jp)
+
+def get_sector_absolute_data_cached(interval: str, tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool = True) -> tuple:
+    """レイヤー2：セクター絶対価格データ算出キャッシュ"""
+    if not isinstance(tickers_tuple, tuple):
+        tickers_tuple = tuple(tickers_tuple)
+    if interval == "1d":
+        return _get_sector_absolute_data_1d_cached(tickers_tuple, period_days, resample_weekly, is_jp)
+    else:
+        return _get_sector_absolute_data_intraday_cached(interval, tickers_tuple, period_days, resample_weekly, is_jp)
+
+
+@st.cache_data(ttl=3600)
+def _get_macro_cores_1d_cached(period_days: int, resample_weekly: bool, is_jp: bool) -> dict:
+    limit_days = period_days + 365
+    db_df = get_price_data_cached("1d", limit_days=limit_days, is_jp=is_jp)
+    return compute_macro_cores_from_db(db_df, period_days, resample_weekly)
+
+@st.cache_data(ttl=300)
+def _get_macro_cores_intraday_cached(interval: str, period_days: int, resample_weekly: bool, is_jp: bool) -> dict:
+    limit_days = period_days + 365
+    db_df = get_price_data_cached(interval, limit_days=limit_days, is_jp=is_jp)
+    return compute_macro_cores_from_db(db_df, period_days, resample_weekly)
+
+def get_macro_cores_cached(interval: str, period_days: int, resample_weekly: bool, is_jp: bool = True) -> dict:
+    """レイヤー2：5大マクロコア算出キャッシュ"""
+    if interval == "1d":
+        return _get_macro_cores_1d_cached(period_days, resample_weekly, is_jp)
+    else:
+        return _get_macro_cores_intraday_cached(interval, period_days, resample_weekly, is_jp)
+
+
+@st.cache_data(ttl=3600)
+def _get_benchmark_data_1d_cached(ticker: str, period_days: int, is_jp: bool) -> pd.Series:
+    return _compute_benchmark_data_internal(ticker, period_days, "1d", is_jp)
+
+@st.cache_data(ttl=300)
+def _get_benchmark_data_intraday_cached(ticker: str, period_days: int, interval: str, is_jp: bool) -> pd.Series:
+    return _compute_benchmark_data_internal(ticker, period_days, interval, is_jp)
+
+def get_benchmark_data_cached(ticker: str, period_days: int, interval: str, is_jp: bool = True) -> pd.Series:
+    """レイヤー2：ベンチマークデータ算出キャッシュ"""
+    if interval == "1d":
+        return _get_benchmark_data_1d_cached(ticker, period_days, is_jp)
+    else:
+        return _get_benchmark_data_intraday_cached(ticker, period_days, interval, is_jp)
