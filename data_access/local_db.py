@@ -233,7 +233,7 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
     log(f"📂 未処理の差分ファイルを検出しました。総計: {len(all_diff_files)} 件。古い順にマージを開始します...")
 
     # メモリ上に統合用の本番ベースデータをキャッシュする辞書
-    # 構造: { group_key: { "df": pd.DataFrame, "filename": str, "local_path": str } }
+    # 構造: { group_key: { "df": pd.DataFrame, "original_tickers": set, "original_count": int, "filename": str, "local_path": str } }
     loaded_bases = {}
 
     processed_file_ids = []
@@ -290,23 +290,35 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                         try:
                             base_df = pd.read_parquet(local_base_path)
                             base_df["date"] = pd.to_datetime(base_df["date"]).dt.tz_localize(None)
+                            
+                            # 健全性検証用メタデータの退避
+                            orig_tickers = set(base_df["ticker"].unique()) if not base_df.empty else set()
+                            orig_count = len(base_df)
+                            
                             loaded_bases[group_key] = {
                                 "df": base_df,
+                                "original_tickers": orig_tickers,
+                                "original_count": orig_count,
                                 "filename": base_filename,
                                 "local_path": local_base_path
                             }
-                        except Exception:
-                            loaded_bases[group_key] = {
-                                "df": pd.DataFrame(),
-                                "filename": base_filename,
-                                "local_path": local_base_path
-                            }
+                        except Exception as e_read:
+                            # 【バグ修正】既存データの破損時は空でフォールバックせず安全にエラー中断させる
+                            log(f"  ❌ [{base_filename}] のロードに失敗しました (破損・I/Oエラー)。過去データを保護するため処理を安全に中断します: {e_read}")
+                            error_occurred = True
+                            err_msg = f"既存本番データの読み込み失敗: {base_filename}"
+                            break
                     else:
                         loaded_bases[group_key] = {
                             "df": pd.DataFrame(),
+                            "original_tickers": set(),
+                            "original_count": 0,
                             "filename": base_filename,
                             "local_path": local_base_path
                         }
+                
+                if error_occurred:
+                    break
                         
                 base_info = loaded_bases[group_key]
                 old_base_df = base_info["df"]
@@ -321,6 +333,10 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                 
             if os.path.exists(local_temp_path):
                 os.remove(local_temp_path)
+                
+            if error_occurred:
+                break
+                
             processed_file_ids.append(file_id)
             
         except Exception as e:
@@ -331,9 +347,65 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                 os.remove(local_temp_path)
             break
 
-    # 5. エラーなく全マージ処理が完了した場合のみ上書き確定保存
+    # 5. 【新設：保存前のインメモリ健全性アサーションスキャン】
     if not error_occurred and loaded_bases:
-        log("💾 すべての差分マージ計算が完了しました。統合ファイルを上書き保存中...")
+        log("🔍 クラウド保存前のインメモリデータ健全性スキャンを実行します...")
+        for g_key, b_info in loaded_bases.items():
+            final_df = b_info["df"]
+            f_name = b_info["filename"]
+            orig_tickers = b_info["original_tickers"]
+            orig_count = b_info["original_count"]
+            new_count = len(final_df)
+
+            # ① 空データアサーション
+            if final_df.empty:
+                log(f"  ❌ [健全性エラー] [{f_name}] マージ後のデータフレームが完全に空です。")
+                error_occurred = True
+                err_msg = f"{f_name} のマージ後データが空になりました。"
+                break
+
+            # ② 銘柄（ティッカー）消失アサーション
+            new_tickers = set(final_df["ticker"].unique())
+            missing_tickers = orig_tickers - new_tickers
+            if missing_tickers:
+                log(f"  ❌ [健全性エラー] [{f_name}] 既存銘柄の一部がマージ後に消失しています: {list(missing_tickers)[:10]}")
+                error_occurred = True
+                err_msg = f"{f_name} から一部の銘柄データが消失しました。"
+                break
+
+            # ③ 件数激減アサーション（重複削除分を考慮し、前件数の99%未満を異常値として検出）
+            if orig_count > 0 and new_count < orig_count * 0.99:
+                log(f"  ❌ [健全性エラー] [{f_name}] 行数が前件数より異常に減少しています: {orig_count:,} ➔ {new_count:,} (減少率: {(1 - new_count/orig_count)*100:.2f}%)")
+                error_occurred = True
+                err_msg = f"{f_name} の行数が異常に減少しました。"
+                break
+
+            # ④ 必須項目NULL値および不正価格値チェック
+            if final_df["close"].isna().any() or final_df["ticker"].isna().any() or final_df["date"].isna().any():
+                log(f"  ❌ [健全性エラー] [{f_name}] 必須列 (date, ticker, close) に NULL値 (NaN) が混入しています。")
+                error_occurred = True
+                err_msg = f"{f_name} に NULL値が混入しました。"
+                break
+
+            if (final_df["close"] <= 0).any():
+                log(f"  ❌ [健全性エラー] [{f_name}] 0 以下の不正な異常価格（Close）が含まれています。")
+                error_occurred = True
+                err_msg = f"{f_name} に 0 以下の異常価格が含まれています。"
+                break
+
+            # ⑤ 時系列の極端なギャップ検知（日足の場合のみ、10日以上の不自然なデータ空白を警告）
+            if interval == "1d" and not final_df.empty:
+                try:
+                    final_df_sorted = final_df.sort_values(["ticker", "date"])
+                    max_gap = final_df_sorted.groupby("ticker")["date"].diff().max()
+                    if pd.notna(max_gap) and max_gap.days > 10:
+                        log(f"  ⚠️ [健全性警告] [{f_name}] 銘柄内の最大時間ギャップが {max_gap.days} 日に達しています。連休閉場を超えた大きなデータ抜けの可能性があります。")
+                except Exception:
+                    pass
+
+    # 6. エラーなく全健全性検証を通過した場合のみ、確定保存（アップロード）
+    if not error_occurred and loaded_bases:
+        log("💾 すべての安全アサーション検証をクリアしました。統合ファイルを上書き保存中...")
         for g_key, b_info in loaded_bases.items():
             final_df = b_info["df"].sort_values(["ticker", "date"]).reset_index(drop=True)
             local_save_path = b_info["local_path"]
@@ -352,12 +424,14 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                     log(f"   ❌ [{f_name}] 本番同期に失敗: {up_msg}")
                     error_occurred = True
                     err_msg = f"本番同期エラー: {up_msg}"
+                    break
             except Exception as e:
                 log(f"   ❌ [{f_name}] 保存書き出し中に例外発生: {e}")
                 error_occurred = True
                 err_msg = str(e)
+                break
 
-    # 6. 【安全削除】確定保存成功時にDrive上の元差分ファイルを消去
+    # 7. 【安全削除】すべてのマージ保存が100%成功した場合に限り、Drive上の差分ファイルを安全消去
     if not error_occurred and processed_file_ids:
         log("🧹 データベースの確定保存を確認しました。Googleドライブ上の元差分ファイルを自動消去中...")
         del_count = 0
@@ -373,10 +447,9 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
         except Exception:
             pass
             
-        return {"success": True, "message": f"計 {len(processed_file_ids)} 件の差分マージと自動消去が正常に完了しました。"}
+        return {"success": True, "message": f"計 {len(processed_file_ids)} 件の差分健全マージと自動消去が正常に完了しました。"}
 
-    return {"success": False, "message": err_msg if err_msg else "マージ処理を中断しました。"}
-
+    return {"success": False, "message": err_msg if err_msg else "マージ処理を安全に中断・ロールバックしました。"}
 
 # --- 🚀 投影ロード & フィルタリング最適化型 DBロード ---
 def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_temp: bool = False, columns: list = None, filters: list = None) -> pd.DataFrame:
@@ -593,4 +666,4 @@ def get_price_data_cached(interval: str, limit_days: int = None, is_jp: bool = T
     if interval == "1d":
         return _get_price_data_1d_cached(limit_days, is_jp)
     else:
-        return _get_price_data_intraday_cached(interval, limit_days, is_jp)
+        return _get_price_data_intraday_cached(interval, limit_days, is_jp)
