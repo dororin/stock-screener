@@ -580,7 +580,7 @@ def render_jp_manual_merge_center(is_jp: bool):
                     pass
             
             if total_diff_count > 0:
-                scan_status.update(label=f"📂 未マージの日本株差分ファイルを計 {total_diff_count} 件検出しました。", state="warning")
+                scan_status.update(label=f"📂 未マージの日本株差分ファイルを計 {total_diff_count} 件検出しました。", state="complete")
                 for line in scanned_details:
                     st.write(line)
             else:
