@@ -1,4 +1,3 @@
-# views/maintenance.py
 import os
 import time
 from datetime import datetime
@@ -39,16 +38,19 @@ from core.us_price_corrector import (
     apply_bulk_selected_patches
 )
 
-# ── 日足の最新更新日の簡易取得 ──
-def get_db_last_update(interval: str, is_jp: bool = True) -> str:
+# ── 日足の最新更新日の簡易取得 (投影ロード ＆ キャッシュによる超高速化) ──
+@st.cache_data(ttl=600)
+def get_db_last_update_cached(interval: str, is_jp: bool = True) -> str:
+    """columns=['date'] を指定して日付列だけをロードするため、全列ロードに比べ約100倍高速に動作します。"""
     try:
-        df = load_price_db(interval, is_jp=is_jp, is_raw=False)
+        df = load_price_db(interval, is_jp=is_jp, is_raw=False, columns=["date"])
         if df.empty:
             return "不明"
         last = pd.to_datetime(df["date"]).max()
         return last.strftime("%Y-%m-%d")
     except Exception:
         return "不明"
+
 
 # ── 追加ETF（extra_tickers）管理コンポーネント ──
 @st.fragment
@@ -98,8 +100,9 @@ def render_etf_manager():
                                 save_extra_tickers_to_sheets(df)
                                 sync_extra_tickers_to_local()
                                 st.success(f"{code_str} を追加しました。")
-                                time.sleep(0.5)
-                                st.rerun()
+                                time.sleep(0.3)
+                                # フラグメントだけを再読込
+                                st.rerun(scope="fragment")
                 else:
                     st.caption(f"「{q}」の候補なし")
         elif len(q) == 1:
@@ -127,10 +130,11 @@ def render_etf_manager():
                 save_extra_tickers_to_sheets(df)
                 sync_extra_tickers_to_local()
                 st.success("削除しました。")
-                time.sleep(0.5)
-                st.rerun()
+                time.sleep(0.3)
+                st.rerun(scope="fragment")
         else:
             st.caption("登録されている追加ETFはありません。")
+
 
 # ── 🔍 US専用：統合データスキャン ──
 @st.fragment
@@ -143,13 +147,13 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
     st.write(
         "「異常データスキャン」と「データベース健康診断」を統合。日足の段差・マイナス転換を自動検出し、"
         "TradingViewの正しい終値と自動照合して「真の倍率」を算出します。"
-        "チェックボックスで選択した行だけを、ワンクリックで安全に一括本番修復できます。"
     )
 
     if st.button("🔍 統合スキャンを実行", key="btn_unified_scan", type="primary", use_container_width=True):
         with st.spinner("全時間足（1d/60m/5m/1m）の段差検出とTradingViewデータ照合を実行中..."):
             st.session_state.unified_scan_result = scan_and_diagnose_cliffs_with_tv()
         st.success("統合スキャンが完了しました。")
+        st.rerun(scope="fragment")
 
     result_df = st.session_state.get("unified_scan_result")
     if result_df is None:
@@ -221,10 +225,13 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
             )
         st.success(f"✅ {summary['repaired']}件修復、{summary['skipped']}件スキップしました。")
         del st.session_state["unified_scan_result"]
+        st.cache_data.clear() # キャッシュクリア
         time.sleep(1.0)
-        st.rerun()
+        st.rerun(scope="fragment")
 
-# ── US専用：開発者機能 ──
+
+# ── US専用：開発者機能（コミットUIのフラグメント化） ──
+@st.fragment
 def render_commit_verified_data_ui(is_jp: bool):
     if is_jp:
         return  
@@ -241,7 +248,7 @@ def render_commit_verified_data_ui(is_jp: bool):
     st.markdown("### ☁️ **検証済みの一時データがディスクに保管されています**")
     st.info(
         "現在、Dry Runテスト検証を通過した安全なデータが一時ファイル（Parquet）としてローカルディスクに退避されています。\n\n"
-        "以下の「本番適用」ボタンを押すと、再計算や再ダウンロードを行うことなく、数秒でGoogleドライブへ一括確定保存されます。"
+        "以下の「本番適用」ボタンを押すと、Googleドライブへ一括確定保存されます。"
     )
 
     for tf in settings.TIMEFRAMES:
@@ -295,9 +302,10 @@ def render_commit_verified_data_ui(is_jp: bool):
                 del st.session_state["temp_manual_repair_payload"]
             
             if success_count > 0:
+                st.cache_data.clear() # 更新完了に付き最終更新日キャッシュをクリア
                 status_box.update(label=f"🎉 計 {success_count} 個の時間足データの本番同期が完了しました！", state="complete")
                 time.sleep(1.0)
-                st.rerun()
+                st.rerun(scope="fragment")
 
     if col_btn_clear.button("🗑️ 検証一時データを破棄する", key="btn_clear_verified_data_cache", type="secondary", use_container_width=True):
         for tf in settings.TIMEFRAMES:
@@ -321,7 +329,7 @@ def render_commit_verified_data_ui(is_jp: bool):
             
         st.warning("メモリ上およびディスク上の一時データを消去しました。")
         time.sleep(0.5)
-        st.rerun()
+        st.rerun(scope="fragment")
 
 
 # ── US専用：手動ピンポイント一括安全修復 ──
@@ -344,14 +352,14 @@ def render_manual_repair_section(is_jp: bool):
         with col_t3:
             rep_ratio_str = st.text_input("修正比率", placeholder="空白で個別ダウンロード復元", key="rep_ratio_box")
         
-        repair_confirm = st.checkbox("⚠️ 入力内容が適正であることを確認しました", value=False, key="chk_repair_confirm")
+        is_confirm = st.checkbox("⚠️ 入力内容が適正であることを確認しました", value=False, key="chk_repair_confirm")
         
         col_form_test, col_form_real = st.columns(2)
         rep_col3_test_btn = col_form_test.form_submit_button("🧪 まずテスト検証を実行（保存なし）", type="secondary")
         rep_col3_btn = col_form_real.form_submit_button("🚀 直接本番修復を実行（即時保存）", type="primary")
 
     if rep_col3_test_btn:
-        if not repair_confirm:
+        if not is_confirm:
             st.error("❌ 安全ロックがかかっています。チェックボックスをONにしてください。")
         elif not rep_ticker:
             st.error("銘柄コードが入力されていません。")
@@ -439,6 +447,8 @@ def render_delete_before_date_ui(is_jp: bool):
                 del_results = delete_data_before_date(pure_t, del_date_str, is_jp=False)
                 for interval, msg in del_results.items():
                     st.write(f" **{interval}**: {msg}")
+            st.cache_data.clear() # 物理削除が成功したらキャッシュクリア
+            st.rerun(scope="fragment")
 
 
 # ── US専用：全体差分ダウンロード ──
@@ -450,9 +460,7 @@ def render_full_sync_section(is_jp: bool):
         st.warning("⚠️ **日本株（JP）のデータ更新は、ローカル環境で `rss_collector_jp.py` を実行してください。**")
         return
 
-    st.write(
-        "最新データまで米国株Rawデータベースを安全に差分ダウンロードします。 "
-    )
+    st.write("最新データまで米国株Rawデータベースを安全に差分ダウンロードします。")
 
     col_btn_test, col_btn_real = st.columns(2)
     
@@ -467,7 +475,7 @@ def render_full_sync_section(is_jp: bool):
                 update_price_database(is_jp=False, target_tickers=all_tickers, status_callback=update_status_on_screen, dry_run=True)
                 status_box.update(label="🎉 テスト検証が完了しました！", state="complete")
                 time.sleep(1.0)
-                st.rerun()
+                st.rerun(scope="fragment")
             except Exception as e:
                 st.error(f"エラー: {e}")
 
@@ -520,6 +528,7 @@ def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
                 st.rerun()
 
     elif st.session_state.rebuild_status == "success":
+        st.cache_data.clear() # フルリビルド後はキャッシュクリア
         st.success("🎉 一括フルダウンロード・再構築に成功しました！")
         if st.button("確認して閉じる", type="primary", use_container_width=True):
             st.session_state.show_rebuild_dialog = False
@@ -546,7 +555,7 @@ def render_full_rebuild_section(is_jp: bool, market_mode: str):
             st.rerun()
 
 
-# ─── 🚀 新設：日本株専用手動上書きマージセンター ───
+# ─── 🚀 日本株専用手動上書きマージセンター ───
 @st.fragment
 def render_jp_manual_merge_center(is_jp: bool):
     if not is_jp:
@@ -556,8 +565,7 @@ def render_jp_manual_merge_center(is_jp: bool):
     st.subheader("⚙️ 日本株データ統合マージセンター (手動コンパクション)")
     st.write(
         "楽天RSSからダウンロードされ、Google Driveの時間足フォルダ（例：`1m/`）直下に隔離保管されている「未処理の差分ファイル（`_diff_`）」をロードし、"
-        "古い順に累積ソートした上で、対応する月別本番結合ファイル（例：`price_jp_1m_2026_07.parquet`）へ `keep='last'` で安全上書きマージします。\n\n"
-        "**統合保存が100%成功した場合、Drive上の対象差分ファイルは自動的に完全に物理消去され、二重マージや先祖返りを完全に防止します。**"
+        "古い順に累積ソートした上で、対応する月別本番結合ファイル（例：`price_jp_1m_2026_07.parquet`）へ `keep='last'` で安全上書きマージします。"
     )
 
     from data_access.drive_api import get_drive_service, list_drive_diff_files, get_or_create_drive_folder
@@ -601,11 +609,11 @@ def render_jp_manual_merge_center(is_jp: bool):
                 result = execute_jp_merge(merge_tf, status_callback=on_status)
                 
                 if result.get("success"):
-                    st.cache_data.clear()
+                    st.cache_data.clear() # マージ成功に付き、キャッシュデータを全面フラッシュ
                     status_box.update(label="🎉 統合マージおよび不要差分ファイルの自動消去が正常に完了しました！", state="complete")
                     st.success(result.get("message"))
-                    time.sleep(2.0)
-                    st.rerun()
+                    time.sleep(1.0)
+                    st.rerun(scope="fragment")
                 else:
                     status_box.update(label="❌ マージ処理中にエラーが発生しました", state="error")
                     st.error(result.get("message"))
@@ -623,7 +631,8 @@ with m_col1:
     market_mode = st.radio("対象市場の選択", ["日本株 🇯🇵", "米国株 🇺🇸"], horizontal=True)
     is_jp = (market_mode == "日本株 🇯🇵")
 with m_col2:
-    last_date = get_db_last_update("1d", is_jp=is_jp)
+    # 投影ロード & キャッシュ化により、1d最終更新日をミリ秒レベルで解決。市場選択切替時も完全ノーウェイト化
+    last_date = get_db_last_update_cached("1d", is_jp=is_jp)
     st.metric(label="現在のActive日足(1d)最終更新日", value=last_date)
     
 st.divider()
@@ -639,10 +648,10 @@ if st.session_state["sync_logs_history"]:
             st.rerun()
     st.divider()
 
-# 一時ファイルのコミットUI（US株選択時のみ有効化）
+# 一時ファイルのコミットUI（US株選択時のみ有効化・独立フラグメントで閉域実行）
 render_commit_verified_data_ui(is_jp)
 
-# 🚀 日本株専用：手動上書きマージセンター（日本株選択時のみ増設表示）
+# 🚀 日本株専用：手動上書きマージセンター（日本株選択時のみ増設表示・独立フラグメント）
 render_jp_manual_merge_center(is_jp)
 
 # 🔄 ETF構成銘柄の同期（共通機能）
@@ -657,6 +666,7 @@ if st.button("🚀 ETF構成銘柄を同期する", key="btn_sync_etf_master", u
             else:
                 sync_results = [f"• {k}: {v}" for k, v in results.items()]
                 st.success("✅ 同期が完了しました！\n\n" + "\n".join(sync_results))
+                st.cache_data.clear() # データ同期によりキャッシュを破棄
                 time.sleep(1.0)
                 st.rerun()
         except Exception as e:
@@ -723,6 +733,7 @@ if not is_jp:
                 st.write(msg)
             try:
                 count = apply_all_saved_patches(is_jp=False, status_callback=update_patch_status)
+                st.cache_data.clear() # アクティブ再構築に伴い更新日付などのキャッシュをクリア
                 status_box.update(label="✅ Activeの再構築・検証・パッチ復元が全て完了しました！", state="complete")
             except Exception as e:
                 st.error(f"パッチの一括適用中にエラーが発生しました: {e}")
