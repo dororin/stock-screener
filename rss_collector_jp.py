@@ -1,5 +1,3 @@
-# rss_collector_jp.py
-
 import os
 import sys
 import time
@@ -102,6 +100,30 @@ def get_column_letter(col_idx: int) -> str:
     return letter
 
 
+def find_last_row_by_reading(ws, col_idx: int, max_search_row: int) -> int:
+    """指定列のデータをメモリに一括で読み込み、Python側で有効な最下部行を判定します。
+    ExcelのEnd属性に起因するCOMバインディングエラーを安全に回避します。
+    """
+    try:
+        def read_col():
+            return ws.Range(ws.Cells(1, col_idx), ws.Cells(max_search_row, col_idx)).Value
+        vals = execute_com_safely(read_col)
+        if not vals or not isinstance(vals, tuple):
+            return 1
+        
+        # 下から遡って有効な値（Noneや空文字、Excelのエラー値等以外）を探す
+        for r_idx in range(len(vals) - 1, -1, -1):
+            val = vals[r_idx][0]
+            if val is not None:
+                val_str = str(val).strip()
+                # 空文字やExcelセルエラーコード（-214... または #）を除外
+                if val_str != "" and not val_str.startswith("-214") and not val_str.startswith("#"):
+                    return r_idx + 1
+    except Exception:
+        pass
+    return 1
+
+
 def load_all_collection_tickers_from_sheets() -> list:
     print("📡 [1/5] Google Sheetsから日本株収集対象の監視銘柄リストを読み込み中...")
     tickers = set()
@@ -188,13 +210,8 @@ def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: d
         last_row_limit = 1
         
         while time.time() - start_time < 30.0:
-            try:
-                def get_row():
-                    return ws.Cells(ws.Rows.Count, 4).End(-4162).Row # D列日付
-                last_row_limit = execute_com_safely(get_row)
-            except Exception:
-                last_row_limit = 1
-                
+            last_row_limit = find_last_row_by_reading(ws, 4, default_limit + 50)
+            
             if last_row_limit >= 3:
                 try:
                     # 最初の確定データ行に正しい数値が展開されたか確認
@@ -283,7 +300,7 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
     """
     rss_code = RSS_INTERVAL_MAP[interval]
     batch_size = 50
-    timeout = 30.0 
+    timeout = 120.0  # 通信ラグ対策としてタイムアウトを120秒（2分）に延長
     
     log_func(f"📡 [RSS] 【{interval}】のデータ取得を開始します... (要求バー数: {limit_bars}本 / バッチサイズ: {batch_size})")
 
@@ -341,13 +358,14 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
                 all_loaded = True
                 elapsed = time.time() - start_time
 
-                # 代表日付列の最終行判定
-                def get_last_row():
-                    return ws.Cells(ws.Rows.Count, 4).End(-4162).Row
-                last_row_limit = execute_com_safely(get_last_row)
+                # 代表日付列（D列：4列目）の最終行判定
+                last_row_limit = find_last_row_by_reading(ws, 4, limit_bars + 50)
+
+                unloaded_tickers = []
 
                 if last_row_limit < 3:
                     all_loaded = False
+                    unloaded_tickers = list(chunk)
                 else:
                     # バッチ内の全領域を1回で一括取得
                     def get_range_values():
@@ -356,6 +374,7 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
 
                     if not all_matrix or not isinstance(all_matrix, tuple):
                         all_loaded = False
+                        unloaded_tickers = list(chunk)
                     else:
                         # メモリ上の2次元タプルを走査して数値検証
                         for i, ticker in enumerate(chunk):
@@ -379,14 +398,22 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
 
                             if val_open is None or val_close is None:
                                 all_loaded = False
-                                break
+                                unloaded_tickers.append(ticker)
                         
                 if all_loaded:
                     log_func(f"    🎉 [完了] バッチ {batch_num} 内の全銘柄のロード完了が確認されました。")
                     break
+                
+                # 診断用：ロードが完了していない特定の銘柄リストを出力
+                if unloaded_tickers:
+                    log_func(f"      ⏳ ロード未完了（待機中）: 残り {len(unloaded_tickers)} / {len(chunk)} 銘柄 {unloaded_tickers[:10]}...")
+
                 if elapsed > timeout:
                     # タイムアウトした場合は一括ロールバックのため例外をスロー
-                    raise TimeoutError(f"バッチ {batch_num} のデータ展開が制限時間（{timeout}秒）内に完了しませんでした。")
+                    raise TimeoutError(
+                        f"バッチ {batch_num} のデータ展開が制限時間（{timeout}秒）内に完了しませんでした。\n"
+                        f"未展開またはエラーの可能性がある銘柄リスト: {unloaded_tickers}"
+                    )
                     
                 time.sleep(5.0)
 
@@ -395,9 +422,8 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
             for i, ticker in enumerate(chunk):
                 col_idx = i * col_step + 1
                 
-                def get_ticker_last_row():
-                    return ws.Cells(ws.Rows.Count, col_idx + 3).End(-4162).Row # 日付列
-                last_row = execute_com_safely(get_ticker_last_row)
+                # 各ティッカーの日付列（col_idx + 3）の最終行判定
+                last_row = find_last_row_by_reading(ws, col_idx + 3, limit_bars + 50)
                 
                 if last_row < 2:
                     continue

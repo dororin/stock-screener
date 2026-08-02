@@ -4,6 +4,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 import re
+import calendar
 
 from config import settings
 from data_access.local_db import load_price_db, save_price_db, execute_jp_merge
@@ -618,6 +619,116 @@ def render_jp_manual_merge_center(is_jp: bool):
                     status_box.update(label="❌ マージ処理中にエラーが発生しました", state="error")
                     st.error(result.get("message"))
 
+@st.fragment
+def render_parquet_data_inspector(is_jp: bool):
+    """
+    指定された条件（時間足・特定年月・特定銘柄）に基づいて、
+    Parquetデータベースからピンポイントにデータをロードして軽量表示します。
+    """
+    st.divider()
+    st.subheader("📊 データベース生データ確認（ピンポイント表示）")
+    st.write(
+        "Parquetファイルを直接ロードして、特定銘柄・特定期間の格納データをそのままグリッド表示します。\n"
+        "銘柄と期間を1つに絞り込むことで、メモリやブラウザへの負荷をかけずに瞬時に確認できます。"
+    )
+
+    # 1. 時間足の選択
+    inspect_interval = st.selectbox(
+        "時間足を選択", 
+        ["1d", "60m", "5m", "1m"], 
+        index=0, 
+        key="inspect_interval_select"
+    )
+
+    # 2. 対象年・月の選択（5m / 1m の場合のみ年月プルダウンを表示）
+    inspect_ym = None
+    if inspect_interval in ["5m", "1m"]:
+        # 現在日時から過去3年分までの年月リスト（YYYY_MM）を動的に生成
+        now_dt = datetime.now()
+        ym_options = []
+        for year in range(now_dt.year, now_dt.year - 3, -1):
+            # 現在年なら現在月まで、過去年なら12月まで
+            max_month = now_dt.month if year == now_dt.year else 12
+            for month in range(max_month, 0, -1):
+                ym_options.append(f"{year:04d}_{month:02d}")
+        
+        inspect_ym = st.selectbox(
+            "対象年・月を選択（Parquetファイル特定用）", 
+            ym_options, 
+            index=0, 
+            key="inspect_ym_select"
+        )
+
+    # 3. 銘柄コードの入力
+    inspect_ticker_raw = st.text_input(
+        "銘柄コードを入力（1件指定）", 
+        placeholder="例: 7203 や AAPL", 
+        key="inspect_ticker_input"
+    ).strip()
+
+    # 4. 「データを表示」ボタン
+    is_ready = bool(inspect_ticker_raw)
+    btn_label = "🔍 データをロードして表示" if is_ready else "⚠️ 銘柄コードを入力してください"
+    
+    if st.button(btn_label, key="btn_execute_parquet_inspect", type="primary", disabled=not is_ready):
+        # 銘柄コードの整形（大文字化・日本株用の末尾削除など）
+        target_ticker = sanitize_ticker(inspect_ticker_raw, is_jp=is_jp)
+        
+        # フィルタポリシーの構築
+        filters = [("ticker", "==", target_ticker)]
+        
+        # 分足の場合は、filtersに日付の上下限を追加して対象年月ファイル以外をスキップ
+        if inspect_interval in ["5m", "1m"] and inspect_ym:
+            try:
+                y_str, m_str = inspect_ym.split("_")
+                year_val = int(y_str)
+                month_val = int(m_str)
+                _, last_day = calendar.monthrange(year_val, month_val)
+                
+                # 年月の初日と最終日を定義
+                start_date_str = f"{year_val:04d}-{month_val:02d}-01 00:00:00"
+                end_date_str = f"{year_val:04d}-{month_val:02d}-{last_day:02d} 23:59:59"
+                
+                filters.append(("date", ">=", start_date_str))
+                filters.append(("date", "<=", end_date_str))
+            except Exception as e:
+                st.error(f"年月範囲の解釈に失敗しました: {e}")
+                return
+
+        with st.spinner(f"📥 Parquetから [{target_ticker}] のデータを検索中..."):
+            try:
+                # 必要最小限の列のみを投影ロード
+                target_cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
+                if not is_jp:
+                    target_cols.extend(["adj close", "stock splits"])
+
+                df_result = load_price_db(
+                    interval=inspect_interval,
+                    is_jp=is_jp,
+                    is_raw=False, # Activeデータベースを参照
+                    columns=target_cols,
+                    filters=filters
+                )
+
+                if df_result.empty:
+                    st.warning("⚠️ 指定された条件に合致するデータはデータベース内に見つかりませんでした。")
+                else:
+                    # 時系列順にソートしてインデックスを整理
+                    if "date" in df_result.columns:
+                        df_result = df_result.sort_values("date").reset_index(drop=True)
+                        # 表示の視認性を高めるため日付フォーマットを整形
+                        df_result["date"] = pd.to_datetime(df_result["date"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+
+                    st.success(f"✅ ロード完了（取得件数: {len(df_result):,} 件）")
+                    
+                    # データをStreamlitのグリッドで表示
+                    st.dataframe(
+                        df_result, 
+                        use_container_width=True, 
+                        hide_index=True
+                    )
+            except Exception as ex:
+                st.error(f"❌ データのロード中に例外が発生しました: {ex}")
 
 # =====================================================================
 # 🛠️ メイン画面描画
@@ -749,3 +860,6 @@ if not is_jp:
 
 if st.session_state.get("show_rebuild_dialog"):
     run_full_rebuild_dialog(rebuild_interval, is_jp=False, market_mode=market_mode)
+
+# 5. データベース生データ確認（新規実装コンポーネント）
+render_parquet_data_inspector(is_jp)
