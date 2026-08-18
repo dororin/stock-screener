@@ -315,7 +315,7 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                                 "local_path": local_base_path
                             }
                         except Exception as e_read:
-                            # 【バグ修正】既存データの破損時は空でフォールバックせず安全にエラー中断させる
+                            # 既存データの破損時は空でフォールバックせず安全にエラー中断させる
                             log(f"  ❌ [{base_filename}] のロードに失敗しました (破損・I/Oエラー)。過去データを保護するため処理を安全に中断します: {e_read}")
                             error_occurred = True
                             err_msg = f"既存本番データの読み込み失敗: {base_filename}"
@@ -359,7 +359,7 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                 os.remove(local_temp_path)
             break
 
-    # 5. 【新設：保存前のインメモリ健全性アサーションスキャン】
+    # 5. 【保存前のインメモリ健全性アサーションスキャン】
     if not error_occurred and loaded_bases:
         log("🔍 クラウド保存前のインメモリデータ健全性スキャンを実行します...")
         for g_key, b_info in loaded_bases.items():
@@ -405,15 +405,42 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                 err_msg = f"{f_name} に 0 以下の異常価格が含まれています。"
                 break
 
-            # ⑤ 時系列の極端なギャップ検知（日足の場合のみ、10日以上の不自然なデータ空白を警告）
-            if interval == "1d" and not final_df.empty:
+            # ⑤ 時系列の極端なギャップ検知（全時間足共通で、10日以上の不自然なデータ空白を特定）
+            if not final_df.empty:
                 try:
-                    final_df_sorted = final_df.sort_values(["ticker", "date"])
-                    max_gap = final_df_sorted.groupby("ticker")["date"].diff().max()
-                    if pd.notna(max_gap) and max_gap.days > 10:
-                        log(f"  ⚠️ [健全性警告] [{f_name}] 銘柄内の最大時間ギャップが {max_gap.days} 日に達しています。連休閉場を超えた大きなデータ抜けの可能性があります。")
-                except Exception:
-                    pass
+                    final_df_sorted = final_df.sort_values(["ticker", "date"]).copy()
+                    final_df_sorted["diff_days"] = final_df_sorted.groupby("ticker")["date"].diff().dt.total_seconds() / 86400.0
+                    gap_rows = final_df_sorted[final_df_sorted["diff_days"] > 10]
+                    if not gap_rows.empty:
+                        log(f"  ⚠️ [健全性警告] [{f_name}] にデータ空白（10日超のギャップ）を検出しました:")
+                        shown_count = 0
+                        for idx_label, row in gap_rows.iterrows():
+                            if shown_count >= 15:
+                                log(f"    • （他 {len(gap_rows) - 15} 件のギャップは省略します）")
+                                break
+                            tk = row["ticker"]
+                            gap_days = row["diff_days"]
+                            end_date = row["date"].strftime("%Y-%m-%d %H:%M:%S")
+                            
+                            # 正確にそのティッカーの直前の日付を取得
+                            ticker_indices = final_df_sorted[final_df_sorted["ticker"] == tk].index.tolist()
+                            try:
+                                curr_pos = ticker_indices.index(idx_label)
+                                if curr_pos > 0:
+                                    prev_idx = ticker_indices[curr_pos - 1]
+                                    prev_row = final_df_sorted.loc[prev_idx]
+                                    start_date = prev_row["date"].strftime("%Y-%m-%d %H:%M:%S")
+                                else:
+                                    start_date = "不明"
+                            except ValueError:
+                                start_date = "不明"
+                                
+                            log(f"    • 銘柄: {tk} | 期間: {start_date} 〜 {end_date} ({gap_days:.1f}日間データなし)")
+                            shown_count += 1
+                    else:
+                        log(f"  ✅ [{f_name}] 時系列に不自然なデータ空白（10日超）はありません。")
+                except Exception as e_gap:
+                    log(f"  ⚠️ [ギャップ検知処理エラー]: {e_gap}")
 
     # 6. エラーなく全健全性検証を通過した場合のみ、確定保存（アップロード）
     if not error_occurred and loaded_bases:
@@ -459,7 +486,7 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
         except Exception:
             pass
             
-        return {"success": True, "message": f"計 {len(processed_file_ids)} 件の差分健全マージと自動消去が正常に完了しました。"}
+        return {"success": True, "message": f"計 {len(processed_file_ids)} 件 of 差分健全マージと自動消去が正常に完了しました。"}
 
     return {"success": False, "message": err_msg if err_msg else "マージ処理を安全に中断・ロールバックしました。"}
 

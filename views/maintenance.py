@@ -558,7 +558,7 @@ def render_full_rebuild_section(is_jp: bool, market_mode: str):
             st.rerun()
 
 
-# ─── 🚀 日本株専用手動上書きマージセンター ───
+# ─── 🚀 日本株専用手動上書きマージセンター（状態維持＆ログの永続表示化） ───
 @st.fragment
 def render_jp_manual_merge_center(is_jp: bool):
     if not is_jp:
@@ -599,27 +599,74 @@ def render_jp_manual_merge_center(is_jp: bool):
     
     merge_tf = st.selectbox("マージを強制実行する時間足を選択", ["1d", "60m", "5m", "1m"], index=0, key="jp_merge_tf_select")
 
+    # ログ状態管理用のセッションキー初期化
+    if "jp_merge_logs_list" not in st.session_state:
+        st.session_state["jp_merge_logs_list"] = []
+    if "jp_merge_running" not in st.session_state:
+        st.session_state["jp_merge_running"] = False
+    if "jp_merge_finished" not in st.session_state:
+        st.session_state["jp_merge_finished"] = False
+    if "jp_merge_result_msg" not in st.session_state:
+        st.session_state["jp_merge_result_msg"] = None
+    if "jp_merge_success" not in st.session_state:
+        st.session_state["jp_merge_success"] = False
+
     col_m1, col_m2 = st.columns([2, 1])
     with col_m1:
         st.caption(f"※実行ボタンを押すと、Google Drive上の【{merge_tf}】時間足フォルダ直下の差分を一括統合マージします。")
     with col_m2:
-        if st.button("🚀 マージを実行する", key="btn_execute_jp_manual_merge", type="primary", use_container_width=True):
-            status_box = st.status(f"🔄 【{merge_tf}】の上書き累積マージ処理を実行中...", expanded=True)
-            with status_box:
-                def on_status(msg):
-                    st.write(msg)
-                    
-                result = execute_jp_merge(merge_tf, status_callback=on_status)
+        # 実行中は重複起動できないようロック
+        btn_disabled = st.session_state["jp_merge_running"]
+        if st.button("🚀 マージを実行する", key="btn_execute_jp_manual_merge", type="primary", use_container_width=True, disabled=btn_disabled):
+            st.session_state["jp_merge_logs_list"] = []
+            st.session_state["jp_merge_running"] = True
+            st.session_state["jp_merge_finished"] = False
+            st.session_state["jp_merge_result_msg"] = None
+            st.session_state["jp_merge_success"] = False
+            st.rerun(scope="fragment")
+
+    # マージ実処理中のスピナー & コールバック
+    if st.session_state["jp_merge_running"] and not st.session_state["jp_merge_finished"]:
+        status_box = st.status(f"🔄 【{merge_tf}】の上書き累積マージ処理を実行中...", expanded=True)
+        with status_box:
+            def on_status(msg):
+                st.session_state["jp_merge_logs_list"].append(msg)
+                st.write(msg)
                 
-                if result.get("success"):
-                    st.cache_data.clear() # マージ成功に付き、キャッシュデータを全面フラッシュ
-                    status_box.update(label="🎉 統合マージおよび不要差分ファイルの自動消去が正常に完了しました！", state="complete")
-                    st.success(result.get("message"))
-                    time.sleep(1.0)
-                    st.rerun(scope="fragment")
-                else:
-                    status_box.update(label="❌ マージ処理中にエラーが発生しました", state="error")
-                    st.error(result.get("message"))
+            result = execute_jp_merge(merge_tf, status_callback=on_status)
+            
+            st.session_state["jp_merge_finished"] = True
+            st.session_state["jp_merge_running"] = False
+            
+            if result.get("success"):
+                st.cache_data.clear() # マージ成功に付き、キャッシュデータを全面フラッシュ
+                status_box.update(label="🎉 統合マージおよび不要差分ファイルの自動消去が正常に完了しました！", state="complete")
+                st.session_state["jp_merge_success"] = True
+                st.session_state["jp_merge_result_msg"] = result.get("message")
+            else:
+                status_box.update(label="❌ マージ処理中にエラーが発生しました", state="error")
+                st.session_state["jp_merge_success"] = False
+                st.session_state["jp_merge_result_msg"] = result.get("message")
+            
+            st.rerun(scope="fragment")
+
+    # 完了後の表示（ログが自動で閉じられるのを防ぐ）
+    if st.session_state["jp_merge_finished"]:
+        if st.session_state["jp_merge_success"]:
+            st.success(f"🎉 成功: {st.session_state['jp_merge_result_msg']}")
+        else:
+            st.error(f"❌ 失敗: {st.session_state['jp_merge_result_msg']}")
+
+        # 溜まったログ一覧を閉じるまで常時表示
+        with st.expander("📝 実行ログ詳細", expanded=True):
+            st.code("\n".join(st.session_state["jp_merge_logs_list"]), language="text")
+            
+            if st.button("🗑️ ログを閉じてクリアする", key="btn_clear_jp_merge_logs", use_container_width=True):
+                st.session_state["jp_merge_logs_list"] = []
+                st.session_state["jp_merge_finished"] = False
+                st.session_state["jp_merge_result_msg"] = None
+                st.session_state["jp_merge_success"] = False
+                st.rerun(scope="fragment")
 
 
 # ─── 🚀 【新設】日本株専用：統合段差スキャン・一括自動修復 ───
