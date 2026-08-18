@@ -127,6 +127,10 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True, is_raw: b
         df_target = df.copy()
         df_target["date"] = pd.to_datetime(df_target["date"])
         
+        # 累積調整倍率カラム(patched_multiplier)の自動同期・スキーマ防護
+        if "patched_multiplier" not in df_target.columns:
+            df_target["patched_multiplier"] = 1.0
+        
         # 1. ローカル作業ディレクトリに一時Parquet出力
         filename = f"price_jp_{interval}_diff_{timestamp}.parquet"
         local_work_path = os.path.join(settings.WORK_DIR, filename)
@@ -219,7 +223,7 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
 
     if not all_diff_files:
         log("✅ 未処理の差分ファイルは検出されませんでした（最新状態です）。")
-        return {"success": True, "message": "マージ対象の差分ファイルはありません。"}
+        return {"success": True, "message": "マージ対象 of 差分ファイルはありません。"}
 
     # 3. 差分ファイルを「タイムスタンプ（古い順）」にソート
     def extract_timestamp(f_meta):
@@ -264,6 +268,10 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                 
             diff_df["date"] = pd.to_datetime(diff_df["date"]).dt.tz_localize(None)
             
+            # 本番に結合する差分側に patched_multiplier が無ければ初期化
+            if "patched_multiplier" not in diff_df.columns:
+                diff_df["patched_multiplier"] = 1.0
+            
             # 時間足ごとの本番ファイル分割単位の割り出し
             if interval == "1d":
                 diff_df["_group_key"] = "all"
@@ -290,6 +298,10 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                         try:
                             base_df = pd.read_parquet(local_base_path)
                             base_df["date"] = pd.to_datetime(base_df["date"]).dt.tz_localize(None)
+                            
+                            # 本番読み出し側スキーマの補正・同期
+                            if "patched_multiplier" not in base_df.columns:
+                                base_df["patched_multiplier"] = 1.0
                             
                             # 健全性検証用メタデータの退避
                             orig_tickers = set(base_df["ticker"].unique()) if not base_df.empty else set()

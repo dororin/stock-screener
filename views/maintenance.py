@@ -1,3 +1,5 @@
+# maintenance.py
+
 import os
 import time
 from datetime import datetime
@@ -619,6 +621,118 @@ def render_jp_manual_merge_center(is_jp: bool):
                     status_box.update(label="❌ マージ処理中にエラーが発生しました", state="error")
                     st.error(result.get("message"))
 
+
+# ─── 🚀 【新設】日本株専用：統合段差スキャン・一括自動修復 ───
+@st.fragment
+def render_jp_split_scan_and_repair_ui(is_jp: bool):
+    if not is_jp:
+        return
+
+    st.divider()
+    st.subheader("🔍 日本株 統合段差スキャン・修復テーブル（自動スキャン → 一括パッチ適用）")
+    st.write(
+        "本番日足データ(`price_jp_1d.parquet`)とyfinance公式の分割情報を自動照合し、不整合のある銘柄を自動検出します。"
+        "未調整（要パッチ）および事前調整済み（メタデータのみ未反映）の候補を特定し、分足までの全時間足を一括で遡及修正します。"
+    )
+
+    if st.button("🔍 日本株 統合段差スキャンを実行", key="btn_jp_split_scan", type="primary", use_container_width=True):
+        with st.spinner("日本株の株式分割履歴をyfinanceから取得し、1d本番データと照合中..."):
+            from core.jp_price_corrector import scan_jp_anomalies_with_yfinance
+            st.session_state.jp_split_scan_result = scan_jp_anomalies_with_yfinance()
+        st.success("日本株統合スキャンが完了しました。")
+        st.rerun(scope="fragment")
+
+    result_df = st.session_state.get("jp_split_scan_result")
+    if result_df is None:
+        return
+
+    if result_df.empty:
+        st.success("✅ 日本株本番データベース内に、未調整の株式分割不整合（崖）は検出されませんでした。")
+        return
+
+    st.warning(f"⚠️ {len(result_df)}件の不整合を検出しました（{result_df['ticker'].nunique()}銘柄）")
+
+    display_df = result_df.copy()
+    display_df["選択"] = False
+
+    rename_map = {
+        "選択": "選択",
+        "ticker": "銘柄",
+        "interval": "時間足",
+        "cliff_date": "分割実施日(cliff_date)",
+        "splits": "分割比率(splits)",
+        "mode": "調整タイプ(mode)",
+        "multiplier": "調整倍率(multiplier)",
+        "before_close": "前日終値",
+        "after_close": "当日終値"
+    }
+    display_df = display_df.rename(columns=rename_map)
+    ordered_cols = [c for c in rename_map.values() if c in display_df.columns]
+    display_df = display_df[ordered_cols]
+
+    edited_df = st.data_editor(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        disabled=[c for c in ordered_cols if c != "選択"],
+        column_config={
+            "選択": st.column_config.CheckboxColumn("選択"),
+        },
+        key="jp_split_scan_editor",
+    )
+
+    selected_rows = edited_df[edited_df["選択"] == True]
+    st.caption(f"現在 {len(selected_rows)} 件が選択されています。")
+
+    if st.button("🚀 選択した日本株パッチを一括本番適用", key="btn_bulk_apply_jp_selected", type="primary", use_container_width=True, disabled=selected_rows.empty):
+        status_box = st.status("📡 日本株一括修復パッチを実行中...", expanded=True)
+        with status_box:
+            from core.jp_price_corrector import apply_jp_patch_to_all_timeframes
+            from data_access.sheets_api import save_repair_log_to_sheets
+            import time
+
+            repaired_count = 0
+            log_rows = []
+
+            for _, r in selected_rows.iterrows():
+                ticker = r["銘柄"]
+                cliff_date = r["分割実施日(cliff_date)"]
+                multiplier = r["調整倍率(multiplier)"]
+                mode = r["調整タイプ(mode)"]
+
+                st.write(f"🔧 [{ticker}] {cliff_date} 以前のパッチを適用中 ({mode} / 倍率: {multiplier:.6f})...")
+                results = apply_jp_patch_to_all_timeframes(ticker, cliff_date, multiplier, mode, status_callback=None)
+                
+                applied_intervals = [iv for iv, msg in results.items() if "正常に修復" in str(msg)]
+                if applied_intervals:
+                    repaired_count += 1
+                    st.success(f"   ✅ [{ticker}] パッチ適用完了 ({', '.join(applied_intervals)})")
+                    log_rows.append({
+                        "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "ticker": ticker,
+                        "market": "JP",
+                        "cliff_date": cliff_date,
+                        "interval": ",".join(applied_intervals),
+                        "before_close": r["前日終値"],
+                        "after_close": r["当日終値"],
+                        "multiplier": multiplier,
+                        "memo": f"日本株自動分割修復パッチ ({mode})",
+                    })
+                else:
+                    st.warning(f"   ⏭️ [{ticker}] スキップまたはエラーが発生しました。")
+
+            if log_rows:
+                save_repair_log_to_sheets(log_rows)
+                st.write(f"📝 実際に修復された {len(log_rows)} 件のログをスプレッドシートへ記録しました。")
+
+            status_box.update(label=f"🎉 完了：{repaired_count}件の銘柄を一括修復しました。", state="complete")
+            if "jp_split_scan_result" in st.session_state:
+                del st.session_state["jp_split_scan_result"]
+            st.cache_data.clear() # キャッシュクリア
+            time.sleep(1.0)
+            st.rerun(scope="fragment")
+
+
 @st.fragment
 def render_parquet_data_inspector(is_jp: bool):
     """
@@ -764,6 +878,9 @@ render_commit_verified_data_ui(is_jp)
 
 # 🚀 日本株専用：手動上書きマージセンター（日本株選択時のみ増設表示・独立フラグメント）
 render_jp_manual_merge_center(is_jp)
+
+# 🚀 日本株専用：統合段差スキャン・一括自動修復（日本株選択時のみ増設表示・独立フラグメント）
+render_jp_split_scan_and_repair_ui(is_jp)
 
 # 🔄 ETF構成銘柄の同期（共通機能）
 st.subheader("🔄 ETFセクター構成の同期（スプレッドシート連動）")
