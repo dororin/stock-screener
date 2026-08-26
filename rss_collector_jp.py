@@ -159,11 +159,7 @@ def load_all_collection_tickers_from_sheets() -> list:
 
 
 # ─── 🚀 基準銘柄(1306)を用いた実営業日ベースの実測型バー数算出 ───
-def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: dict, excel, wb, log_func) -> int:
-    """
-    台帳の同期履歴と基準銘柄(1306)の配信データを用いて、
-    実際に市場で発生した確定バー数を実測し、無駄のない limit_bars を決定します。
-    """
+def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: dict, tickers: list, excel, wb, log_func) -> int:
     default_limit = DEFAULT_BARS_LIMIT[interval]
     
     # 台帳に過去の同期履歴が全くない（初回ダウンロード時）場合はフォールバック
@@ -173,7 +169,13 @@ def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: d
 
     try:
         valid_dates = []
+        active_tickers = set(tickers)  # 現在のアクティブな銘柄リストをセット化
+        
         for t, d_str in last_updates_map.items():
+            # リストから削除されたゴースト銘柄は無視する
+            if t not in active_tickers:
+                continue
+                
             try:
                 valid_dates.append(pd.to_datetime(d_str))
             except Exception:
@@ -558,9 +560,9 @@ def main():
                 return excel.Workbooks.Add()
             wb = execute_com_safely(create_wb)
 
-            # 3. 基準銘柄(1306)による実測型の動的バー数算出
+            # 3. 基準銘柄(1306)による実測型の動的バー数算出 (tickersを渡してフィルタリングさせる)
             log("📡 基準銘柄(1306)を用いた動的な必要バー数の算出を開始します...")
-            limit_bars = measure_actual_needed_bars_with_benchmark(interval, last_updates_map, excel, wb, log)
+            limit_bars = measure_actual_needed_bars_with_benchmark(interval, last_updates_map, tickers, excel, wb, log)
 
             # 4. 楽天RSSから一括ダウンロード（途中でエラーが出た場合は上位に例外を投げる）
             df_new = collect_data_via_excel_rss(tickers, interval, limit_bars, log, excel, wb)
