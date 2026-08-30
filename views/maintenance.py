@@ -779,7 +779,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             time.sleep(1.0)
             st.rerun(scope="fragment")
 
-
 @st.fragment
 def render_parquet_data_inspector(is_jp: bool):
     """
@@ -882,9 +881,20 @@ def render_parquet_data_inspector(is_jp: bool):
 
                     st.success(f"✅ ロード完了（取得件数: {len(df_result):,} 件）")
                     
-                    # データをStreamlitのグリッドで表示
+                    # 💡 Streamlitの送信容量制限(MessageSizeError)およびブラウザクラッシュを回避するセーフガード
+                    MAX_DISPLAY_ROWS = 2000
+                    if len(df_result) > MAX_DISPLAY_ROWS:
+                        st.warning(
+                            f"⚠️ 該当期間のデータ（{len(df_result):,}件）が極めて多いため、ブラウザの描画クラッシュ防止用に"
+                            f"最新の {MAX_DISPLAY_ROWS:,} 件のみを表示しています。"
+                        )
+                        df_display = df_result.tail(MAX_DISPLAY_ROWS)
+                    else:
+                        df_display = df_result
+
+                    # データをStreamlitのグリッドで安全に表示
                     st.dataframe(
-                        df_result, 
+                        df_display, 
                         use_container_width=True, 
                         hide_index=True
                     )

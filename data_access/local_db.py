@@ -496,6 +496,22 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
     1m, 5m, 60m, 1d 等の本番統合Parquetファイルを投影ロード（columns）および
     フィルタリングロード（filters）でピンポイント取得します。
     """
+    # ── [安全対策] フィルタがPyArrowレベルで失敗した際、Pandas側でエミュレート適用するヘルパー ──
+    def _apply_pandas_filters_safe(df_target: pd.DataFrame) -> pd.DataFrame:
+        if df_target.empty or not filters:
+            return df_target
+        for f in filters:
+            if isinstance(f, (tuple, list)) and len(f) == 3:
+                col, op, val = f
+                if col in df_target.columns:
+                    if op == "==":
+                        df_target = df_target[df_target[col] == val]
+                    elif op == ">=":
+                        df_target = df_target[df_target[col] >= val]
+                    elif op == "<=":
+                        df_target = df_target[df_target[col] <= val]
+        return df_target
+
     # filtersからlimit_start_dateを解析して古いファイルの処理をスキップ
     min_date_limit = None
     if filters:
@@ -547,10 +563,11 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
                 
             if os.path.exists(local_path):
                 try:
-                    df = pd.read_parquet(local_path, columns=columns, filters=filters)
+                    df = pd.read_parquet(local_path, columns=columns, filters=filters, engine='pyarrow')
                 except Exception:
                     try:
-                        df = pd.read_parquet(local_path, columns=columns)
+                        df = pd.read_parquet(local_path, columns=columns, engine='pyarrow')
+                        df = _apply_pandas_filters_safe(df)  # 確実なフィルタ適用
                     except Exception:
                         df = pd.DataFrame()
                 if not df.empty:
@@ -610,10 +627,11 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
                         if file_year < min_date_limit.year:
                             continue
             try:
-                df = pd.read_parquet(filepath, columns=columns, filters=filters)
+                df = pd.read_parquet(filepath, columns=columns, filters=filters, engine='pyarrow')
             except Exception:
                 try:
-                    df = pd.read_parquet(filepath, columns=columns)
+                    df = pd.read_parquet(filepath, columns=columns, engine='pyarrow')
+                    df = _apply_pandas_filters_safe(df)  # 確実なフィルタ適用
                 except Exception:
                     df = pd.DataFrame()
             if not df.empty:
@@ -632,10 +650,11 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
     work_file = os.path.join(settings.WORK_DIR, filename)
     if os.path.exists(work_file):
         try:
-            df = pd.read_parquet(work_file, columns=columns, filters=filters)
+            df = pd.read_parquet(work_file, columns=columns, filters=filters, engine='pyarrow')
         except Exception:
             try:
-                df = pd.read_parquet(work_file, columns=columns)
+                df = pd.read_parquet(work_file, columns=columns, engine='pyarrow')
+                df = _apply_pandas_filters_safe(df)  # 確実なフィルタ適用
             except Exception:
                 df = pd.DataFrame()
         if "date" in df.columns:
@@ -644,7 +663,6 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
                 df = df[df["date"] >= min_date_limit]
         return df
     return pd.DataFrame()
-
 
 # =====================================================================
 # ⚡ レイヤー1：材料（ロード）キャッシュ設計
