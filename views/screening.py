@@ -1,3 +1,5 @@
+# ──── screening.py のコード全体を以下に差し替え ────
+
 import io
 import pandas as pd
 import streamlit as st
@@ -28,6 +30,8 @@ if 'result_df' not in st.session_state:
     st.session_state.result_df = pd.DataFrame()
 if 'performed_scan' not in st.session_state:
     st.session_state.performed_scan = False
+if 'screening_logs' not in st.session_state:
+    st.session_state.screening_logs = []  # 永続詳細ログ格納用
 
 
 st.title("WVF + Trend Screener :blue[Pro]")
@@ -67,11 +71,13 @@ def render_screener_controls_panel():
                     with st.spinner("データベースから対象データを抽出・判定中..."):
                         db_df = load_unified_db("1d", is_jp=True)
                         if not db_df.empty:
-                            st.session_state.result_df = run_fast_screening(db_df)
+                            # 判定開始時にログを初期化して蓄積
+                            temp_logs = []
+                            st.session_state.result_df = run_fast_screening(db_df, log_accumulator=temp_logs)
+                            st.session_state.screening_logs = temp_logs
                             st.session_state.performed_scan = True
                             st.session_state.last_id = None
                             st.success("スキャンが正常に完了しました。")
-                            # 新規判定結果を描画領域に即時反映させるため1回リラン
                             st.rerun()
                         else:
                             st.error("データベース（price_jp_1d.parquet）が検出されませんでした。")
@@ -107,11 +113,10 @@ def render_screened_stock_card(index_num: int, unique_key: str):
         c1, c2 = st.columns([0.85, 0.15])
         c1.subheader(f"[{r['コード']}](https://jp.tradingview.com/chart/?symbol=TSE%3A{r['コード']}) {r['銘柄']}")
         
-        # お気に入りトグル (セッションステート内のデータと安全に直結)
+        # お気に入りトグル
         is_fav = bool(rdf.at[index_num, 'お気に入り'])
         new_fav = c2.toggle("⭐", value=is_fav, key=f"f_toggle_{r['コード']}_{unique_key}", label_visibility="collapsed")
         
-        # 局所的に状態を書き換え (再起動を一切伴わずオンメモリで確定)
         if new_fav != is_fav:
             st.session_state.result_df.at[index_num, 'お気に入り'] = new_fav
 
@@ -158,6 +163,21 @@ def render_screened_stock_card(index_num: int, unique_key: str):
 # 1. 操作コントロールパネルフラグメントを実行
 render_screener_controls_panel()
 
+# ─── 🚀 【新規追加】実行後に勝手に消えない永続的な詳細ログコンソール ───
+if st.session_state.screening_logs:
+    st.write(" ")
+    with st.expander("📋 WVF+Trend スクリーニング詳細実行ログ・コンソール", expanded=True):
+        st.markdown(
+            "システム内部で計算された全500銘柄のWVF値、アッパーバンド、トレンド判定の途中結果と、"
+            "合致・スキップされた詳細な理由がすべて記録されています。特定のコード（例: `4631`）でブラウザ検索（Ctrl + F）してデバッグできます。"
+        )
+        # テキストエリアではなくst.codeにより、スクロール可能な形で表示
+        st.code("\n".join(st.session_state.screening_logs), language="text")
+        
+        if st.button("🗑️ ログ表示履歴をクリア", key="btn_clear_screening_logs_history", use_container_width=True):
+            st.session_state.screening_logs = []
+            st.rerun()
+
 st.write("---")
 
 # 2. スクリーニング結果表示
@@ -165,16 +185,14 @@ if not st.session_state.result_df.empty:
     rdf = st.session_state.result_df
     st.info(f"🔍 判定結果: {len(rdf)} 件検出されました。")
     
-    # 2列グリッド形式でループ描画します
     for i in range(0, len(rdf), 2):
         cols = st.columns(2)
         for j in range(2):
             if i + j < len(rdf):
                 with cols[j]:
-                    # フラグメント関数の呼び出し
                     render_screened_stock_card(index_num=i+j, unique_key=f"grid_{i}_{j}")
 else:
     if st.session_state.performed_scan:
-        st.warning("⚠️ スキャンの結果、条件に一致する銘柄は見つかりませんでした。")
+        st.warning("⚠️ スキャンの結果、条件に一致する銘柄は見つかりませんでした。上記の詳細実行ログを確認してください。")
     else:
         st.info("💡 上記パネルの「🚀 判定開始 (TOPIX500)」ボタンを押してください。データベースから超高速判定を行います。")

@@ -639,3 +639,9 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     ws_out.update(output_values, "A1")
     
     return sync_results
+
+# ─── 🔌 互換性維持用のグローバル接続オブジェクト (gspread クライアント) ───
+try:
+    conn = get_gspread_client()
+except Exception:
+    conn = None

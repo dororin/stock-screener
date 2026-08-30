@@ -48,9 +48,15 @@ def get_jpx_full_list() -> pd.DataFrame:
         df['symbol'] = df['symbol'].astype(str)
         return df
 
-def run_fast_screening(db_df: pd.DataFrame) -> pd.DataFrame:
+def run_fast_screening(db_df: pd.DataFrame, log_accumulator: list = None) -> pd.DataFrame:
     """WVF（Williams Variable Accumulation）点灯＆200SMA上向き／上乗せ条件で高速スキャンを実行します。"""
+    def log(msg):
+        if log_accumulator is not None:
+            log_accumulator.append(msg)
+        print(f"[SCREENER] {msg}")
+
     if db_df.empty:
+        log("❌ データベースが空のため、判定処理を中止します。")
         return pd.DataFrame()
     
     jpx_list = get_jpx_list()
@@ -64,6 +70,8 @@ def run_fast_screening(db_df: pd.DataFrame) -> pd.DataFrame:
     status_text = st.empty()
     total = len(tickers)
     
+    log(f"🔎 判定プロセスを開始します。総判定対象: {total} 銘柄")
+    
     for idx, ticker in enumerate(tickers):
         if idx % 20 == 0:
             progress_bar.progress((idx + 1) / total)
@@ -71,7 +79,10 @@ def run_fast_screening(db_df: pd.DataFrame) -> pd.DataFrame:
             
         try:
             df = db_df[db_df['ticker'] == ticker].copy()
+            
+            # 【検証】データ件数のチェック
             if len(df) < 220:
+                log(f"⏭️ [{ticker}] スキップ：時系列データが不足しています（実績: {len(df)} 件 / 最小必要数: 220 件）")
                 continue
             
             df['sma50'] = df['close'].rolling(window=50).mean()
@@ -91,6 +102,13 @@ def run_fast_screening(db_df: pd.DataFrame) -> pd.DataFrame:
             is_uptrend = (latest['close'] > latest['sma200']) or (slope_rate >= -0.0001)
             is_wvf_lit = latest['wvf'] >= latest['wvf_upper'] or latest['wvf'] >= latest['range_high']
             
+            # 各銘柄の直近判定パラメータをテキスト化
+            param_details = (
+                f"Close={latest['close']:.1f}, SMA200={latest['sma200']:.1f}, "
+                f"WVF={latest['wvf']:.2f}%, Upper={latest['wvf_upper']:.2f}%, RangeHigh={latest['range_high']:.2f}%, "
+                f"SlopeRate={slope_rate:.6f}"
+            )
+            
             if is_uptrend and is_wvf_lit and latest['wvf'] >= 5.0:
                 ext_price = min(max(latest['highest_close'] * (1 - latest['wvf_upper'] / 100), latest['highest_close'] * (1 - latest['range_high'] / 100)), latest['highest_close'] * (1 - 5.0 / 100))
                 results.append({
@@ -107,9 +125,25 @@ def run_fast_screening(db_df: pd.DataFrame) -> pd.DataFrame:
                     'WVF Upper': round(latest['wvf_upper'], 2),
                     'お気に入り': False
                 })
-        except Exception:
+                log(f"✅ [{ticker}] {name_map.get(ticker, '-')} ➔ 点灯！条件クリア ({param_details})")
+            else:
+                # なぜ引っかからなかったのか不一致の理由をログに出力
+                reasons = []
+                if not is_uptrend:
+                    reasons.append(f"トレンド条件未達 (Close {latest['close']:.1f} <= SMA200 {latest['sma200']:.1f} かつ 200MA傾き率 {slope_rate:.6f} < -0.0001)")
+                if not is_wvf_lit:
+                    reasons.append(f"WVF未点灯 (WVF {latest['wvf']:.2f}% が Upper {latest['wvf_upper']:.2f}% および RangeHigh {latest['range_high']:.2f}% をともに下回る)")
+                if latest['wvf'] < 5.0:
+                    reasons.append(f"WVF値が5.0%未満 (WVF: {latest['wvf']:.2f}%)")
+                
+                log(f"⏭️ [{ticker}] {name_map.get(ticker, '-')} ➔ スキップ ({param_details}) 理由: {' / '.join(reasons)}")
+                
+        except Exception as e:
+            # 判定中に発生したエラーを完全に可視化
+            log(f"❌ [{ticker}] 判定処理中に例外エラーが発生しました: {e}")
             continue
             
     progress_bar.empty()
     status_text.empty()
+    log(f"🎉 判定処理が完了しました。合致数: {len(results)} 件")
     return pd.DataFrame(results)
