@@ -675,7 +675,9 @@ def _fetch_price_data_internal(interval: str, limit_days: int, is_jp: bool) -> p
     limit_dt = pd.Timestamp.now() - pd.Timedelta(days=limit_days)
     limit_start_date = limit_dt.strftime("%Y-%m-%d %H:%M:%S")
     
-    target_columns = ["date", "ticker", "close", "volume"]
+    # ── [修正点] wvfの計算やローソク足描画に必要なため、open, high, low を追加 ──
+    target_columns = ["date", "ticker", "open", "high", "low", "close", "volume"]
+    
     if not is_jp:
         target_columns.extend(["adj close", "stock splits"])
         
