@@ -782,14 +782,14 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
 @st.fragment
 def render_parquet_data_inspector(is_jp: bool):
     """
-    指定された条件（時間足・特定年月・特定銘柄）に基づいて、
+    指定された条件（時間足・開始日・特定年月・特定銘柄）に基づいて、
     Parquetデータベースからピンポイントにデータをロードして軽量表示します。
     """
     st.divider()
     st.subheader("📊 データベース生データ確認（ピンポイント表示）")
     st.write(
         "Parquetファイルを直接ロードして、特定銘柄・特定期間の格納データをそのままグリッド表示します。\n"
-        "銘柄と期間を1つに絞り込むことで、メモリやブラウザへの負荷をかけずに瞬時に確認できます。"
+        "銘柄、時間足、および「表示開始日」を絞り込むことで、古いデータから順番に追跡できます。"
     )
 
     # 1. 時間足の選択
@@ -800,7 +800,14 @@ def render_parquet_data_inspector(is_jp: bool):
         key="inspect_interval_select"
     )
 
-    # 2. 対象年・月の選択（5m / 1m の場合のみ年月プルダウンを表示）
+    # 2. 表示開始日の指定 (新設)
+    inspect_start_date = st.date_input(
+        "表示開始日を指定（この日付以降のデータを表示）",
+        value=datetime.now().date() - timedelta(days=90),
+        key="inspect_start_date_input"
+    )
+
+    # 3. 対象年・月の選択（5m / 1m の場合のみ年月プルダウンを表示）
     inspect_ym = None
     if inspect_interval in ["5m", "1m"]:
         # 現在日時から過去3年分までの年月リスト（YYYY_MM）を動的に生成
@@ -819,14 +826,14 @@ def render_parquet_data_inspector(is_jp: bool):
             key="inspect_ym_select"
         )
 
-    # 3. 銘柄コードの入力
+    # 4. 銘柄コードの入力
     inspect_ticker_raw = st.text_input(
         "銘柄コードを入力（1件指定）", 
         placeholder="例: 7203 や AAPL", 
         key="inspect_ticker_input"
     ).strip()
 
-    # 4. 「データを表示」ボタン
+    # 5. 「データを表示」ボタン
     is_ready = bool(inspect_ticker_raw)
     btn_label = "🔍 データをロードして表示" if is_ready else "⚠️ 銘柄コードを入力してください"
     
@@ -834,10 +841,13 @@ def render_parquet_data_inspector(is_jp: bool):
         # 銘柄コードの整形（大文字化・日本株用の末尾削除など）
         target_ticker = sanitize_ticker(inspect_ticker_raw, is_jp=is_jp)
         
-        # フィルタポリシーの構築
+        # 開始日付の文字列化 (例: "2026-07-15 00:00:00")
+        start_date_filter_str = inspect_start_date.strftime("%Y-%m-%d 00:00:00")
+        
+        # フィルタポリシーの初期構築
         filters = [("ticker", "==", target_ticker)]
         
-        # 分足の場合は、filtersに日付の上下限を追加して対象年月ファイル以外をスキップ
+        # 分足（5m, 1m）の場合は、対象年月ファイル範囲と開始日の整合性を取る
         if inspect_interval in ["5m", "1m"] and inspect_ym:
             try:
                 y_str, m_str = inspect_ym.split("_")
@@ -845,15 +855,23 @@ def render_parquet_data_inspector(is_jp: bool):
                 month_val = int(m_str)
                 _, last_day = calendar.monthrange(year_val, month_val)
                 
-                # 年月の初日と最終日を定義
-                start_date_str = f"{year_val:04d}-{month_val:02d}-01 00:00:00"
-                end_date_str = f"{year_val:04d}-{month_val:02d}-{last_day:02d} 23:59:59"
+                # 対象年月の初日と最終日を定義
+                month_start_str = f"{year_val:04d}-{month_val:02d}-01 00:00:00"
+                month_end_str = f"{year_val:04d}-{month_val:02d}-{last_day:02d} 23:59:59"
                 
-                filters.append(("date", ">=", start_date_str))
-                filters.append(("date", "<=", end_date_str))
+                # 指定開始日が選択年月の初日より前の場合は初日から、
+                # 選択年月の中にある場合は指定開始日を優先させてロード範囲を決定
+                actual_start_dt = max(pd.to_datetime(month_start_str), pd.to_datetime(start_date_filter_str))
+                actual_start_str = actual_start_dt.strftime("%Y-%m-%d %H:%M:%S")
+                
+                filters.append(("date", ">=", actual_start_str))
+                filters.append(("date", "<=", month_end_str))
             except Exception as e:
                 st.error(f"年月範囲の解釈に失敗しました: {e}")
                 return
+        else:
+            # 1d / 60m の場合は純粋に「指定開始日以降」をフィルターとして適用
+            filters.append(("date", ">=", start_date_filter_str))
 
         with st.spinner(f"📥 Parquetから [{target_ticker}] のデータを検索中..."):
             try:
@@ -873,26 +891,28 @@ def render_parquet_data_inspector(is_jp: bool):
                 if df_result.empty:
                     st.warning("⚠️ 指定された条件に合致するデータはデータベース内に見つかりませんでした。")
                 else:
-                    # 時系列順にソートしてインデックスを整理
+                    # 時系列順（昇順）にソートして整理
                     if "date" in df_result.columns:
                         df_result = df_result.sort_values("date").reset_index(drop=True)
-                        # 表示の視認性を高めるため日付フォーマットを整形
+                        # 表示フォーマットの整形
                         df_result["date"] = pd.to_datetime(df_result["date"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-                    st.success(f"✅ ロード完了（取得件数: {len(df_result):,} 件）")
+                    st.success(f"✅ ロード完了（フィルタ該当件数: {len(df_result):,} 件）")
                     
-                    # 💡 Streamlitの送信容量制限(MessageSizeError)およびブラウザクラッシュを回避するセーフガード
+                    # 💡 送信データ量抑制およびブラウザクラッシュ回避のセーフガード
                     MAX_DISPLAY_ROWS = 2000
                     if len(df_result) > MAX_DISPLAY_ROWS:
                         st.warning(
-                            f"⚠️ 該当期間のデータ（{len(df_result):,}件）が極めて多いため、ブラウザの描画クラッシュ防止用に"
-                            f"最新の {MAX_DISPLAY_ROWS:,} 件のみを表示しています。"
+                            f"⚠️ 条件に該当するデータが多いため（{len(df_result):,}件）、"
+                            f"指定開始日を起点とした先頭 {MAX_DISPLAY_ROWS:,} 件のみを表示しています。\n\n"
+                            f"これより後ろの（より新しい）データを確認したい場合は、表示開始日を後ろにずらしてください。"
                         )
-                        df_display = df_result.tail(MAX_DISPLAY_ROWS)
+                        # 指定開始日を起点とした「古い順から2,000件」を表示するためにheadを適用
+                        df_display = df_result.head(MAX_DISPLAY_ROWS)
                     else:
                         df_display = df_result
 
-                    # データをStreamlitのグリッドで安全に表示
+                    # グリッド描画
                     st.dataframe(
                         df_display, 
                         use_container_width=True, 
