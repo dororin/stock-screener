@@ -678,12 +678,12 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
     st.divider()
     st.subheader("🔍 日本株 統合段差スキャン・修復テーブル（自動スキャン → 一括パッチ適用）")
     st.write(
-        "本番日足データ(`price_jp_1d.parquet`)とyfinance公式の分割情報を自動照合し、不整合のある銘柄を自動検出します。"
-        "未調整（要パッチ）および事前調整済み（メタデータのみ未反映）の候補を特定し、分足までの全時間足を一括で遡及修正します。"
+        "本番日足データ(`price_jp_1d.parquet`)とyfinance公式の分割情報を自動照合し、不整合のある銘柄を自動検出します。\n"
+        "予定日の過去45日間におよぶ「面」のルックバック走査により、収集ズレや先回り調整された不整合（崖）も確実に見つけ出します。"
     )
 
     if st.button("🔍 日本株 統合段差スキャンを実行", key="btn_jp_split_scan", type="primary", use_container_width=True):
-        with st.spinner("日本株の株式分割履歴をyfinanceから取得し、1d本番データと照合中..."):
+        with st.spinner("日本株の株式分割履歴をyfinanceから取得し、1d本番データとルックバック走査中..."):
             from core.jp_price_corrector import scan_jp_anomalies_with_yfinance
             st.session_state.jp_split_scan_result = scan_jp_anomalies_with_yfinance()
         st.success("日本株統合スキャンが完了しました。")
@@ -702,16 +702,20 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
     display_df = result_df.copy()
     display_df["選択"] = False
 
+    # 修正仕様書3.1に基づき、詳細情報をわかりやすく表示するための名称マッピング
     rename_map = {
         "選択": "選択",
         "ticker": "銘柄",
         "interval": "時間足",
-        "cliff_date": "分割実施日(cliff_date)",
+        "ex_date": "公式予定日(ex_date)",
+        "actual_date": "実質段差日(actual_date)",
+        "cliff_date": "真の境界日(cliff_date)",
         "splits": "分割比率(splits)",
         "mode": "調整タイプ(mode)",
         "multiplier": "調整倍率(multiplier)",
         "before_close": "前日終値",
-        "after_close": "当日終値"
+        "after_close": "当日終値",
+        "status": "警告状態(status)"
     }
     display_df = display_df.rename(columns=rename_map)
     ordered_cols = [c for c in rename_map.values() if c in display_df.columns]
@@ -723,7 +727,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         hide_index=True,
         disabled=[c for c in ordered_cols if c != "選択"],
         column_config={
-            "選択": st.column_config.CheckboxColumn("選択"),
+            "選択": st.column_config.CheckboxColumn("選択", help="微小分割（ボラティリティ疑い）は手動目視で選択してください"),
         },
         key="jp_split_scan_editor",
     )
@@ -743,12 +747,16 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
 
             for _, r in selected_rows.iterrows():
                 ticker = r["銘柄"]
-                cliff_date = r["分割実施日(cliff_date)"]
+                # パッチ処理エンジンの不等号 "<" 処理（境界日未満を調整する）との辻褄を完璧に合わせるため、
+                # 境界引数には「実質段差日(actual_date)」をそのまま渡します。これにより段差前日（真の境界日）以前が綺麗に調整されます。
+                actual_date = r["実質段差日(actual_date)"]
+                cliff_date = r["真の境界日(cliff_date)"]
                 multiplier = r["調整倍率(multiplier)"]
                 mode = r["調整タイプ(mode)"]
+                status_label = r["警告状態(status)"]
 
-                st.write(f"🔧 [{ticker}] {cliff_date} 以前のパッチを適用中 ({mode} / 倍率: {multiplier:.6f})...")
-                results = apply_jp_patch_to_all_timeframes(ticker, cliff_date, multiplier, mode, status_callback=None)
+                st.write(f"🔧 [{ticker}] {actual_date} より前（{cliff_date} 以前）のパッチを適用中 ({mode} / 倍率: {multiplier:.6f})...")
+                results = apply_jp_patch_to_all_timeframes(ticker, actual_date, multiplier, mode, status_callback=None)
                 
                 applied_intervals = [iv for iv, msg in results.items() if "正常に修復" in str(msg)]
                 if applied_intervals:
@@ -758,12 +766,12 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
                         "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "ticker": ticker,
                         "market": "JP",
-                        "cliff_date": cliff_date,
+                        "cliff_date": cliff_date,  # スプレッドシート履歴には真の境界日を書き込みます
                         "interval": ",".join(applied_intervals),
                         "before_close": r["前日終値"],
                         "after_close": r["当日終値"],
                         "multiplier": multiplier,
-                        "memo": f"日本株自動分割修復パッチ ({mode})",
+                        "memo": f"日本株自動分割修復パッチ ({mode} / {status_label})",
                     })
                 else:
                     st.warning(f"   ⏭️ [{ticker}] スキップまたはエラーが発生しました。")
