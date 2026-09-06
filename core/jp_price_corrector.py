@@ -16,10 +16,25 @@ from data_access.drive_api import (
     get_drive_service
 )
 
+def get_dynamic_threshold(s: float) -> tuple:
+    """
+    公式の分割比率Sに応じて、許容する段差判定価格比R (前日Close / 当日Close) の範囲を返します。
+    """
+    if s >= 2.0:
+        # 大規模分割: バッファ ±15% でノイズを徹底除外
+        return s * 0.85, s * 1.15
+    elif s >= 1.30:
+        # 中規模分割: バッファ ±15%
+        return s * 0.85, s * 1.15
+    else:
+        # 微小分割（1.01 〜 1.30未満）: 通常の乱高下に埋もれるため、
+        # 下限を一律1.03 (下落率約3%) まで拡張し「見逃しゼロ」を最優先にします。
+        return 1.03, s * 1.15
+
 def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
     """
     本番日足データ(price_jp_1d.parquet)から監視銘柄リストのデータをロードし、
-    yfinanceから一括（バルク）で株式分割履歴を一時取得して自動診断スキャンを行います。
+    yfinanceから公式の株式分割履歴を一時取得して、過去に遡ったルックバック走査診断を行います。
     100銘柄ずつのバッチ処理により、外部通信回数を最小限に抑えます。
     """
     def log(msg):
@@ -87,16 +102,22 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                 log(f"  ⚠️ バッチ [{b_idx + 1}] のデータが空です。次のバッチに進みます。")
                 continue
             
-            # yfinanceのバルクダウンロード時の列構造（MultiIndex）から Stock Splits 部分を抽出
+            # yfinanceのバルクダウンロード時の列構造（MultiIndex）から Stock Splits および Adj Close 部分を抽出
             df_splits = pd.DataFrame()
+            df_adj_close = pd.DataFrame()
             if isinstance(df_download.columns, pd.MultiIndex):
                 if "Stock Splits" in df_download.columns.get_level_values(0):
                     df_splits = df_download["Stock Splits"]
+                if "Adj Close" in df_download.columns.get_level_values(0):
+                    df_adj_close = df_download["Adj Close"]
             else:
                 # 1銘柄しか該当しないバッチの場合の安全なカラム処理
                 if "Stock Splits" in df_download.columns:
                     df_splits = pd.DataFrame(df_download["Stock Splits"])
                     df_splits.columns = batch_tickers_T[:1]
+                if "Adj Close" in df_download.columns:
+                    df_adj_close = pd.DataFrame(df_download["Adj Close"])
+                    df_adj_close.columns = batch_tickers_T[:1]
             
             if df_splits.empty:
                 log(f"  ⚠️ バッチ [{b_idx + 1}] の結果に分割データが見つかりませんでした。")
@@ -123,62 +144,119 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                     if pd.isna(s_val) or s_val <= 0.0 or s_val == 1.0:
                         continue
                     
-                    # T_dtは分割権利落ち日(ex-date)
-                    T_dt = pd.to_datetime(ex_date).tz_localize(None)
+                    # 予定日 (Ex-Date)
+                    planned_dt = pd.to_datetime(ex_date).tz_localize(None)
+                    planned_date_str = planned_dt.strftime("%Y-%m-%d")
                     
-                    # 1dデータの中から境界日 T に最も近い、かつ >= T である最初の営業日を探す
-                    future_df = df_ticker[df_ticker["date_dt"] >= T_dt]
-                    if future_df.empty:
-                        continue
+                    # 面としてのルックバック走査：公式予定日から過去45日間を遡及対象とする [仕様書2.1]
+                    lookback_start_dt = planned_dt - timedelta(days=45)
                     
-                    idx_T = future_df.index[0] # ex-date当日のインデックス
-                    if idx_T == 0:
-                        # 分割実施前の日足データが存在しない
-                        continue
-                    
-                    row_T = df_ticker.loc[idx_T]
-                    row_prev = df_ticker.loc[idx_T - 1]
-                    
-                    # 前後の営業日の乖離が大きすぎる(15日超)場合は取引停止中などのため除外
-                    gap_days = (row_T["date_dt"] - row_prev["date_dt"]).days
-                    if gap_days > 15:
-                        continue
-                    
-                    close_T = row_T["close"]
-                    close_prev = row_prev["close"]
-                    mult_T = row_T["patched_multiplier"]
-                    mult_prev = row_prev["patched_multiplier"]
-                    
-                    if pd.isna(close_T) or pd.isna(close_prev) or close_T <= 0 or close_prev <= 0:
+                    # 走査・検証ウィンドウ（マージンとして予定日＋5日後まで抽出）
+                    df_window = df_ticker[
+                        (df_ticker["date_dt"] >= lookback_start_dt) & 
+                        (df_ticker["date_dt"] <= planned_dt + timedelta(days=5))
+                    ]
+                    if df_window.empty or len(df_window) < 2:
                         continue
                         
-                    R_price = close_prev / close_T
-                    R_multiplier = mult_prev / mult_T
+                    detected_idx = -1
+                    detected_R = 1.0
                     
-                    S = float(s_val)
-                    M = 1.0 / S
+                    # 分割倍率に応じた動的バッファ閾値の取得 [仕様書2.2]
+                    min_R, max_R = get_dynamic_threshold(s_val)
+                    window_indices = df_window.index.tolist()
                     
-                    # 各条件の判定 (マージン 15%)
-                    is_adjusted = (abs(R_multiplier - M) <= M * 0.15) and (abs(R_price - 1.0) <= 0.15)
-                    is_unadjusted = (abs(R_multiplier - 1.0) <= 0.15) and (abs(R_price - S) <= S * 0.15)
-                    is_pre_adjusted = (abs(R_multiplier - 1.0) <= 0.15) and (abs(R_price - 1.0) <= 0.15)
+                    # 最新（最も予定日に近い日付）の実際の段差を特定するため、後ろから前（逆向き）に走査
+                    for i in reversed(range(1, len(window_indices))):
+                        idx_T = window_indices[i]
+                        idx_prev = window_indices[i-1]
+                        
+                        row_T = df_ticker.loc[idx_T]
+                        row_prev = df_ticker.loc[idx_prev]
+                        
+                        # 休場・取引停止が長すぎる場合は境界不整合と判定せず除外
+                        gap_days = (row_T["date_dt"] - row_prev["date_dt"]).days
+                        if gap_days > 15:
+                            continue
+                            
+                        close_T = row_T["close"]
+                        close_prev = row_prev["close"]
+                        
+                        if pd.isna(close_T) or pd.isna(close_prev) or close_T <= 0 or close_prev <= 0:
+                            continue
+                            
+                        R_price = close_prev / close_T
+                        
+                        # 動的バッファ閾値内の不連続性を検出
+                        if min_R <= R_price <= max_R:
+                            detected_idx = idx_T
+                            detected_R = R_price
+                            break
                     
+                    # 判定パラメータの初期化
                     mode = None
-                    if is_unadjusted:
-                        mode = "要パッチ"
-                    elif is_pre_adjusted:
-                        mode = "メタデータのみ更新"
+                    actual_dt = planned_dt
+                    cliff_dt = planned_dt
+                    close_T_val = np.nan
+                    close_prev_val = np.nan
+                    
+                    M = 1.0 / s_val
+                    
+                    if detected_idx != -1:
+                        # 1. 実際のデータ上で段差（崖）が検出された場合
+                        row_T = df_ticker.loc[detected_idx]
+                        row_prev = df_ticker.loc[detected_idx - 1]
                         
+                        actual_dt = row_T["date_dt"] # 実質的な段差発生日（当日）
+                        cliff_dt = row_prev["date_dt"] # 真の境界日（前日） [仕様書2.3]
+                        
+                        close_T_val = row_T["close"]
+                        close_prev_val = row_prev["close"]
+                        
+                        mult_T = row_T["patched_multiplier"]
+                        mult_prev = row_prev["patched_multiplier"]
+                        R_multiplier = mult_prev / mult_T
+                        
+                        # データベースの乗数がまだ等倍（未調整）状態であれば、要遡及パッチ
+                        is_unadjusted = (abs(R_multiplier - 1.0) <= 0.15)
+                        if is_unadjusted:
+                            mode = "要パッチ"
+                            
+                    else:
+                        # 2. 段差が時系列上に見つからなかった場合（すでに全データが先回り調整されているなど）
+                        # 予定日の前後データに基づき、メタデータのみの更新が必要かを判断
+                        future_df = df_ticker[df_ticker["date_dt"] >= planned_dt]
+                        if not future_df.empty:
+                            idx_T = future_df.index[0]
+                            if idx_T > 0:
+                                row_T = df_ticker.loc[idx_T]
+                                row_prev = df_ticker.loc[idx_T - 1]
+                                
+                                mult_T = row_T["patched_multiplier"]
+                                mult_prev = row_prev["patched_multiplier"]
+                                R_multiplier = mult_prev / mult_T
+                                
+                                is_pre_adjusted = (abs(R_multiplier - 1.0) <= 0.15)
+                                if is_pre_adjusted:
+                                    mode = "メタデータのみ更新"
+                                    actual_dt = planned_dt
+                                    cliff_dt = planned_dt
+                                    close_T_val = row_T["close"]
+                                    close_prev_val = row_prev["close"]
+
                     if mode:
                         results.append({
                             "ticker": ticker,
                             "interval": "1d",
-                            "cliff_date": T_dt.strftime("%Y-%m-%d"),
-                            "splits": S,
+                            "ex_date": planned_date_str,                  # 公式予定日 [仕様書3.1]
+                            "actual_date": actual_dt.strftime("%Y-%m-%d"), # 実質段差日 [仕様書3.1]
+                            "cliff_date": cliff_dt.strftime("%Y-%m-%d"),   # 真の境界日（段差前日） [仕様書3.1]
+                            "splits": s_val,
                             "mode": mode,
                             "multiplier": M,
-                            "before_close": round(close_prev, 2),
-                            "after_close": round(close_T, 2)
+                            "before_close": round(close_prev_val, 2) if not pd.isna(close_prev_val) else 0.0,
+                            "after_close": round(close_T_val, 2) if not pd.isna(close_T_val) else 0.0,
+                            "status": "[正常分割]" if actual_dt == planned_dt else "[⚠️先回り調整混入（警告）]" # [仕様書3.1]
                         })
             
             # アクセス間の負荷調整用のわずかなウェイト
