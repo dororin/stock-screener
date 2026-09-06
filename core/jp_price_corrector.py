@@ -3,7 +3,7 @@
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import yfinance as yf
