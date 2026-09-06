@@ -19,7 +19,8 @@ from data_access.drive_api import (
 def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
     """
     本番日足データ(price_jp_1d.parquet)から監視銘柄リストのデータをロードし、
-    yfinanceから公式の株式分割履歴を一時取得して自動診断スキャンを行います。
+    yfinanceから一括（バルク）で株式分割履歴を一時取得して自動診断スキャンを行います。
+    100銘柄ずつのバッチ処理により、外部通信回数を最小限に抑えます。
     """
     def log(msg):
         if status_callback:
@@ -50,88 +51,141 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
 
     df_1d["date_dt"] = pd.to_datetime(df_1d["date"]).dt.tz_localize(None)
     tickers = df_1d["ticker"].unique().tolist()
-    log(f"🔎 データベース内から {len(tickers)} 銘柄を検出。yfinance分割履歴との自動照合を開始します...")
-
-    results = []
+    
     total = len(tickers)
+    batch_size = 100
+    
+    # 照合の開始日をDBの最も古い日付から動的に決定（安全策）
+    start_date_str = df_1d["date_dt"].min().strftime("%Y-%m-%d") if not df_1d.empty else "2016-01-01"
+    
+    log(f"🔎 データベース内から {total} 銘柄を検出。")
+    log(f"🚀 {batch_size} 銘柄ずつのバッチで一括照合を開始します... (取得期間: {start_date_str} 〜 現在)")
 
-    for idx, ticker in enumerate(tickers):
-        log(f"  [{idx+1}/{total}] 銘柄: {ticker} の履歴を照合中...")
-        ticker_with_T = f"{ticker}.T"
+    # 100銘柄ごとのバッチに分割
+    ticker_batches = [tickers[i:i + batch_size] for i in range(0, total, batch_size)]
+    results = []
+
+    for b_idx, batch in enumerate(ticker_batches):
+        batch_tickers_T = [f"{t}.T" for t in batch]
+        log(f"📥 バッチ [{b_idx + 1}/{len(ticker_batches)}] 処理中... (対象: {len(batch)} 銘柄 | {', '.join(batch[:4])}...)")
         
         try:
-            yt = yf.Ticker(ticker_with_T)
-            splits_series = yt.splits
-            if splits_series.empty:
+            # yf.download を用いて100銘柄分のデータを一括取得
+            # actions=True により、Stock Splits (分割履歴) データを同時に取得します。
+            df_download = yf.download(
+                batch_tickers_T,
+                start=start_date_str,
+                interval="1d",
+                auto_adjust=False,
+                actions=True,
+                progress=False,
+                threads=True,
+                timeout=30
+            )
+            
+            if df_download.empty:
+                log(f"  ⚠️ バッチ [{b_idx + 1}] のデータが空です。次のバッチに進みます。")
                 continue
             
-            df_ticker = df_1d[df_1d["ticker"] == ticker].sort_values("date_dt").reset_index(drop=True)
-            if df_ticker.empty or len(df_ticker) < 2:
+            # yfinanceのバルクダウンロード時の列構造（MultiIndex）から Stock Splits 部分を抽出
+            df_splits = pd.DataFrame()
+            if isinstance(df_download.columns, pd.MultiIndex):
+                if "Stock Splits" in df_download.columns.get_level_values(0):
+                    df_splits = df_download["Stock Splits"]
+            else:
+                # 1銘柄しか該当しないバッチの場合の安全なカラム処理
+                if "Stock Splits" in df_download.columns:
+                    df_splits = pd.DataFrame(df_download["Stock Splits"])
+                    df_splits.columns = batch_tickers_T[:1]
+            
+            if df_splits.empty:
+                log(f"  ⚠️ バッチ [{b_idx + 1}] の結果に分割データが見つかりませんでした。")
                 continue
 
-            for ex_date, s_val in splits_series.items():
-                if pd.isna(s_val) or s_val <= 0.0 or s_val == 1.0:
+            # 各銘柄に対して照合・判定
+            for ticker in batch:
+                ticker_with_T = f"{ticker}.T"
+                if ticker_with_T not in df_splits.columns:
                     continue
                 
-                # T_dtは分割権利落ち日(ex-date)
-                T_dt = pd.to_datetime(ex_date).tz_localize(None)
+                # splitsから0.0やNaNを除外して有効な分割履歴を抽出
+                splits_series_raw = df_splits[ticker_with_T]
+                splits_series = splits_series_raw[(splits_series_raw > 0) & (splits_series_raw != 1.0)].dropna()
                 
-                # 1dデータの中から境界日 T に最も近い、かつ >= T である最初の営業日を探す
-                future_df = df_ticker[df_ticker["date_dt"] >= T_dt]
-                if future_df.empty:
+                if splits_series.empty:
                     continue
                 
-                idx_T = future_df.index[0] # ex-date当日のインデックス
-                if idx_T == 0:
-                    # 分割実施前の日足データが存在しない
+                df_ticker = df_1d[df_1d["ticker"] == ticker].sort_values("date_dt").reset_index(drop=True)
+                if df_ticker.empty or len(df_ticker) < 2:
                     continue
-                
-                row_T = df_ticker.loc[idx_T]
-                row_prev = df_ticker.loc[idx_T - 1]
-                
-                # 前後の営業日の乖離が大きすぎる(15日超)場合は取引停止中などのため除外
-                gap_days = (row_T["date_dt"] - row_prev["date_dt"]).days
-                if gap_days > 15:
-                    continue
-                
-                close_T = row_T["close"]
-                close_prev = row_prev["close"]
-                mult_T = row_T["patched_multiplier"]
-                mult_prev = row_prev["patched_multiplier"]
-                
-                if pd.isna(close_T) or pd.isna(close_prev) or close_T <= 0 or close_prev <= 0:
-                    continue
+
+                for ex_date, s_val in splits_series.items():
+                    if pd.isna(s_val) or s_val <= 0.0 or s_val == 1.0:
+                        continue
                     
-                R_price = close_prev / close_T
-                R_multiplier = mult_prev / mult_T
-                
-                S = float(s_val)
-                M = 1.0 / S
-                
-                # 各条件の判定 (マージン 15%)
-                is_adjusted = (abs(R_multiplier - M) <= M * 0.15) and (abs(R_price - 1.0) <= 0.15)
-                is_unadjusted = (abs(R_multiplier - 1.0) <= 0.15) and (abs(R_price - S) <= S * 0.15)
-                is_pre_adjusted = (abs(R_multiplier - 1.0) <= 0.15) and (abs(R_price - 1.0) <= 0.15)
-                
-                mode = None
-                if is_unadjusted:
-                    mode = "要パッチ"
-                elif is_pre_adjusted:
-                    mode = "メタデータのみ更新"
+                    # T_dtは分割権利落ち日(ex-date)
+                    T_dt = pd.to_datetime(ex_date).tz_localize(None)
                     
-                if mode:
-                    results.append({
-                        "ticker": ticker,
-                        "interval": "1d",
-                        "cliff_date": T_dt.strftime("%Y-%m-%d"),
-                        "splits": S,
-                        "mode": mode,
-                        "multiplier": M,
-                        "before_close": round(close_prev, 2),
-                        "after_close": round(close_T, 2)
-                    })
+                    # 1dデータの中から境界日 T に最も近い、かつ >= T である最初の営業日を探す
+                    future_df = df_ticker[df_ticker["date_dt"] >= T_dt]
+                    if future_df.empty:
+                        continue
+                    
+                    idx_T = future_df.index[0] # ex-date当日のインデックス
+                    if idx_T == 0:
+                        # 分割実施前の日足データが存在しない
+                        continue
+                    
+                    row_T = df_ticker.loc[idx_T]
+                    row_prev = df_ticker.loc[idx_T - 1]
+                    
+                    # 前後の営業日の乖離が大きすぎる(15日超)場合は取引停止中などのため除外
+                    gap_days = (row_T["date_dt"] - row_prev["date_dt"]).days
+                    if gap_days > 15:
+                        continue
+                    
+                    close_T = row_T["close"]
+                    close_prev = row_prev["close"]
+                    mult_T = row_T["patched_multiplier"]
+                    mult_prev = row_prev["patched_multiplier"]
+                    
+                    if pd.isna(close_T) or pd.isna(close_prev) or close_T <= 0 or close_prev <= 0:
+                        continue
+                        
+                    R_price = close_prev / close_T
+                    R_multiplier = mult_prev / mult_T
+                    
+                    S = float(s_val)
+                    M = 1.0 / S
+                    
+                    # 各条件の判定 (マージン 15%)
+                    is_adjusted = (abs(R_multiplier - M) <= M * 0.15) and (abs(R_price - 1.0) <= 0.15)
+                    is_unadjusted = (abs(R_multiplier - 1.0) <= 0.15) and (abs(R_price - S) <= S * 0.15)
+                    is_pre_adjusted = (abs(R_multiplier - 1.0) <= 0.15) and (abs(R_price - 1.0) <= 0.15)
+                    
+                    mode = None
+                    if is_unadjusted:
+                        mode = "要パッチ"
+                    elif is_pre_adjusted:
+                        mode = "メタデータのみ更新"
+                        
+                    if mode:
+                        results.append({
+                            "ticker": ticker,
+                            "interval": "1d",
+                            "cliff_date": T_dt.strftime("%Y-%m-%d"),
+                            "splits": S,
+                            "mode": mode,
+                            "multiplier": M,
+                            "before_close": round(close_prev, 2),
+                            "after_close": round(close_T, 2)
+                        })
+            
+            # アクセス間の負荷調整用のわずかなウェイト
+            time.sleep(1.0)
+
         except Exception as ex:
-            log(f"  ⚠️ 銘柄 {ticker} 処理中に例外検出 (スキップ): {ex}")
+            log(f"  ⚠️ バッチ [{b_idx + 1}] 処理中に例外検出 (スキップ): {ex}")
             continue
 
     log(f"🎉 日本株段差スキャン完了。修正候補: {len(results)} 件")
