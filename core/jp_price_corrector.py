@@ -67,29 +67,23 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
     df_1d["date_dt"] = pd.to_datetime(df_1d["date"]).dt.tz_localize(None)
     tickers = df_1d["ticker"].unique().tolist()
     
-    total = len(tickers)
-    batch_size = 100
-    
-    # 照合の開始日をDBの最も古い日付から動的に決定（安全策）
-    start_date_str = df_1d["date_dt"].min().strftime("%Y-%m-%d") if not df_1d.empty else "2016-01-01"
-    
-    log(f"🔎 データベース内から {total} 銘柄を検出。")
-    log(f"🚀 {batch_size} 銘柄ずつのバッチで一括照合を開始します... (取得期間: {start_date_str} 〜 現在)")
+    # ── 仕様書4.1：イベントターゲット絞り込み（直近3ヶ月間：90日に限定） ──
+    # スキャンの処理負荷を抑えるため、そもそも直近に公式分割イベントがある銘柄のみにフィルタリングします。
+    target_start_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+    log(f"🔎 データベース内から {len(tickers)} 銘柄を検出し、直近3ヶ月間（{target_start_date}以降）の公式分割イベントを高速フィルタ中...")
 
-    # 100銘柄ごとのバッチに分割
-    ticker_batches = [tickers[i:i + batch_size] for i in range(0, total, batch_size)]
-    results = []
+    batch_size = 100
+    ticker_batches = [tickers[i:i + batch_size] for i in range(0, len(tickers), batch_size)]
+    
+    event_tickers_with_splits = {}  # {ticker: {ex_date_timestamp: split_ratio}}
 
     for b_idx, batch in enumerate(ticker_batches):
         batch_tickers_T = [f"{t}.T" for t in batch]
-        log(f"📥 バッチ [{b_idx + 1}/{len(ticker_batches)}] 処理中... (対象: {len(batch)} 銘柄 | {', '.join(batch[:4])}...)")
-        
         try:
-            # yf.download を用いて100銘柄分のデータを一括取得
-            # actions=True により、Stock Splits (分割履歴) データを同時に取得します。
+            # yf.downloadを用いて一括アクション情報の取得（auto_adjust=FalseでCloseとAdj Closeの双方を確保）
             df_download = yf.download(
                 batch_tickers_T,
-                start=start_date_str,
+                start=target_start_date,
                 interval="1d",
                 auto_adjust=False,
                 actions=True,
@@ -99,174 +93,215 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
             )
             
             if df_download.empty:
-                log(f"  ⚠️ バッチ [{b_idx + 1}] のデータが空です。次のバッチに進みます。")
                 continue
             
-            # yfinanceのバルクダウンロード時の列構造（MultiIndex）から Stock Splits および Adj Close 部分を抽出
+            # Stock Splitsの抽出
             df_splits = pd.DataFrame()
-            df_adj_close = pd.DataFrame()
             if isinstance(df_download.columns, pd.MultiIndex):
                 if "Stock Splits" in df_download.columns.get_level_values(0):
                     df_splits = df_download["Stock Splits"]
-                if "Adj Close" in df_download.columns.get_level_values(0):
-                    df_adj_close = df_download["Adj Close"]
             else:
-                # 1銘柄しか該当しないバッチの場合の安全なカラム処理
                 if "Stock Splits" in df_download.columns:
                     df_splits = pd.DataFrame(df_download["Stock Splits"])
                     df_splits.columns = batch_tickers_T[:1]
-                if "Adj Close" in df_download.columns:
-                    df_adj_close = pd.DataFrame(df_download["Adj Close"])
-                    df_adj_close.columns = batch_tickers_T[:1]
             
             if df_splits.empty:
-                log(f"  ⚠️ バッチ [{b_idx + 1}] の結果に分割データが見つかりませんでした。")
                 continue
 
-            # 各銘柄に対して照合・判定
-            for ticker in batch:
-                ticker_with_T = f"{ticker}.T"
-                if ticker_with_T not in df_splits.columns:
-                    continue
-                
-                # splitsから0.0やNaNを除外して有効な分割履歴を抽出
+            # 各銘柄に対して分割イベントがあるか走査
+            for ticker_with_T in df_splits.columns:
                 splits_series_raw = df_splits[ticker_with_T]
                 splits_series = splits_series_raw[(splits_series_raw > 0) & (splits_series_raw != 1.0)].dropna()
                 
-                if splits_series.empty:
-                    continue
-                
-                df_ticker = df_1d[df_1d["ticker"] == ticker].sort_values("date_dt").reset_index(drop=True)
-                if df_ticker.empty or len(df_ticker) < 2:
-                    continue
-
-                for ex_date, s_val in splits_series.items():
-                    if pd.isna(s_val) or s_val <= 0.0 or s_val == 1.0:
-                        continue
-                    
-                    # 予定日 (Ex-Date)
-                    planned_dt = pd.to_datetime(ex_date).tz_localize(None)
-                    planned_date_str = planned_dt.strftime("%Y-%m-%d")
-                    
-                    # 面としてのルックバック走査：公式予定日から過去45日間を遡及対象とする [仕様書2.1]
-                    lookback_start_dt = planned_dt - timedelta(days=45)
-                    
-                    # 走査・検証ウィンドウ（マージンとして予定日＋5日後まで抽出）
-                    df_window = df_ticker[
-                        (df_ticker["date_dt"] >= lookback_start_dt) & 
-                        (df_ticker["date_dt"] <= planned_dt + timedelta(days=5))
-                    ]
-                    if df_window.empty or len(df_window) < 2:
-                        continue
-                        
-                    detected_idx = -1
-                    detected_R = 1.0
-                    
-                    # 分割倍率に応じた動的バッファ閾値の取得 [仕様書2.2]
-                    min_R, max_R = get_dynamic_threshold(s_val)
-                    window_indices = df_window.index.tolist()
-                    
-                    # 最新（最も予定日に近い日付）の実際の段差を特定するため、後ろから前（逆向き）に走査
-                    for i in reversed(range(1, len(window_indices))):
-                        idx_T = window_indices[i]
-                        idx_prev = window_indices[i-1]
-                        
-                        row_T = df_ticker.loc[idx_T]
-                        row_prev = df_ticker.loc[idx_prev]
-                        
-                        # 休場・取引停止が長すぎる場合は境界不整合と判定せず除外
-                        gap_days = (row_T["date_dt"] - row_prev["date_dt"]).days
-                        if gap_days > 15:
-                            continue
-                            
-                        close_T = row_T["close"]
-                        close_prev = row_prev["close"]
-                        
-                        if pd.isna(close_T) or pd.isna(close_prev) or close_T <= 0 or close_prev <= 0:
-                            continue
-                            
-                        R_price = close_prev / close_T
-                        
-                        # 動的バッファ閾値内の不連続性を検出
-                        if min_R <= R_price <= max_R:
-                            detected_idx = idx_T
-                            detected_R = R_price
-                            break
-                    
-                    # 判定パラメータの初期化
-                    mode = None
-                    actual_dt = planned_dt
-                    cliff_dt = planned_dt
-                    close_T_val = np.nan
-                    close_prev_val = np.nan
-                    
-                    M = 1.0 / s_val
-                    
-                    if detected_idx != -1:
-                        # 1. 実際のデータ上で段差（崖）が検出された場合
-                        row_T = df_ticker.loc[detected_idx]
-                        row_prev = df_ticker.loc[detected_idx - 1]
-                        
-                        actual_dt = row_T["date_dt"] # 実質的な段差発生日（当日）
-                        cliff_dt = row_prev["date_dt"] # 真の境界日（前日） [仕様書2.3]
-                        
-                        close_T_val = row_T["close"]
-                        close_prev_val = row_prev["close"]
-                        
-                        mult_T = row_T["patched_multiplier"]
-                        mult_prev = row_prev["patched_multiplier"]
-                        R_multiplier = mult_prev / mult_T
-                        
-                        # データベースの乗数がまだ等倍（未調整）状態であれば、要遡及パッチ
-                        is_unadjusted = (abs(R_multiplier - 1.0) <= 0.15)
-                        if is_unadjusted:
-                            mode = "要パッチ"
-                            
-                    else:
-                        # 2. 段差が時系列上に見つからなかった場合（すでに全データが先回り調整されているなど）
-                        # 予定日の前後データに基づき、メタデータのみの更新が必要かを判断
-                        future_df = df_ticker[df_ticker["date_dt"] >= planned_dt]
-                        if not future_df.empty:
-                            idx_T = future_df.index[0]
-                            if idx_T > 0:
-                                row_T = df_ticker.loc[idx_T]
-                                row_prev = df_ticker.loc[idx_T - 1]
-                                
-                                mult_T = row_T["patched_multiplier"]
-                                mult_prev = row_prev["patched_multiplier"]
-                                R_multiplier = mult_prev / mult_T
-                                
-                                is_pre_adjusted = (abs(R_multiplier - 1.0) <= 0.15)
-                                if is_pre_adjusted:
-                                    mode = "メタデータのみ更新"
-                                    actual_dt = planned_dt
-                                    cliff_dt = planned_dt
-                                    close_T_val = row_T["close"]
-                                    close_prev_val = row_prev["close"]
-
-                    if mode:
-                        results.append({
-                            "ticker": ticker,
-                            "interval": "1d",
-                            "ex_date": planned_date_str,                  # 公式予定日 [仕様書3.1]
-                            "actual_date": actual_dt.strftime("%Y-%m-%d"), # 実質段差日 [仕様書3.1]
-                            "cliff_date": cliff_dt.strftime("%Y-%m-%d"),   # 真の境界日（段差前日） [仕様書3.1]
-                            "splits": s_val,
-                            "mode": mode,
-                            "multiplier": M,
-                            "before_close": round(close_prev_val, 2) if not pd.isna(close_prev_val) else 0.0,
-                            "after_close": round(close_T_val, 2) if not pd.isna(close_T_val) else 0.0,
-                            "status": "[正常分割]" if actual_dt == planned_dt else "[⚠️先回り調整混入（警告）]" # [仕様書3.1]
-                        })
-            
-            # アクセス間の負荷調整用のわずかなウェイト
-            time.sleep(1.0)
+                if not splits_series.empty:
+                    ticker = ticker_with_T.split(".")[0]
+                    event_tickers_with_splits[ticker] = splits_series.to_dict()
 
         except Exception as ex:
             log(f"  ⚠️ バッチ [{b_idx + 1}] 処理中に例外検出 (スキップ): {ex}")
             continue
 
-    log(f"🎉 日本株段差スキャン完了。修正候補: {len(results)} 件")
+    if not event_tickers_with_splits:
+        log("✅ 直近3ヶ月間に株式分割イベントが検知された銘柄はありません。スキャンを正常終了します。")
+        return pd.DataFrame()
+
+    log(f"🎯 公式分割イベントを検出。対象 {len(event_tickers_with_splits)} 銘柄に対して、詳細なインメモリ遡及走査を開始します。")
+    results = []
+
+    # ── 仕様書4.2：日足のインメモリ投影走査（イベント適合銘柄のみに限定ループ） ──
+    for ticker, splits_dict in event_tickers_with_splits.items():
+        df_ticker = df_1d[df_1d["ticker"] == ticker].sort_values("date_dt").reset_index(drop=True)
+        if df_ticker.empty or len(df_ticker) < 2:
+            continue
+
+        for ex_date, s_val in splits_dict.items():
+            if pd.isna(s_val) or s_val <= 0.0 or s_val == 1.0:
+                continue
+            
+            planned_dt = pd.to_datetime(ex_date).tz_localize(None)
+            planned_date_str = planned_dt.strftime("%Y-%m-%d")
+            
+            # ── 仕様書2.1：走査ロジックの改修（「点」から「面」への移行：過去30営業日） ──
+            ex_date_idx_list = df_ticker[df_ticker["date_dt"] <= planned_dt].index.tolist()
+            if not ex_date_idx_list:
+                continue
+                
+            ex_date_idx = ex_date_idx_list[-1]
+            # Ex-Dateを含めた、過去最大30営業日分をルックバック期間とする
+            lookback_start_idx = max(0, ex_date_idx - 30)
+            df_window = df_ticker.iloc[lookback_start_idx : ex_date_idx + 1].copy()
+            
+            if len(df_window) < 2:
+                continue
+                
+            detected_idx = -1
+            detected_R = 1.0
+            
+            # 分割倍率に応じた動的バッファ閾値の取得 [仕様書2.2]
+            min_R, max_R = get_dynamic_threshold(s_val)
+            window_indices = df_window.index.tolist()
+            
+            # ── 仕様書2.3：複数検出時のセーフガード（逆向き走査により最もEx-Dateに近い新しい日付を検出） ──
+            for i in reversed(range(1, len(window_indices))):
+                idx_T = window_indices[i]
+                idx_prev = window_indices[i-1]
+                
+                row_T = df_ticker.loc[idx_T]
+                row_prev = df_ticker.loc[idx_prev]
+                
+                # 休場・取引停止が長すぎる場合は境界不整合と判定せず除外
+                gap_days = (row_T["date_dt"] - row_prev["date_dt"]).days
+                if gap_days > 15:
+                    continue
+                    
+                close_T = row_T["close"]
+                close_prev = row_prev["close"]
+                
+                if pd.isna(close_T) or pd.isna(close_prev) or close_T <= 0 or close_prev <= 0:
+                    continue
+                    
+                R_price = close_prev / close_T
+                
+                # 動的バッファ閾値内の不連続性を検出
+                if min_R <= R_price <= max_R:
+                    detected_idx = idx_T
+                    detected_R = R_price
+                    break
+            
+            mode = None
+            actual_dt = planned_dt
+            cliff_dt = planned_dt
+            close_T_val = np.nan
+            close_prev_val = np.nan
+            status_label = "[正常分割]"
+            
+            M = 1.0 / s_val
+            
+            # ── [安全・重複検知防止チェック] 既に累積乗数（マーク）が書き換わっているか判定 ──
+            is_already_patched = False
+            if detected_idx != -1:
+                row_T = df_ticker.loc[detected_idx]
+                row_prev = df_ticker.loc[detected_idx - 1]
+                mult_T = row_T["patched_multiplier"]
+                mult_prev = row_prev["patched_multiplier"]
+                R_multiplier = mult_prev / mult_T
+                
+                # すでに等倍（1.0）付近を離れて累積補正乗数が適用済みである場合
+                if abs(R_multiplier - 1.0) > 0.15:
+                    is_already_patched = True
+            else:
+                row_T = df_ticker.iloc[ex_date_idx]
+                row_prev = df_ticker.iloc[max(0, ex_date_idx - 1)]
+                mult_T = row_T["patched_multiplier"]
+                mult_prev = row_prev["patched_multiplier"]
+                R_multiplier = mult_prev / mult_T
+                if abs(R_multiplier - 1.0) > 0.15:
+                    is_already_patched = True
+
+            if is_already_patched:
+                # すでに処理済みのマーク（patched_multiplier）があれば、スキャン重複防止のために結果から自動除外
+                continue
+            
+            # ── 仕様書2.4：yfinance調整後終値との突合・整合性チェック仕様（アプローチ③） ──
+            if detected_idx != -1:
+                row_T = df_ticker.loc[detected_idx]
+                row_prev = df_ticker.loc[detected_idx - 1]
+                
+                actual_dt = row_T["date_dt"]  # 実質的な段差発生日（当日）
+                cliff_dt = row_prev["date_dt"]  # 真の境界日（段差前日）
+                
+                close_T_val = row_T["close"]
+                close_prev_val = row_prev["close"]
+                
+                # 突合用 yfinance Adj Close（公式調整値）をピンポイント取得
+                try:
+                    df_verify = yf.download(
+                        f"{ticker}.T",
+                        start=(actual_dt - timedelta(days=2)).strftime("%Y-%m-%d"),
+                        end=(actual_dt + timedelta(days=3)).strftime("%Y-%m-%d"),
+                        auto_adjust=False,
+                        actions=False,
+                        progress=False,
+                        timeout=15
+                    )
+                    if not df_verify.empty and "Adj Close" in df_verify.columns:
+                        actual_date_str = actual_dt.strftime("%Y-%m-%d")
+                        matching_rows = df_verify[df_verify.index.strftime("%Y-%m-%d") == actual_date_str]
+                        if not matching_rows.empty:
+                            C_tv = matching_rows["Adj Close"].iloc[0]
+                            C_db = close_T_val
+                            
+                            # 突合条件判定（すでに調整価格で書き換わっているか判定）
+                            if abs(C_db - C_tv) <= C_tv * 0.15:
+                                # ① 誤差15%以内：先回り調整状態
+                                mode = "要パッチ"
+                            else:
+                                # ② 未調整状態
+                                mode = "要パッチ"
+                        else:
+                            mode = "要パッチ"
+                    else:
+                        mode = "要パッチ"
+                except Exception:
+                    mode = "要パッチ"
+
+                # 警告表示のステータス判定 [仕様書3.1]
+                if actual_dt < planned_dt:
+                    status_label = "[⚠️先回り調整混入（警告）]"
+                else:
+                    status_label = "[正常分割]"
+                    
+            else:
+                # 崖がルックバック期間内に検出されなかった場合（すでに全データが完璧に先回り調整されているなど） [質問2への対応]
+                mode = "メタデータのみ更新"
+                actual_dt = planned_dt
+                cliff_dt = planned_dt
+                
+                row_T = df_ticker.iloc[ex_date_idx]
+                close_T_val = row_T["close"]
+                if ex_date_idx > 0:
+                    close_prev_val = df_ticker.iloc[ex_date_idx - 1]["close"]
+                
+                status_label = "[正常分割]"
+
+            if mode:
+                results.append({
+                    "ticker": ticker,
+                    "interval": "1d",
+                    "ex_date": planned_date_str,                  # 公式予定日
+                    "actual_date": actual_dt.strftime("%Y-%m-%d"), # 実質段差日
+                    "cliff_date": cliff_dt.strftime("%Y-%m-%d"),   # 真の境界日（段差前日）
+                    "splits": s_val,
+                    "mode": mode,
+                    "multiplier": M,
+                    "before_close": round(close_prev_val, 2) if not pd.isna(close_prev_val) else 0.0,
+                    "after_close": round(close_T_val, 2) if not pd.isna(close_T_val) else 0.0,
+                    "status": status_label
+                })
+            
+            time.sleep(1.0)
+
+    log(f"🎉 日本株段差スキャン完了。自動検出された修正候補: {len(results)} 件")
     return pd.DataFrame(results)
 
 def apply_jp_patch_to_all_timeframes(ticker: str, cliff_date: str, multiplier: float, mode: str, status_callback=None) -> dict:
@@ -384,7 +419,7 @@ def apply_jp_patch_to_all_timeframes(ticker: str, cliff_date: str, multiplier: f
                             if "volume" in df.columns:
                                 df.loc[mask, "volume"] = df.loc[mask, "volume"] / multiplier
                                 
-                        # multiplierの履歴を累積
+                        # multiplierの履歴を過去レコード1つ1つに累積（実施済み刻印マーク）
                         df.loc[mask, "patched_multiplier"] = df.loc[mask, "patched_multiplier"] * multiplier
                         
                         df_cleaned = df.drop(columns=["date_dt"], errors="ignore")
