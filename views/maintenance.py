@@ -699,7 +699,11 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
 
     st.warning(f"⚠️ {len(result_df)}件の不整合を検出しました（{result_df['ticker'].nunique()}銘柄）")
 
+    if "is_selectable" not in result_df.columns:
+        result_df["is_selectable"] = True
+
     display_df = result_df.copy()
+    # 突合乖離率が閾値超過（is_selectable=False）の行は初期値からチェックOFFにしています。
     display_df["選択"] = False
 
     # 修正仕様書3.1に基づき、詳細情報をわかりやすく表示するための名称マッピング
@@ -715,7 +719,10 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         "multiplier": "調整倍率(multiplier)",
         "before_close": "前日終値",
         "after_close": "当日終値",
-        "status": "警告状態(status)"
+        "yf_close": "yfinance突合値",
+        "deviation_pct": "乖離率(%)",
+        "status": "警告状態(status)",
+        "is_selectable": "選択可否",
     }
     display_df = display_df.rename(columns=rename_map)
     ordered_cols = [c for c in rename_map.values() if c in display_df.columns]
@@ -728,59 +735,63 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         disabled=[c for c in ordered_cols if c != "選択"],
         column_config={
             "選択": st.column_config.CheckboxColumn("選択", help="微小分割（ボラティリティ疑い）は手動目視で選択してください"),
+            "選択可否": st.column_config.CheckboxColumn("選択可否", help="False の行は突合乖離率が閾値超過のため、選択しても適用対象から除外されます"),
         },
         key="jp_split_scan_editor",
     )
 
-    selected_rows = edited_df[edited_df["選択"] == True]
-    st.caption(f"現在 {len(selected_rows)} 件が選択されています。")
+    # ── 安全ロック：「選択可否」が False の行は、誤ってチェックされても適用対象から除外 ──
+    selected_rows = edited_df[(edited_df["選択"] == True) & (edited_df["選択可否"] == True)]
+    n_blocked = len(edited_df[(edited_df["選択"] == True) & (edited_df["選択可否"] == False)])
+    if n_blocked > 0:
+        st.error(f"🛑 {n_blocked}件は突合乖離率が閾値超過のため選択されていても適用対象から除外されます。")
+    st.caption(f"現在 {len(selected_rows)} 件が適用対象として選択されています。")
 
     if st.button("🚀 選択した日本株パッチを一括本番適用", key="btn_bulk_apply_jp_selected", type="primary", use_container_width=True, disabled=selected_rows.empty):
         status_box = st.status("📡 日本株一括修復パッチを実行中...", expanded=True)
         with status_box:
             from core.jp_price_corrector import apply_jp_patch_to_all_timeframes
-            from data_access.sheets_api import save_repair_log_to_sheets
             import time
 
-            repaired_count = 0
-            log_rows = []
-
+            # ── 銘柄ごとにグルーピング（1d/60m/5m/1mの各行を patch_rows としてまとめて渡す） ──
+            grouped = {}
             for _, r in selected_rows.iterrows():
                 ticker = r["銘柄"]
-                # パッチ処理エンジンの不等号 "<" 処理（境界日未満を調整する）との辻褄を完璧に合わせるため、
-                # 境界引数には「実質段差日(actual_date)」をそのまま渡します。これにより段差前日（真の境界日）以前が綺麗に調整されます。
-                actual_date = r["実質段差日(actual_date)"]
-                cliff_date = r["真の境界日(cliff_date)"]
-                multiplier = r["調整倍率(multiplier)"]
-                mode = r["調整タイプ(mode)"]
-                status_label = r["警告状態(status)"]
+                grouped.setdefault(ticker, []).append({
+                    "interval": r["時間足"],
+                    "cliff_date": r["真の境界日(cliff_date)"],
+                    "multiplier": r["調整倍率(multiplier)"],
+                    "mode": r["調整タイプ(mode)"],
+                    "before_close": r["前日終値"],
+                    "after_close": r["当日終値"],
+                    "deviation_pct": r.get("乖離率(%)"),
+                    "status": r["警告状態(status)"],
+                })
 
-                st.write(f"🔧 [{ticker}] {actual_date} より前（{cliff_date} 以前）のパッチを適用中 ({mode} / 倍率: {multiplier:.6f})...")
-                results = apply_jp_patch_to_all_timeframes(ticker, actual_date, multiplier, mode, status_callback=None)
-                
+            repaired_count = 0
+
+            for ticker, patch_rows in grouped.items():
+                intervals_str = ", ".join(p["interval"] for p in patch_rows)
+                st.write(f"🔧 [{ticker}] {intervals_str} の各境界日以前を一括パッチ適用中...")
+
+                def _status_cb(msg, _ticker=ticker):
+                    st.write(f"　　{msg}")
+
+                try:
+                    results = apply_jp_patch_to_all_timeframes(ticker, patch_rows, status_callback=_status_cb)
+                except Exception as ex:
+                    st.error(f"   ❌ [{ticker}] パッチ適用中に例外が発生しました: {ex}")
+                    continue
+
                 applied_intervals = [iv for iv, msg in results.items() if "正常に修復" in str(msg)]
                 if applied_intervals:
                     repaired_count += 1
                     st.success(f"   ✅ [{ticker}] パッチ適用完了 ({', '.join(applied_intervals)})")
-                    log_rows.append({
-                        "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "ticker": ticker,
-                        "market": "JP",
-                        "cliff_date": cliff_date,  # スプレッドシート履歴には真の境界日を書き込みます
-                        "interval": ",".join(applied_intervals),
-                        "before_close": r["前日終値"],
-                        "after_close": r["当日終値"],
-                        "multiplier": multiplier,
-                        "memo": f"日本株自動分割修復パッチ ({mode} / {status_label})",
-                    })
                 else:
-                    st.warning(f"   ⏭️ [{ticker}] スキップまたはエラーが発生しました。")
+                    st.warning(f"   ⏭️ [{ticker}] スキップまたはエラーが発生しました。（詳細: {results}）")
 
-            if log_rows:
-                save_repair_log_to_sheets(log_rows)
-                st.write(f"📝 実際に修復された {len(log_rows)} 件のログをスプレッドシートへ記録しました。")
-
-            status_box.update(label=f"🎉 完了：{repaired_count}件の銘柄を一括修復しました。", state="complete")
+            # repair_log シートへの記録は apply_jp_patch_to_all_timeframes 内部で行われるため、ここでは重複記録しません。
+            status_box.update(label=f"🎉 完了：{repaired_count}銘柄を一括修復しました。", state="complete")
             if "jp_split_scan_result" in st.session_state:
                 del st.session_state["jp_split_scan_result"]
             st.cache_data.clear() # キャッシュクリア
