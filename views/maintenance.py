@@ -682,36 +682,27 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         "予定日の過去45日間におよぶ「面」のルックバック走査により、収集ズレや先回り調整された不整合（崖）も確実に見つけ出します。"
     )
 
-    # ── 状態の安全な初期化 ──
-    if "jp_scan_running" not in st.session_state:
-        st.session_state["jp_scan_running"] = False
-
-    is_running = st.session_state["jp_scan_running"]
-
     col_btn1, col_btn2 = st.columns([3, 1])
     with col_btn1:
-        if st.button(
+        btn_scan = st.button(
             "🔍 日本株 統合段差スキャンを実行", 
             key="btn_jp_split_scan", 
             type="primary", 
-            use_container_width=True,
-            disabled=is_running  # 実行中は連打できないようロック
-        ):
-            st.session_state["jp_scan_running"] = True
-            st.rerun(scope="fragment")
+            use_container_width=True
+        )
 
     with col_btn2:
         if st.session_state.get("jp_split_scan_result") is not None:
             if st.button("🗑️ 結果クリア", key="btn_clear_jp_scan", use_container_width=True):
                 st.session_state["jp_split_scan_result"] = None
-                st.rerun(scope="fragment")
+                st.rerun()
 
-    # ── スキャン実行中の処理（WebSocket切断を防ぐリアルタイムキープアライブ） ──
-    if st.session_state["jp_scan_running"]:
+    # ── スキャン実行ブロック ──
+    if btn_scan:
         status_box = st.status("📡 日本株 統合段差スキャンを実行中...", expanded=True)
         with status_box:
             def on_scan_progress(msg):
-                # ログを小刻みにUIへ描画することでWebSocketの切断を防止する
+                # ログをUIへリアルタイム送信してWebSocket切断（タイムアウト）を防止
                 st.write(msg)
 
             try:
@@ -722,13 +713,10 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             except Exception as e:
                 st.error(f"❌ スキャン中にエラーが発生しました: {e}")
                 st.session_state["jp_split_scan_result"] = pd.DataFrame()
-            finally:
-                st.session_state["jp_scan_running"] = False
         
-        # 完了後に確実にテーブルを描画するために再描画
-        st.rerun(scope="fragment")
+        # 💡【重要】ここで st.rerun() を呼ばずとも、下の「結果テーブルの描画」へそのまま自然に流れます
 
-    # ── 結果テーブルの描画 ──
+    # ── 結果テーブルの描画ブロック ──
     result_df = st.session_state.get("jp_split_scan_result")
     if result_df is None:
         return
@@ -788,6 +776,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         status_box = st.status("📡 日本株一括修復パッチを実行中...", expanded=True)
         with status_box:
             from core.jp_price_corrector import apply_jp_patch_to_all_timeframes
+            import time
 
             grouped = {}
             for _, r in selected_rows.iterrows():
@@ -829,7 +818,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
                 del st.session_state["jp_split_scan_result"]
             st.cache_data.clear()
             time.sleep(1.0)
-            st.rerun(scope="fragment")
+            st.rerun()
 
 @st.fragment
 def render_parquet_data_inspector(is_jp: bool):
