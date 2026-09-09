@@ -682,13 +682,53 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         "予定日の過去45日間におよぶ「面」のルックバック走査により、収集ズレや先回り調整された不整合（崖）も確実に見つけ出します。"
     )
 
-    if st.button("🔍 日本株 統合段差スキャンを実行", key="btn_jp_split_scan", type="primary", use_container_width=True):
-        with st.spinner("日本株の株式分割履歴をyfinanceから取得し、1d本番データとルックバック走査中..."):
-            from core.jp_price_corrector import scan_jp_anomalies_with_yfinance
-            st.session_state.jp_split_scan_result = scan_jp_anomalies_with_yfinance()
-        st.success("日本株統合スキャンが完了しました。")
+    # ── 状態の安全な初期化 ──
+    if "jp_scan_running" not in st.session_state:
+        st.session_state["jp_scan_running"] = False
+
+    is_running = st.session_state["jp_scan_running"]
+
+    col_btn1, col_btn2 = st.columns([3, 1])
+    with col_btn1:
+        if st.button(
+            "🔍 日本株 統合段差スキャンを実行", 
+            key="btn_jp_split_scan", 
+            type="primary", 
+            use_container_width=True,
+            disabled=is_running  # 実行中は連打できないようロック
+        ):
+            st.session_state["jp_scan_running"] = True
+            st.rerun(scope="fragment")
+
+    with col_btn2:
+        if st.session_state.get("jp_split_scan_result") is not None:
+            if st.button("🗑️ 結果クリア", key="btn_clear_jp_scan", use_container_width=True):
+                st.session_state["jp_split_scan_result"] = None
+                st.rerun(scope="fragment")
+
+    # ── スキャン実行中の処理（WebSocket切断を防ぐリアルタイムキープアライブ） ──
+    if st.session_state["jp_scan_running"]:
+        status_box = st.status("📡 日本株 統合段差スキャンを実行中...", expanded=True)
+        with status_box:
+            def on_scan_progress(msg):
+                # ログを小刻みにUIへ描画することでWebSocketの切断を防止する
+                st.write(msg)
+
+            try:
+                from core.jp_price_corrector import scan_jp_anomalies_with_yfinance
+                scan_df = scan_jp_anomalies_with_yfinance(status_callback=on_scan_progress)
+                st.session_state["jp_split_scan_result"] = scan_df
+                status_box.update(label="🎉 スキャン完了！", state="complete")
+            except Exception as e:
+                st.error(f"❌ スキャン中にエラーが発生しました: {e}")
+                st.session_state["jp_split_scan_result"] = pd.DataFrame()
+            finally:
+                st.session_state["jp_scan_running"] = False
+        
+        # 完了後に確実にテーブルを描画するために再描画
         st.rerun(scope="fragment")
 
+    # ── 結果テーブルの描画 ──
     result_df = st.session_state.get("jp_split_scan_result")
     if result_df is None:
         return
@@ -703,10 +743,8 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         result_df["is_selectable"] = True
 
     display_df = result_df.copy()
-    # 突合乖離率が閾値超過（is_selectable=False）の行は初期値からチェックOFFにしています。
     display_df["選択"] = False
 
-    # 修正仕様書3.1に基づき、詳細情報をわかりやすく表示するための名称マッピング
     rename_map = {
         "選択": "選択",
         "ticker": "銘柄",
@@ -740,7 +778,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         key="jp_split_scan_editor",
     )
 
-    # ── 安全ロック：「選択可否」が False の行は、誤ってチェックされても適用対象から除外 ──
     selected_rows = edited_df[(edited_df["選択"] == True) & (edited_df["選択可否"] == True)]
     n_blocked = len(edited_df[(edited_df["選択"] == True) & (edited_df["選択可否"] == False)])
     if n_blocked > 0:
@@ -751,9 +788,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         status_box = st.status("📡 日本株一括修復パッチを実行中...", expanded=True)
         with status_box:
             from core.jp_price_corrector import apply_jp_patch_to_all_timeframes
-            import time
 
-            # ── 銘柄ごとにグルーピング（1d/60m/5m/1mの各行を patch_rows としてまとめて渡す） ──
             grouped = {}
             for _, r in selected_rows.iterrows():
                 ticker = r["銘柄"]
@@ -769,7 +804,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
                 })
 
             repaired_count = 0
-
             for ticker, patch_rows in grouped.items():
                 intervals_str = ", ".join(p["interval"] for p in patch_rows)
                 st.write(f"🔧 [{ticker}] {intervals_str} の各境界日以前を一括パッチ適用中...")
@@ -790,11 +824,10 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
                 else:
                     st.warning(f"   ⏭️ [{ticker}] スキップまたはエラーが発生しました。（詳細: {results}）")
 
-            # repair_log シートへの記録は apply_jp_patch_to_all_timeframes 内部で行われるため、ここでは重複記録しません。
             status_box.update(label=f"🎉 完了：{repaired_count}銘柄を一括修復しました。", state="complete")
             if "jp_split_scan_result" in st.session_state:
                 del st.session_state["jp_split_scan_result"]
-            st.cache_data.clear() # キャッシュクリア
+            st.cache_data.clear()
             time.sleep(1.0)
             st.rerun(scope="fragment")
 

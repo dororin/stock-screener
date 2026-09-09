@@ -172,14 +172,35 @@ def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: 
                 progress=False,
                 timeout=15
             )
-            if isinstance(df_verify.columns, pd.MultiIndex):
-                df_verify.columns = df_verify.columns.get_level_values(0)
 
             yf_close = None
-            if not df_verify.empty and "Close" in df_verify.columns:
-                matching_rows = df_verify[df_verify.index.strftime("%Y-%m-%d") == date_str]
-                if not matching_rows.empty:
-                    yf_close = float(matching_rows["Close"].iloc[0])
+            if not df_verify.empty:
+                # MultiIndex または 通常カラムから "Close" を特定
+                close_data = None
+                if isinstance(df_verify.columns, pd.MultiIndex):
+                    if "Close" in df_verify.columns.get_level_values(0):
+                        close_data = df_verify["Close"]
+                elif "Close" in df_verify.columns:
+                    close_data = df_verify["Close"]
+
+                if close_data is not None:
+                    # 日付のタイムゾーンを正規化して日付一致行を抽出
+                    dt_index = pd.to_datetime(close_data.index)
+                    try:
+                        dt_index = dt_index.tz_localize(None)
+                    except Exception:
+                        pass
+
+                    matching_mask = (dt_index.strftime("%Y-%m-%d") == date_str)
+                    matched = close_data[matching_mask]
+
+                    if not matched.empty:
+                        # 💡【重要】Series や DataFrame の形状に関係なく1次元配列化して最初の有効数値を抽出
+                        raw_vals = matched.to_numpy().flatten()
+                        valid_vals = [float(v) for v in raw_vals if pd.notna(v) and float(v) > 0]
+                        if valid_vals:
+                            yf_close = valid_vals[0]
+
             cache[cache_key] = yf_close
             logger.debug(f"_verify_against_yfinance_pure_close: 取得結果 {cache_key} -> yf_close={yf_close}")
         except Exception as e:
@@ -209,7 +230,6 @@ def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: 
         f"passed={passed} (閾値{VERIFY_DEVIATION_THRESHOLD_PCT}%)"
     )
     return {"yf_close": round(yf_close, 2), "deviation_pct": round(deviation_pct, 3), "passed": passed}
-
 
 def _scan_intraday_cliff(ticker: str, interval: str, actual_day_dt, s_val: float,
                           daily_after_close: float, yf_cache: dict, status_callback=None) -> dict:
