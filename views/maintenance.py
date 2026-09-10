@@ -559,7 +559,6 @@ def render_full_rebuild_section(is_jp: bool, market_mode: str):
 
 
 # ─── 🚀 日本株専用手動上書きマージセンター（状態維持＆ログの永続表示化） ───
-@st.fragment
 def render_jp_manual_merge_center(is_jp: bool):
     if not is_jp:
         return
@@ -670,7 +669,6 @@ def render_jp_manual_merge_center(is_jp: bool):
 
 
 # ─── 🚀 【新設】日本株専用：統合段差スキャン・一括自動修復 ───
-@st.fragment
 def render_jp_split_scan_and_repair_ui(is_jp: bool):
     if not is_jp:
         return
