@@ -76,14 +76,17 @@ def _emit(status_callback, msg: str, level: str = "info", exc: bool = False):
     else:
         log_fn(msg)
 
+    # 💡【最重要】UIコールバックより先に標準出力へ即座にフラッシュ出力する。
+    # UI側（Streamlit）が再描画やセッション切断でコンテキストを失っていても、
+    # バックエンドの走査・パッチ処理を絶対に停止させないための安全構造。
+    print(f"[JP_PATCH_ENGINE/{level.upper()}] {msg}", flush=True)
+
     if status_callback and level != "debug":
         try:
             status_callback(msg)
         except Exception:
-            logger.debug("status_callback の呼び出し中に例外が発生しましたが、処理は継続します。", exc_info=True)
-
-    # コンソールにも従来どおりのprefix付きで出す（既存のprint運用との互換のため）
-    print(f"[JP_PATCH_ENGINE/{level.upper()}] {msg}")
+            # UIコンテナが消滅している等でコールバックが失敗しても、バックエンドは巻き込まない
+            pass
 
 
 # 突合の許容乖離率（仕様書Ⅰ-⑤）：これを超えると「不一致（暴落疑い）」として自動安全ロック

@@ -570,32 +570,10 @@ def render_jp_manual_merge_center(is_jp: bool):
         "古い順に累積ソートした上で、対応する月別本番結合ファイル（例：`price_jp_1m_2026_07.parquet`）へ `keep='last'` で安全上書きマージします。"
     )
 
-    from data_access.drive_api import get_drive_service, list_drive_diff_files, get_or_create_drive_folder
-    service = get_drive_service()
-    
-    if service:
-        with st.status("📡 Google Drive上の未処理差分データを簡易検索中...", expanded=False) as scan_status:
-            total_diff_count = 0
-            scanned_details = []
-            
-            for tf in settings.TIMEFRAMES:
-                try:
-                    tf_folder_id = get_or_create_drive_folder(tf, settings.FOLDER_ID)
-                    diffs = list_drive_diff_files(tf_folder_id)
-                    tf_diff_count = len(diffs)
-                    total_diff_count += tf_diff_count
-                    if tf_diff_count > 0:
-                        scanned_details.append(f"• 【{tf}】: {tf_diff_count} 件の未処理差分ファイル")
-                except Exception:
-                    pass
-            
-            if total_diff_count > 0:
-                scan_status.update(label=f"📂 未マージの日本株差分ファイルを計 {total_diff_count} 件検出しました。", state="complete")
-                for line in scanned_details:
-                    st.write(line)
-            else:
-                scan_status.update(label="✅ 未マージの差分ファイルはありません（本番データベースは最新です）。", state="complete")
-    
+    # 💡【重要】ここではボタンや枠だけを描画し、Google Driveへの通信は一切行わない（実行コスト 0.001秒）。
+    # 以前はここで無条件にDrive差分検索を4回叩いていたため、下流のスキャンボタンを押した際にも
+    # 毎回このマージ検索が強制的に走り、処理とUIが吹き飛ぶ原因になっていた。
+
     merge_tf = st.selectbox("マージを強制実行する時間足を選択", ["1d", "60m", "5m", "1m"], index=0, key="jp_merge_tf_select")
 
     # ログ状態管理用のセッションキー初期化
@@ -622,7 +600,7 @@ def render_jp_manual_merge_center(is_jp: bool):
             st.session_state["jp_merge_finished"] = False
             st.session_state["jp_merge_result_msg"] = None
             st.session_state["jp_merge_success"] = False
-            st.rerun(scope="fragment")
+            st.rerun()
 
     # マージ実処理中のスピナー & コールバック
     if st.session_state["jp_merge_running"] and not st.session_state["jp_merge_finished"]:
@@ -647,7 +625,7 @@ def render_jp_manual_merge_center(is_jp: bool):
                 st.session_state["jp_merge_success"] = False
                 st.session_state["jp_merge_result_msg"] = result.get("message")
             
-            st.rerun(scope="fragment")
+            st.rerun()
 
     # 完了後の表示（ログが自動で閉じられるのを防ぐ）
     if st.session_state["jp_merge_finished"]:
@@ -665,7 +643,7 @@ def render_jp_manual_merge_center(is_jp: bool):
                 st.session_state["jp_merge_finished"] = False
                 st.session_state["jp_merge_result_msg"] = None
                 st.session_state["jp_merge_success"] = False
-                st.rerun(scope="fragment")
+                st.rerun()
 
 
 # ─── 🚀 【新設】日本株専用：統合段差スキャン・一括自動修復 ───
@@ -680,14 +658,23 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         "予定日の過去45日間におよぶ「面」のルックバック走査により、収集ズレや先回り調整された不整合（崖）も確実に見つけ出します。"
     )
 
+    # ── 状態管理フラグの初期化 ──
+    # 💡【重要】if btn_scan: のようなその場限りのボタン判定（1フレームしか真にならない）ではなく、
+    # セッションフラグで実行状態を保持することで、途中で再描画が起きても処理とUIが消失しないようにする。
+    if "jp_scan_is_running" not in st.session_state:
+        st.session_state["jp_scan_is_running"] = False
+
     col_btn1, col_btn2 = st.columns([3, 1])
     with col_btn1:
-        btn_scan = st.button(
-            "🔍 日本株 統合段差スキャンを実行", 
-            key="btn_jp_split_scan", 
-            type="primary", 
-            use_container_width=True
-        )
+        if st.button(
+            "🔍 日本株 統合段差スキャンを実行",
+            key="btn_jp_split_scan",
+            type="primary",
+            use_container_width=True,
+            disabled=st.session_state["jp_scan_is_running"]  # 実行中は連打を物理ロック
+        ):
+            st.session_state["jp_scan_is_running"] = True
+            st.rerun()
 
     with col_btn2:
         if st.session_state.get("jp_split_scan_result") is not None:
@@ -695,8 +682,8 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
                 st.session_state["jp_split_scan_result"] = None
                 st.rerun()
 
-    # ── スキャン実行ブロック ──
-    if btn_scan:
+    # ── スキャン実行ブロック（フラグがTrueの間は確実に表示・維持される） ──
+    if st.session_state["jp_scan_is_running"]:
         status_box = st.status("📡 日本株 統合段差スキャンを実行中...", expanded=True)
         with status_box:
             def on_scan_progress(msg):
@@ -711,8 +698,11 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             except Exception as e:
                 st.error(f"❌ スキャン中にエラーが発生しました: {e}")
                 st.session_state["jp_split_scan_result"] = pd.DataFrame()
-        
-        # 💡【重要】ここで st.rerun() を呼ばずとも、下の「結果テーブルの描画」へそのまま自然に流れます
+            finally:
+                st.session_state["jp_scan_is_running"] = False
+
+        # 完了後に結果テーブルを即座に描画
+        st.rerun()
 
     # ── 結果テーブルの描画ブロック ──
     result_df = st.session_state.get("jp_split_scan_result")
