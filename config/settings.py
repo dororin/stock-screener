@@ -88,6 +88,18 @@ except KeyError as e:
 JPX_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
 TIMEFRAMES = ["1d", "60m", "5m", "1m"]
 
+# --- 株式分割スキャン：各時間足の遡り走査期間（営業日ベース） ---
+# 楽天RSSの実データ取得は暦日ではなく「営業日ベースの本数」で制限されるため
+# （core/rss_collector_jp.py の DEFAULT_BARS_LIMIT 参照）、
+# ex_date（分割イベント日）を起点に、この本数だけ営業日を遡って走査する。
+# メンテナンスジョブの実行遅延を吸収するマージンを含んだ実用値。
+SPLIT_SCAN_LOOKBACK_BDAYS = {
+    "1m": 9,
+    "5m": 15,
+    "60m": 30,
+    "1d": 30,
+}
+
 # --- Google Sheets 内のシート名設定 ---
 WATCHLIST_SHEET_NAME = "watchlist"
 REPAIR_LOG_SHEET_NAME = "repair_log"

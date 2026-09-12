@@ -234,18 +234,31 @@ def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: 
     )
     return {"yf_close": round(yf_close, 2), "deviation_pct": round(deviation_pct, 3), "passed": passed}
 
-def _scan_intraday_cliff(ticker: str, interval: str, actual_day_dt, s_val: float,
+def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_val: float,
                           daily_after_close: float, yf_cache: dict, status_callback=None) -> dict:
     """
     仕様書Ⅰ-④：下位時間足（60m/5m/1m）の段差オートフォーカス。
-    該当銘柄・該当時間足のみを直近30営業日分ピンポイント投影ロードし、
+    該当銘柄・該当時間足のみをピンポイント投影ロードし、
     実際に価格が跳んでいる正確な日時（ミリ秒単位のタイムスタンプ）を自律特定します。
-    """
-    logger.debug(f"_scan_intraday_cliff: 開始 ticker={ticker}, interval={interval}, actual_day_dt={actual_day_dt}, s_val={s_val}")
 
-    lookback_start = (pd.to_datetime(actual_day_dt) - timedelta(days=45)).strftime("%Y-%m-%d")
-    lookback_end = (pd.to_datetime(actual_day_dt) + timedelta(days=3)).strftime("%Y-%m-%d")
-    logger.debug(f"_scan_intraday_cliff: ピンポイント投影ロード範囲 [{lookback_start} 〜 {lookback_end}]")
+    ⚠️【重要】楽天RSSの実データ取得は暦日ではなく「営業日ベースの本数」で制限されるため
+    （例：1mは実測9営業日分）、下位足の崖はex_date当日ではなく、そこから最大で
+    settings.SPLIT_SCAN_LOOKBACK_BDAYS[interval] 営業日分「過去にズレた位置」に出現しうる。
+    さらにメンテナンスジョブの実行が数日〜数週間放置されていた場合、そのズレは
+    「今日」に近づく方向にも動くため、走査の前方境界は固定日数ではなく常に現在時刻まで開放する。
+    """
+    logger.debug(f"_scan_intraday_cliff: 開始 ticker={ticker}, interval={interval}, ex_date={ex_date}, actual_day_dt={actual_day_dt}, s_val={s_val}")
+
+    ex_date_ts = pd.to_datetime(ex_date)
+    lookback_bdays = settings.SPLIT_SCAN_LOOKBACK_BDAYS.get(interval, 30)
+    lookback_start = (ex_date_ts - pd.tseries.offsets.BDay(lookback_bdays)).strftime("%Y-%m-%d")
+    # 前方は固定日数で打ち切らず、常に「現在時刻」までフルカバーする
+    # （収集ジョブの放置期間次第で崖の位置が未来方向へズレるのを見逃さないため）
+    lookback_end = pd.Timestamp.now().strftime("%Y-%m-%d")
+    logger.debug(
+        f"_scan_intraday_cliff: ピンポイント投影ロード範囲 [{lookback_start} 〜 {lookback_end}] "
+        f"(lookback_bdays={lookback_bdays})"
+    )
 
     try:
         df_tf = load_price_db(
@@ -276,10 +289,11 @@ def _scan_intraday_cliff(ticker: str, interval: str, actual_day_dt, s_val: float
         logger.debug("_scan_intraday_cliff: tz_localize(None) をスキップ（すでにtz-naive）", exc_info=True)
     df_tf = df_tf.sort_values("date_dt").reset_index(drop=True)
 
-    # 対象日の当日9:00以前のウィンドウのみに限定（直近30営業日相当をそのまま使用）
-    window_end_dt = pd.to_datetime(actual_day_dt) + timedelta(hours=15)
-    df_window = df_tf[df_tf["date_dt"] <= window_end_dt].tail(3000).reset_index(drop=True)
-    logger.debug(f"_scan_intraday_cliff: ウィンドウ抽出後 {len(df_window)} 行 (window_end_dt={window_end_dt})")
+    # 💡【重要】ここで対象日当日15時などに区切らない。上のload_price_db段階で
+    # すでに [ex_date - 営業日lookback, 現在] という必要十分な範囲に絞り込み済みのため、
+    # 取得した全行がそのまま走査対象のウィンドウになる。
+    df_window = df_tf.tail(5000).reset_index(drop=True)
+    logger.debug(f"_scan_intraday_cliff: ウィンドウ抽出後 {len(df_window)} 行")
 
     if len(df_window) < 2:
         logger.debug(f"_scan_intraday_cliff: {interval} データ不足のためスキップ (ticker={ticker}, rows={len(df_window)})")
@@ -491,7 +505,7 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                 continue
 
             ex_date_idx = ex_date_idx_list[-1]
-            lookback_start_idx = max(0, ex_date_idx - 30)
+            lookback_start_idx = max(0, ex_date_idx - settings.SPLIT_SCAN_LOOKBACK_BDAYS.get("1d", 30))
             df_window = df_ticker.iloc[lookback_start_idx: ex_date_idx + 1].copy()
             logger.debug(f"ticker={ticker}: ルックバックウィンドウ {len(df_window)}行 (idx {lookback_start_idx}〜{ex_date_idx})")
 
@@ -595,6 +609,7 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                             tf_result = _scan_intraday_cliff(
                                 ticker=ticker,
                                 interval=tf,
+                                ex_date=planned_dt,
                                 actual_day_dt=actual_dt,
                                 s_val=s_val,
                                 daily_after_close=close_T_val,
