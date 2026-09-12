@@ -92,6 +92,11 @@ def _emit(status_callback, msg: str, level: str = "info", exc: bool = False):
 # 突合の許容乖離率（仕様書Ⅰ-⑤）：これを超えると「不一致（暴落疑い）」として自動安全ロック
 VERIFY_DEVIATION_THRESHOLD_PCT = 2.0
 
+# Adj Close（auto_adjust=True）連続性チェックの許容ジャンプ率：
+# 既知の分割はすべて遡及調整済みになっているはずなので、崖の前後でこれを超える断絶が
+# 残っている場合は「既知の分割では説明できない崖（暴落・データ異常の疑い）」として扱う
+ADJCLOSE_JUMP_THRESHOLD_PCT = 3.0
+
 # 下位時間足オートフォーカス走査の対象（仕様書Ⅰ-④）
 INTRADAY_TIMEFRAMES = ["60m", "5m", "1m"]
 
@@ -153,69 +158,141 @@ def _find_cliff_reverse(rows: list, min_R: float, max_R: float, max_gap_days: fl
     return -1
 
 
-def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: float, cache: dict) -> dict:
+def _extract_close_series(df: pd.DataFrame):
     """
-    仕様書Ⅰ-⑤：yfinance「純粋な分割調整後Close」（配当ノイズを含まない、auto_adjust=False の Close）
+    yf.download() の戻りDataFrameから、MultiIndex/通常カラムいずれの形状にも対応して
+    "Close" 列をtz-naiveなDatetimeIndexの1次元Seriesとして抽出する共通ヘルパー。
+    抽出できない場合は None を返す。
+    """
+    if df is None or df.empty:
+        return None
+
+    close_data = None
+    if isinstance(df.columns, pd.MultiIndex):
+        if "Close" in df.columns.get_level_values(0):
+            close_data = df["Close"]
+    elif "Close" in df.columns:
+        close_data = df["Close"]
+
+    if close_data is None:
+        return None
+
+    if isinstance(close_data, pd.DataFrame):
+        close_data = close_data.iloc[:, 0]
+
+    idx = pd.to_datetime(close_data.index)
+    try:
+        idx = idx.tz_localize(None)
+    except Exception:
+        pass
+    close_data = close_data.copy()
+    close_data.index = idx
+    return close_data.sort_index()
+
+
+def _extract_close_on_date(df: pd.DataFrame, date_str: str):
+    """指定日付(YYYY-MM-DD)に一致する行から、最初の有効な正の値を抽出する。"""
+    s = _extract_close_series(df)
+    if s is None:
+        return None
+    mask = s.index.strftime("%Y-%m-%d") == date_str
+    matched = s[mask].dropna()
+    matched = matched[matched > 0]
+    if matched.empty:
+        return None
+    return float(matched.iloc[0])
+
+
+def _extract_close_at_timestamp(df: pd.DataFrame, target_ts, tolerance_minutes: int = 90):
+    """
+    指定タイムスタンプに最も近い時刻の値を抽出する（イントラデイ突合用）。
+    許容誤差(tolerance_minutes)を超えて最も近い行が離れている場合は None を返す
+    （＝データはあるが該当時刻の値としては使えないと判断）。
+    """
+    s = _extract_close_series(df)
+    if s is None or s.empty:
+        return None
+    s = s[s > 0].dropna()
+    if s.empty:
+        return None
+    target_np = np.datetime64(pd.to_datetime(target_ts))
+    time_diffs_sec = np.abs((s.index.values - target_np).astype("timedelta64[s]").astype(float))
+    min_idx = int(np.argmin(time_diffs_sec))
+    if time_diffs_sec[min_idx] > tolerance_minutes * 60:
+        return None
+    return float(s.iloc[min_idx])
+
+
+def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: float, cache: dict,
+                                         interval: str = "1d") -> dict:
+    """
+    仕様書Ⅰ-⑤：yfinance「純粋な取引値Close」（配当ノイズを含まない、auto_adjust=False の Close）
     との突合により、乖離率を計算し、暴落誤認を排除する多重防護アサーションを行います。
 
-    戻り値: {"yf_close": float|None, "deviation_pct": float|None, "passed": bool}
+    ⚠️【重要】interval を明示的に指定することで、60m/5m/1mの突合ではまずその足自体の
+    イントラデイ値との照合を試みる。yfinance側の取得可能期間（1mは実測7〜8日程度など）を
+    超えていて取得できない場合のみ、日足のCloseで代用する（is_daily_fallback=True で明示）。
+    以前の実装は interval を一切指定していなかったため、常に日足のCloseと比較しており、
+    intraday側の突合値が実質的に無意味だった。
+
+    戻り値: {"yf_close": float|None, "deviation_pct": float|None, "passed": bool, "is_daily_fallback": bool}
     """
-    date_str = pd.to_datetime(target_dt).strftime("%Y-%m-%d")
-    cache_key = f"{ticker}_{date_str}"
+    target_ts = pd.to_datetime(target_dt)
+    date_str = target_ts.strftime("%Y-%m-%d")
+    cache_key = f"{ticker}_{interval}_{target_ts.strftime('%Y-%m-%d_%H%M')}"
 
     if cache_key not in cache:
         logger.debug(f"_verify_against_yfinance_pure_close: キャッシュ未ヒット。yfinanceへ問い合わせ中 ({cache_key})")
+        yf_close = None
+        is_daily_fallback = (interval == "1d")
         try:
-            df_verify = yf.download(
-                f"{ticker}.T",
-                start=(pd.to_datetime(target_dt) - timedelta(days=3)).strftime("%Y-%m-%d"),
-                end=(pd.to_datetime(target_dt) + timedelta(days=3)).strftime("%Y-%m-%d"),
-                auto_adjust=False,   # 配当・分割の事後調整をかけない、実際の取引値そのもの
-                actions=False,
-                progress=False,
-                timeout=15
-            )
+            if interval != "1d":
+                intraday_start = (target_ts - timedelta(days=2)).strftime("%Y-%m-%d")
+                intraday_end = (target_ts + timedelta(days=2)).strftime("%Y-%m-%d")
+                df_intraday = yf.download(
+                    f"{ticker}.T",
+                    start=intraday_start,
+                    end=intraday_end,
+                    interval=interval,
+                    auto_adjust=False,
+                    actions=False,
+                    progress=False,
+                    timeout=15
+                )
+                yf_close = _extract_close_at_timestamp(df_intraday, target_ts)
+                if yf_close is None:
+                    logger.debug(
+                        f"_verify_against_yfinance_pure_close: interval={interval} のイントラデイ突合に失敗"
+                        f"（取得可能期間外の可能性）。日足へフォールバックします。"
+                    )
+                    is_daily_fallback = True
 
-            yf_close = None
-            if not df_verify.empty:
-                # MultiIndex または 通常カラムから "Close" を特定
-                close_data = None
-                if isinstance(df_verify.columns, pd.MultiIndex):
-                    if "Close" in df_verify.columns.get_level_values(0):
-                        close_data = df_verify["Close"]
-                elif "Close" in df_verify.columns:
-                    close_data = df_verify["Close"]
+            if yf_close is None:
+                df_daily = yf.download(
+                    f"{ticker}.T",
+                    start=(target_ts - timedelta(days=3)).strftime("%Y-%m-%d"),
+                    end=(target_ts + timedelta(days=3)).strftime("%Y-%m-%d"),
+                    auto_adjust=False,   # 配当・分割の事後調整をかけない、実際の取引値そのもの
+                    actions=False,
+                    progress=False,
+                    timeout=15
+                )
+                yf_close = _extract_close_on_date(df_daily, date_str)
 
-                if close_data is not None:
-                    # 日付のタイムゾーンを正規化して日付一致行を抽出
-                    dt_index = pd.to_datetime(close_data.index)
-                    try:
-                        dt_index = dt_index.tz_localize(None)
-                    except Exception:
-                        pass
-
-                    matching_mask = (dt_index.strftime("%Y-%m-%d") == date_str)
-                    matched = close_data[matching_mask]
-
-                    if not matched.empty:
-                        # 💡【重要】Series や DataFrame の形状に関係なく1次元配列化して最初の有効数値を抽出
-                        raw_vals = matched.to_numpy().flatten()
-                        valid_vals = [float(v) for v in raw_vals if pd.notna(v) and float(v) > 0]
-                        if valid_vals:
-                            yf_close = valid_vals[0]
-
-            cache[cache_key] = yf_close
-            logger.debug(f"_verify_against_yfinance_pure_close: 取得結果 {cache_key} -> yf_close={yf_close}")
+            cache[cache_key] = {"yf_close": yf_close, "is_daily_fallback": is_daily_fallback}
+            logger.debug(f"_verify_against_yfinance_pure_close: 取得結果 {cache_key} -> {cache[cache_key]}")
         except Exception as e:
             logger.warning(
-                f"_verify_against_yfinance_pure_close: yfinance取得失敗 ticker={ticker}, target_dt={target_dt}: {e}",
+                f"_verify_against_yfinance_pure_close: yfinance取得失敗 ticker={ticker}, target_dt={target_dt}, interval={interval}: {e}",
                 exc_info=True
             )
-            cache[cache_key] = None
+            cache[cache_key] = {"yf_close": None, "is_daily_fallback": is_daily_fallback}
     else:
         logger.debug(f"_verify_against_yfinance_pure_close: キャッシュヒット ({cache_key})")
 
-    yf_close = cache[cache_key]
+    cached = cache[cache_key]
+    yf_close = cached["yf_close"]
+    is_daily_fallback = cached["is_daily_fallback"]
 
     if yf_close is None or pd.isna(yf_close) or yf_close <= 0 or detected_close is None or pd.isna(detected_close):
         logger.debug(
@@ -223,16 +300,78 @@ def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: 
             f"(yf_close={yf_close}, detected_close={detected_close})"
         )
         # 突合材料が無い場合は「未検証」として安全側（不合格）に倒す
-        return {"yf_close": None, "deviation_pct": None, "passed": False}
+        return {"yf_close": None, "deviation_pct": None, "passed": False, "is_daily_fallback": is_daily_fallback}
 
     deviation_pct = abs(detected_close - yf_close) / yf_close * 100.0
     passed = deviation_pct <= VERIFY_DEVIATION_THRESHOLD_PCT
     logger.debug(
-        f"_verify_against_yfinance_pure_close: 突合結果 ticker={ticker}, date={date_str}, "
+        f"_verify_against_yfinance_pure_close: 突合結果 ticker={ticker}, date={date_str}, interval={interval}, "
         f"detected_close={detected_close}, yf_close={yf_close}, deviation_pct={deviation_pct:.3f}%, "
-        f"passed={passed} (閾値{VERIFY_DEVIATION_THRESHOLD_PCT}%)"
+        f"passed={passed}, is_daily_fallback={is_daily_fallback} (閾値{VERIFY_DEVIATION_THRESHOLD_PCT}%)"
     )
-    return {"yf_close": round(yf_close, 2), "deviation_pct": round(deviation_pct, 3), "passed": passed}
+    return {
+        "yf_close": round(yf_close, 2),
+        "deviation_pct": round(deviation_pct, 3),
+        "passed": passed,
+        "is_daily_fallback": is_daily_fallback
+    }
+
+
+def _verify_adjclose_continuity(ticker: str, cliff_dt, actual_dt, cache: dict,
+                                 window_days: int = 10,
+                                 jump_threshold_pct: float = ADJCLOSE_JUMP_THRESHOLD_PCT) -> dict:
+    """
+    仕様書Ⅰ-⑤拡張：Adj Close（auto_adjust=True）による独立した連続性チェック。
+
+    既知の公式分割はすべてyfinance側で遡及調整（back-adjust）されているはずなので、
+    「本当にその公式分割による崖」であれば、Adj Close系列は崖の前後で滑らか（断絶なし）になる。
+    逆に、崖の位置が既知の分割では説明できない暴落やデータ異常であれば、
+    Adj Closeで補正してもなお断絶（大きな変化率）が残る。
+
+    ⚠️ これは _verify_against_yfinance_pure_close（生値の絶対一致チェック）とは独立した、
+    別の観点の安全網。特に収集ラグにより崖の位置が公式ex_dateから大きくズレているケース
+    （放置による崖ズレ）では、この連続性チェックが最も効く。
+
+    戻り値: {"max_jump_pct": float|None, "passed": bool}
+    """
+    boundary_date = pd.to_datetime(actual_dt).normalize()
+    cache_key = f"adjcont_{ticker}_{boundary_date.strftime('%Y-%m-%d')}"
+
+    if cache_key not in cache:
+        logger.debug(f"_verify_adjclose_continuity: キャッシュ未ヒット。yfinanceへ問い合わせ中 ({cache_key})")
+        result = {"max_jump_pct": None, "passed": False}
+        try:
+            start = (boundary_date - timedelta(days=window_days * 2)).strftime("%Y-%m-%d")
+            end = (boundary_date + timedelta(days=window_days * 2)).strftime("%Y-%m-%d")
+            df_adj = yf.download(
+                f"{ticker}.T", start=start, end=end,
+                auto_adjust=True,  # 既知の分割・配当を遡及調整した「連続な」価格系列
+                actions=False, progress=False, timeout=15
+            )
+            s = _extract_close_series(df_adj)
+            if s is not None and len(s) >= 2:
+                pct_changes = s.pct_change().abs() * 100.0
+                # 境界日 ±window_days 営業日程度の範囲だけを見る（無関係な遠い変動を拾わないため）
+                near_mask = (
+                    (s.index >= boundary_date - pd.Timedelta(days=window_days)) &
+                    (s.index <= boundary_date + pd.Timedelta(days=window_days))
+                )
+                near_changes = pct_changes[near_mask].dropna()
+                if not near_changes.empty:
+                    max_jump = float(near_changes.max())
+                    result = {"max_jump_pct": round(max_jump, 3), "passed": max_jump <= jump_threshold_pct}
+            cache[cache_key] = result
+            logger.debug(f"_verify_adjclose_continuity: 取得結果 {cache_key} -> {result}")
+        except Exception as e:
+            logger.warning(
+                f"_verify_adjclose_continuity: yfinance取得失敗 ticker={ticker}, boundary_date={boundary_date}: {e}",
+                exc_info=True
+            )
+            cache[cache_key] = {"max_jump_pct": None, "passed": False}
+    else:
+        logger.debug(f"_verify_adjclose_continuity: キャッシュヒット ({cache_key})")
+
+    return cache[cache_key]
 
 def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_val: float,
                           daily_after_close: float, yf_cache: dict, status_callback=None) -> dict:
@@ -336,10 +475,20 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
                 "verify": {"yf_close": None, "deviation_pct": None, "passed": True},
                 "status": "[処理済み・スキップ]"}
 
-    # 仕様書Ⅰ-⑤：同日のyfinance純粋Closeとの突合（日足の確定値を正解データとして使用）
-    verify = _verify_against_yfinance_pure_close(ticker, actual_dt, after_close, yf_cache)
+    # 仕様書Ⅰ-⑤：当該足自体のyfinance生値との突合（取得可能期間外なら日足に自動フォールバック）
+    verify = _verify_against_yfinance_pure_close(ticker, actual_dt, after_close, yf_cache, interval=interval)
 
-    status_label = "[正常分割]" if verify["passed"] else "[不一致：暴落またはノイズ疑い]"
+    # 仕様書Ⅰ-⑤拡張：Adj Close連続性チェック（既知の分割で本当に説明できる崖かの独立検証）
+    adjcont = _verify_adjclose_continuity(ticker, cliff_dt, actual_dt, yf_cache)
+    verify["adjclose_max_jump_pct"] = adjcont["max_jump_pct"]
+    verify["adjclose_passed"] = adjcont["passed"]
+    verify["passed"] = bool(verify["passed"]) and bool(adjcont["passed"])
+
+    # 💡【重要】「要パッチ」は「これから正しい分割としてパッチ適用する対象」を意味するので、
+    # 「メタデータのみ更新（何もしない）」側の「[正常分割]」とは別の文言にして混同を防ぐ
+    status_label = "[パッチ対象・分割整合OK]" if verify["passed"] else "[不一致：暴落またはノイズ疑い]"
+    if verify.get("is_daily_fallback") and verify["passed"]:
+        status_label = "[パッチ対象・分割整合OK（日足代用突合）]"
     if actual_dt < pd.to_datetime(actual_day_dt):
         status_label = "[⚠️先回り調整混入（警告）]"
 
@@ -551,20 +700,30 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                 close_prev_val = row_prev["close"]
 
                 # ── 仕様書Ⅰ-⑤：yfinance純粋Closeとの突合・多重防護アサーション ──
-                verify = _verify_against_yfinance_pure_close(ticker, actual_dt, close_T_val, yf_cache)
+                verify = _verify_against_yfinance_pure_close(ticker, actual_dt, close_T_val, yf_cache, interval="1d")
+
+                # ── 仕様書Ⅰ-⑤拡張：Adj Close連続性チェック（放置による崖ズレでも機能する独立検証） ──
+                adjcont = _verify_adjclose_continuity(ticker, cliff_dt, actual_dt, yf_cache)
+                verify["adjclose_max_jump_pct"] = adjcont["max_jump_pct"]
+                verify["adjclose_passed"] = adjcont["passed"]
+                verify["passed"] = bool(verify["passed"]) and bool(adjcont["passed"])
+
                 mode = "要パッチ"
 
                 if not verify["passed"]:
                     status_label = "[不一致：暴落またはノイズ疑い（選択不可）]"
                     logger.warning(
                         f"ticker={ticker}: 突合不一致を検出しました。安全ロックを適用します。 "
-                        f"deviation_pct={verify['deviation_pct']}, yf_close={verify['yf_close']}, detected_close={close_T_val}"
+                        f"deviation_pct={verify['deviation_pct']}, yf_close={verify['yf_close']}, detected_close={close_T_val}, "
+                        f"adjclose_max_jump_pct={verify['adjclose_max_jump_pct']}"
                     )
                 elif actual_dt < planned_dt:
                     status_label = "[⚠️先回り調整混入（警告）]"
                     logger.debug(f"ticker={ticker}: 先回り調整混入を検出 actual_dt={actual_dt} < planned_dt={planned_dt}")
                 else:
-                    status_label = "[正常分割]"
+                    # 💡【重要】「メタデータのみ更新（何もしない）」側の「[正常分割]」と同じ文言だと、
+                    # 「要パッチ」なのに何もしなくていいように見えてしまうため、専用の文言にする
+                    status_label = "[パッチ対象・分割整合OK]"
             else:
                 # 崖がルックバック期間内に検出されなかった場合（すでに全データが先回り調整済みなど）
                 mode = "メタデータのみ更新"
@@ -576,7 +735,7 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                 if ex_date_idx > 0:
                     close_prev_val = df_ticker.iloc[ex_date_idx - 1]["close"]
 
-                verify = _verify_against_yfinance_pure_close(ticker, actual_dt, close_T_val, yf_cache)
+                verify = _verify_against_yfinance_pure_close(ticker, actual_dt, close_T_val, yf_cache, interval="1d")
                 status_label = "[正常分割]" if verify["passed"] else "[不一致：要目視確認（選択不可）]"
                 logger.debug(f"ticker={ticker}: 日足段差なし -> メタデータのみ更新モード, status={status_label}")
 
@@ -595,6 +754,7 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                     "after_close": round(close_T_val, 2) if not pd.isna(close_T_val) else 0.0,
                     "yf_close": verify["yf_close"],
                     "deviation_pct": verify["deviation_pct"],
+                    "adjclose_max_jump_pct": verify.get("adjclose_max_jump_pct"),
                     "status": status_label,
                     "is_selectable": is_selectable,
                 })
@@ -647,6 +807,7 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                             "after_close": round(tf_result["after_close"], 2) if not pd.isna(tf_result["after_close"]) else 0.0,
                             "yf_close": tf_verify.get("yf_close"),
                             "deviation_pct": tf_verify.get("deviation_pct"),
+                            "adjclose_max_jump_pct": tf_verify.get("adjclose_max_jump_pct"),
                             "status": tf_result["status"],
                             "is_selectable": tf_selectable,
                         })
