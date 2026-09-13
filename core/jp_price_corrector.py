@@ -317,85 +317,79 @@ def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: 
     }
 
 
-def _verify_split_via_adjustment_factor(ticker: str, cliff_dt, actual_dt, cache: dict,
-                                         window_days: int = 10,
-                                         min_side_points: int = 2,
-                                         ratio_change_threshold_pct: float = ADJCLOSE_JUMP_THRESHOLD_PCT) -> dict:
+def _verify_split_via_local_cliff_adjclose(ticker: str, cliff_dt, actual_dt,
+                                            before_close: float, after_close: float,
+                                            cache: dict,
+                                            match_tolerance_pct: float = ADJCLOSE_JUMP_THRESHOLD_PCT) -> dict:
     """
-    仕様書Ⅰ-⑤拡張：「調整係数（生Close ÷ Adj Close）」が崖を境に変化するかどうかによる、
-    分割と暴落・ノイズを見分ける独立検証。
+    仕様書Ⅰ-⑤拡張：DBで検出した崖の「まさにその前後2点」について、
+    ローカルDBの生値の変化率と、yfinanceのAdj Closeの変化率を比較する独立検証。
 
     考え方：
-    ・調整係数は「その日以降に起きた全ての既知分割・配当をどれだけ遡及調整しているか」を表す。
-    ・本物の分割なら、その分割のex_dateを境に調整係数そのものが変化する
-      （その分割ぶんの遡及調整が、ex_date以降は不要になるため）。
-    ・単なる暴落やデータ異常なら、それは「既知の調整イベント」ではないので、
-      調整係数は崖の前後で変化しない（同じ係数のまま）。
-    ・崖の前後どちらにも同じように乗る「将来の無関係な分割・配当の影響」は、
-      前後の比率同士を比較することで自動的に相殺される（絶対値比較ではなく差分比較にしているため）。
+    ・崖の前後の変化率は、配信時の生値であろうとAdj Closeであろうと、
+      「その値動き自体が本物の値動きなら」同じ変化率になるはずである。
+    ・唯一これがズレるのは、DB側の変化が「既知の分割」に由来する場合。
+      その場合yfinanceのAdj Closeはその分割を遡及調整で吸収してしまっているため、
+      同じ日付ペアで見てもAdj Close側にはほとんど変化が残らない。
+    ・つまり、DBの変化率とyfinance Adj Closeの変化率が「一致していれば暴落等の本物の値動き」、
+      「大きく乖離していれば（Adj Close側の変化が小さければ）分割による段差」と判定できる。
 
-    ⚠️ これは _verify_against_yfinance_pure_close（生値の絶対一致チェック）とは独立した、
-    別の観点の安全網。特に収集ラグにより崖の位置が公式ex_dateから大きくズレているケース
-    （放置による崖ズレ）でも、ex_date自体さえ跨いでいれば機能する。
+    ⚠️【重要】ex_dateからの絶対距離や「今日」のような遠い基準点に一切依存しない。
+    DBが検出した「まさにその日」のペアだけで完結するため、収集ラグで崖がどこにズレていても、
+    その崖自体がその2点の間で本物の値動きかどうかだけを直接判定できる
+    （ただし、崖の位置が公式ex_dateより前にズレている「先回り調整混入」ケースは対象外。
+    その期間はyfinance自身もまだ遡及調整の起点と認識していないため、Adj Closeにも
+    同じ変化が残ってしまい判定できない。このケースは呼び出し側で別途除外している）。
 
-    戻り値: {"ratio_before": float|None, "ratio_after": float|None,
-             "ratio_change_pct": float|None, "passed": bool}
+    戻り値: {"yf_adj_ratio": float|None, "local_raw_ratio": float|None,
+             "ratio_gap_pct": float|None, "passed": bool}
     """
-    boundary_date = pd.to_datetime(actual_dt).normalize()
-    cache_key = f"adjfactor_{ticker}_{boundary_date.strftime('%Y-%m-%d')}"
+    before_date = pd.to_datetime(cliff_dt).normalize()
+    after_date = pd.to_datetime(actual_dt).normalize()
+    cache_key = f"adjpair_{ticker}_{before_date.strftime('%Y-%m-%d')}_{after_date.strftime('%Y-%m-%d')}"
 
     if cache_key not in cache:
-        logger.debug(f"_verify_split_via_adjustment_factor: キャッシュ未ヒット。yfinanceへ問い合わせ中 ({cache_key})")
-        result = {"ratio_before": None, "ratio_after": None, "ratio_change_pct": None, "passed": False}
+        logger.debug(f"_verify_split_via_local_cliff_adjclose: キャッシュ未ヒット。yfinanceへ問い合わせ中 ({cache_key})")
+        result = {"yf_adj_ratio": None, "local_raw_ratio": None, "ratio_gap_pct": None, "passed": False}
         try:
-            start = (boundary_date - timedelta(days=window_days * 3)).strftime("%Y-%m-%d")
-            end = (boundary_date + timedelta(days=window_days * 3)).strftime("%Y-%m-%d")
+            local_raw_ratio = None
+            if before_close and not pd.isna(before_close) and before_close > 0 and after_close is not None and not pd.isna(after_close):
+                local_raw_ratio = float(after_close) / float(before_close)
 
-            df_raw = yf.download(f"{ticker}.T", start=start, end=end,
-                                  auto_adjust=False, actions=False, progress=False, timeout=15)
-            df_adj = yf.download(f"{ticker}.T", start=start, end=end,
-                                  auto_adjust=True, actions=False, progress=False, timeout=15)
+            if local_raw_ratio is not None:
+                start = (before_date - timedelta(days=7)).strftime("%Y-%m-%d")
+                end = (after_date + timedelta(days=7)).strftime("%Y-%m-%d")
+                df_adj = yf.download(f"{ticker}.T", start=start, end=end,
+                                      auto_adjust=True, actions=False, progress=False, timeout=15)
+                adj_before = _extract_close_on_date(df_adj, before_date.strftime("%Y-%m-%d"))
+                adj_after = _extract_close_on_date(df_adj, after_date.strftime("%Y-%m-%d"))
 
-            s_raw = _extract_close_series(df_raw)
-            s_adj = _extract_close_series(df_adj)
-
-            if s_raw is not None and s_adj is not None:
-                df_ratio = pd.DataFrame({"raw": s_raw, "adj": s_adj}).dropna()
-                df_ratio = df_ratio[(df_ratio["raw"] > 0) & (df_ratio["adj"] > 0)]
-                # 調整係数 = 生値 ÷ Adj Close（分割・配当を遡及調整するために掛けている倍率の逆数）
-                df_ratio["ratio"] = df_ratio["raw"] / df_ratio["adj"]
-
-                before_mask = (df_ratio.index < boundary_date) & (df_ratio.index >= boundary_date - pd.Timedelta(days=window_days))
-                after_mask = (df_ratio.index >= boundary_date) & (df_ratio.index <= boundary_date + pd.Timedelta(days=window_days))
-
-                ratios_before = df_ratio.loc[before_mask, "ratio"].tail(min_side_points)
-                ratios_after = df_ratio.loc[after_mask, "ratio"].head(min_side_points)
-
-                if len(ratios_before) >= 1 and len(ratios_after) >= 1:
-                    ratio_before = float(ratios_before.mean())
-                    ratio_after = float(ratios_after.mean())
-                    if ratio_before > 0:
-                        ratio_change_pct = abs(ratio_after - ratio_before) / ratio_before * 100.0
-                        # 💡【重要】ここは「一致度」ではなく「変化度」を見ている。
-                        # 変化が大きい＝既知の分割イベントによる調整係数の切り替わりが実在する＝分割
-                        # 変化が小さい＝調整係数は変わっていない＝この崖は分割で説明できない＝暴落・ノイズ疑い
-                        passed = ratio_change_pct >= ratio_change_threshold_pct
-                        result = {
-                            "ratio_before": round(ratio_before, 4),
-                            "ratio_after": round(ratio_after, 4),
-                            "ratio_change_pct": round(ratio_change_pct, 3),
-                            "passed": passed
-                        }
+                if adj_before is not None and adj_before > 0 and adj_after is not None:
+                    yf_adj_ratio = adj_after / adj_before
+                    # 変化率(%)ベースに揃えて差分を取る（比率のまま引き算するより解釈しやすいため）
+                    local_change_pct = (1.0 - local_raw_ratio) * 100.0
+                    yf_change_pct = (1.0 - yf_adj_ratio) * 100.0
+                    ratio_gap_pct = abs(local_change_pct - yf_change_pct)
+                    # 💡【重要】gapが小さい＝Adj Closeでも同じだけ動いている＝本物の値動き（暴落）
+                    #          gapが大きい＝Adj Closeではほとんど動いていない＝既知の分割で吸収済み＝本物の分割
+                    passed = ratio_gap_pct >= match_tolerance_pct
+                    result = {
+                        "yf_adj_ratio": round(yf_adj_ratio, 4),
+                        "local_raw_ratio": round(local_raw_ratio, 4),
+                        "ratio_gap_pct": round(ratio_gap_pct, 3),
+                        "passed": passed
+                    }
             cache[cache_key] = result
-            logger.debug(f"_verify_split_via_adjustment_factor: 取得結果 {cache_key} -> {result}")
+            logger.debug(f"_verify_split_via_local_cliff_adjclose: 取得結果 {cache_key} -> {result}")
         except Exception as e:
             logger.warning(
-                f"_verify_split_via_adjustment_factor: yfinance取得失敗 ticker={ticker}, boundary_date={boundary_date}: {e}",
+                f"_verify_split_via_local_cliff_adjclose: yfinance取得失敗 ticker={ticker}, "
+                f"before_date={before_date}, after_date={after_date}: {e}",
                 exc_info=True
             )
-            cache[cache_key] = {"ratio_before": None, "ratio_after": None, "ratio_change_pct": None, "passed": False}
+            cache[cache_key] = {"yf_adj_ratio": None, "local_raw_ratio": None, "ratio_gap_pct": None, "passed": False}
     else:
-        logger.debug(f"_verify_split_via_adjustment_factor: キャッシュヒット ({cache_key})")
+        logger.debug(f"_verify_split_via_local_cliff_adjclose: キャッシュヒット ({cache_key})")
 
     return cache[cache_key]
 
@@ -508,14 +502,15 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
         status_label = "[不一致：暴落またはノイズ疑い]"
     elif actual_dt < pd.to_datetime(actual_day_dt):
         # 💡【重要】先回り調整混入はex_dateより前にズレているケースであり、
-        # 調整係数チェックはYahoo自身のex_date基準に依存するため、
-        # このケースでは構造的に必ず不合格になる（暴落・ノイズとは無関係）。
+        # この期間はyfinance自身もまだ遡及調整の起点と認識していないため、
+        # Adj Closeにも同じ変化が残ってしまい判定できない（暴落・ノイズとは無関係）。
         # そのためこのチェックの対象から意図的に除外する。
         status_label = "[⚠️先回り調整混入（警告）]"
     else:
-        # 仕様書Ⅰ-⑤拡張：調整係数（生値÷Adj Close）の前後変化チェック（先回り調整混入ではないケースにのみ適用）
-        adjfactor = _verify_split_via_adjustment_factor(ticker, cliff_dt, actual_dt, yf_cache)
-        verify["adj_factor_change_pct"] = adjfactor["ratio_change_pct"]
+        # 仕様書Ⅰ-⑤拡張：崖の前後2点でDB生値変化率とyfinance Adj Close変化率を比較
+        # （先回り調整混入ではないケースにのみ適用）
+        adjfactor = _verify_split_via_local_cliff_adjclose(ticker, cliff_dt, actual_dt, before_close, after_close, yf_cache)
+        verify["adj_factor_change_pct"] = adjfactor["ratio_gap_pct"]
         verify["adj_factor_passed"] = adjfactor["passed"]
         verify["passed"] = bool(verify["passed"]) and bool(adjfactor["passed"])
 
@@ -745,18 +740,18 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                     )
                 elif actual_dt < planned_dt:
                     # 💡【重要】「先回り調整混入」は actual_dt が公式 ex_date より前にズレているケース。
-                    # 調整係数チェックはYahoo自身が記録するex_dateを基準に変化するため、
-                    # ex_dateより前の時点では構造的に不合格になりうる
+                    # この期間はyfinance自身もまだ遡及調整の起点と認識していないため、
+                    # Adj Closeにも同じ変化が残ってしまい判定できない
                     # （＝Yahooの調整ロジックの前提とズレているだけで、暴落・ノイズとは無関係）。
-                    # そのためこのケースは調整係数チェックの対象から意図的に除外し、
+                    # そのためこのケースは調整チェックの対象から意図的に除外し、
                     # 生値突合の一致のみで「先回り調整混入（警告）」として確定させる。
                     status_label = "[⚠️先回り調整混入（警告）]"
                     logger.debug(f"ticker={ticker}: 先回り調整混入を検出 actual_dt={actual_dt} < planned_dt={planned_dt}")
                 else:
-                    # ── 仕様書Ⅰ-⑤拡張：調整係数（生値÷Adj Close）の前後変化チェック ──
+                    # ── 仕様書Ⅰ-⑤拡張：崖の前後2点でDB生値変化率とyfinance Adj Close変化率を比較 ──
                     # （放置による崖ズレでも機能する独立検証。先回り調整混入ではないケースにのみ適用する）
-                    adjfactor = _verify_split_via_adjustment_factor(ticker, cliff_dt, actual_dt, yf_cache)
-                    verify["adj_factor_change_pct"] = adjfactor["ratio_change_pct"]
+                    adjfactor = _verify_split_via_local_cliff_adjclose(ticker, cliff_dt, actual_dt, close_prev_val, close_T_val, yf_cache)
+                    verify["adj_factor_change_pct"] = adjfactor["ratio_gap_pct"]
                     verify["adj_factor_passed"] = adjfactor["passed"]
                     verify["passed"] = bool(verify["passed"]) and bool(adjfactor["passed"])
 
