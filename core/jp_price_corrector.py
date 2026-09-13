@@ -265,18 +265,10 @@ def _find_ceil_value(s: pd.Series, target_ts):
 
 
 def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: float, cache: dict,
-                                         interval: str = "1d") -> dict:
+                                         interval: str = "1d", s_val: float = 1.0) -> dict:
     """
-    仕様書Ⅰ-⑤：yfinance「純粋な取引値Close」（配当ノイズを含まない、auto_adjust=False の Close）
-    との突合により、乖離率を計算し、暴落誤認を排除する多重防護アサーションを行います。
-
-    ⚠️【重要】interval を明示的に指定することで、60m/5m/1mの突合ではまずその足自体の
-    イントラデイ値との照合を試みる。yfinance側の取得可能期間（1mは実測7〜8日程度など）を
-    超えていて取得できない場合のみ、日足のCloseで代用する（is_daily_fallback=True で明示）。
-    以前の実装は interval を一切指定していなかったため、常に日足のCloseと比較しており、
-    intraday側の突合値が実質的に無意味だった。
-
-    戻り値: {"yf_close": float|None, "deviation_pct": float|None, "passed": bool, "is_daily_fallback": bool}
+    yfinance「純粋な取引値Close」との突合アサーション。
+    yfinanceの分足が当時の旧スケール生値（新スケールのs_val倍）で返ってきた場合も考慮して正確に判定します。
     """
     target_ts = pd.to_datetime(target_dt)
     date_str = target_ts.strftime("%Y-%m-%d")
@@ -302,10 +294,6 @@ def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: 
                 )
                 yf_close = _extract_close_at_timestamp(df_intraday, target_ts)
                 if yf_close is None:
-                    logger.debug(
-                        f"_verify_against_yfinance_pure_close: interval={interval} のイントラデイ突合に失敗"
-                        f"（取得可能期間外の可能性）。日足へフォールバックします。"
-                    )
                     is_daily_fallback = True
 
             if yf_close is None:
@@ -313,7 +301,7 @@ def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: 
                     f"{ticker}.T",
                     start=(target_ts - timedelta(days=3)).strftime("%Y-%m-%d"),
                     end=(target_ts + timedelta(days=3)).strftime("%Y-%m-%d"),
-                    auto_adjust=False,   # 配当・分割の事後調整をかけない、実際の取引値そのもの
+                    auto_adjust=False,
                     actions=False,
                     progress=False,
                     timeout=15
@@ -321,42 +309,41 @@ def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: 
                 yf_close = _extract_close_on_date(df_daily, date_str)
 
             cache[cache_key] = {"yf_close": yf_close, "is_daily_fallback": is_daily_fallback}
-            logger.debug(f"_verify_against_yfinance_pure_close: 取得結果 {cache_key} -> {cache[cache_key]}")
         except Exception as e:
-            logger.warning(
-                f"_verify_against_yfinance_pure_close: yfinance取得失敗 ticker={ticker}, target_dt={target_dt}, interval={interval}: {e}",
-                exc_info=True
-            )
+            logger.warning(f"_verify_against_yfinance_pure_close: yfinance取得失敗 ticker={ticker}: {e}", exc_info=True)
             cache[cache_key] = {"yf_close": None, "is_daily_fallback": is_daily_fallback}
-    else:
-        logger.debug(f"_verify_against_yfinance_pure_close: キャッシュヒット ({cache_key})")
 
     cached = cache[cache_key]
     yf_close = cached["yf_close"]
     is_daily_fallback = cached["is_daily_fallback"]
 
     if yf_close is None or pd.isna(yf_close) or yf_close <= 0 or detected_close is None or pd.isna(detected_close):
-        logger.debug(
-            f"_verify_against_yfinance_pure_close: 突合材料不足のため不合格扱い "
-            f"(yf_close={yf_close}, detected_close={detected_close})"
-        )
-        # 突合材料が無い場合は「未検証」として安全側（不合格）に倒す
         return {"yf_close": None, "deviation_pct": None, "passed": False, "is_daily_fallback": is_daily_fallback}
 
-    deviation_pct = abs(detected_close - yf_close) / yf_close * 100.0
-    passed = deviation_pct <= VERIFY_DEVIATION_THRESHOLD_PCT
-    logger.debug(
-        f"_verify_against_yfinance_pure_close: 突合結果 ticker={ticker}, date={date_str}, interval={interval}, "
-        f"detected_close={detected_close}, yf_close={yf_close}, deviation_pct={deviation_pct:.3f}%, "
-        f"passed={passed}, is_daily_fallback={is_daily_fallback} (閾値{VERIFY_DEVIATION_THRESHOLD_PCT}%)"
-    )
+    # 💡 判定ロジックの改善：
+    # パターンA: yfinanceが新スケールに改定済みの場合 (|detected_close - yf_close|)
+    dev_direct = abs(detected_close - yf_close) / yf_close * 100.0
+
+    # パターンB: yfinanceが当時の旧スケール生値のままの場合 (|detected_close * s_val - yf_close|)
+    dev_scaled = abs(detected_close * s_val - yf_close) / yf_close * 100.0 if s_val > 0 else 999.0
+
+    # より合致している方を採用
+    if dev_direct <= VERIFY_DEVIATION_THRESHOLD_PCT:
+        deviation_pct = dev_direct
+        passed = True
+    elif dev_scaled <= VERIFY_DEVIATION_THRESHOLD_PCT:
+        deviation_pct = dev_scaled
+        passed = True
+    else:
+        deviation_pct = min(dev_direct, dev_scaled)
+        passed = False
+
     return {
         "yf_close": round(yf_close, 2),
         "deviation_pct": round(deviation_pct, 3),
         "passed": passed,
         "is_daily_fallback": is_daily_fallback
     }
-
 
 # 調整整合性チェックで試す足の順序（細かい順→粗い順）。
 # yfinance側の取得可能期間外なら自動的に次の粗い足へフォールバックする。
@@ -489,7 +476,6 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
                           daily_after_close: float, yf_cache: dict, status_callback=None) -> dict:
     """
     下位時間足（60m/5m/1m）の段差オートフォーカス走査。
-    該当銘柄・時間足をピンポイント走査し、無条件で生値突合および分割説明ギャップを計算します。
     """
     logger.debug(f"_scan_intraday_cliff: 開始 ticker={ticker}, interval={interval}, ex_date={ex_date}, actual_day_dt={actual_day_dt}, s_val={s_val}")
 
@@ -547,7 +533,7 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
     before_close = row_prev["close"]
     after_close = row_T["close"]
 
-    # 重複判定：すでに patched_multiplier が書き換わっている場合はスキップ
+    # 重複判定
     mult_T = row_T["patched_multiplier"]
     mult_prev = row_prev["patched_multiplier"]
     if mult_T > 0 and abs((mult_prev / mult_T) - 1.0) > 0.15:
@@ -556,10 +542,9 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
                 "verify": {"yf_close": None, "deviation_pct": None, "passed": True},
                 "status": "[処理済み・スキップ]"}
 
-    # ① 当該足自体のyfinance生値との突合
-    verify = _verify_against_yfinance_pure_close(ticker, actual_dt, after_close, yf_cache, interval=interval)
+    # 💡 s_val を渡して、旧スケール生値（2806円など）でも正しく照合できるようにする
+    verify = _verify_against_yfinance_pure_close(ticker, actual_dt, after_close, yf_cache, interval=interval, s_val=s_val)
 
-    # ② elifバイパスを廃止し、無条件で分割説明ギャップ（Adj Closeとの比較）を計算
     adjfactor = _verify_split_via_local_cliff_adjclose(ticker, cliff_dt, actual_dt, before_close, after_close, yf_cache)
     verify["split_explain_gap_pct"] = adjfactor["ratio_gap_pct"]
     verify["split_explain_gap_passed"] = adjfactor["passed"]
@@ -568,7 +553,6 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
     gap_passed = adjfactor["passed"]
     verify["passed"] = bool(pure_passed) and bool(gap_passed)
 
-    # ステータス表示の判定（選択可否のロック文言は撤廃し、注意喚起にとどめる）
     if pure_passed and gap_passed:
         status_label = "[パッチ対象・分割整合OK（日足代用突合）]" if verify.get("is_daily_fallback") else "[パッチ対象・分割整合OK]"
     elif not pure_passed:
