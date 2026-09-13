@@ -161,7 +161,7 @@ def _find_cliff_reverse(rows: list, min_R: float, max_R: float, max_gap_days: fl
 def _extract_close_series(df: pd.DataFrame):
     """
     yf.download() の戻りDataFrameから、MultiIndex/通常カラムいずれの形状にも対応して
-    "Close" 列をtz-naiveなDatetimeIndexの1次元Seriesとして抽出する共通ヘルパー。
+    "Close" 列を日本時間(JST)基準のtz-naiveなDatetimeIndexの1次元Seriesとして抽出する共通ヘルパー。
     抽出できない場合は None を返す。
     """
     if df is None or df.empty:
@@ -181,14 +181,21 @@ def _extract_close_series(df: pd.DataFrame):
         close_data = close_data.iloc[:, 0]
 
     idx = pd.to_datetime(close_data.index)
+    # 💡 タイムゾーンがついている場合は、日本時間に変換した上でtz情報を除去する
     try:
-        idx = idx.tz_localize(None)
+        if idx.tz is not None:
+            idx = idx.tz_convert("Asia/Tokyo").tz_localize(None)
+        else:
+            idx = idx.tz_localize(None)
     except Exception:
-        pass
+        try:
+            idx = idx.tz_localize(None)
+        except Exception:
+            pass
+
     close_data = close_data.copy()
     close_data.index = idx
     return close_data.sort_index()
-
 
 def _extract_close_on_date(df: pd.DataFrame, date_str: str):
     """指定日付(YYYY-MM-DD)に一致する行から、最初の有効な正の値を抽出する。"""
@@ -206,8 +213,7 @@ def _extract_close_on_date(df: pd.DataFrame, date_str: str):
 def _extract_close_at_timestamp(df: pd.DataFrame, target_ts, tolerance_minutes: int = 90):
     """
     指定タイムスタンプに最も近い時刻の値を抽出する（イントラデイ突合用）。
-    許容誤差(tolerance_minutes)を超えて最も近い行が離れている場合は None を返す
-    （＝データはあるが該当時刻の値としては使えないと判断）。
+    許容誤差(tolerance_minutes)を超えて最も近い行が離れている場合は None を返す。
     """
     s = _extract_close_series(df)
     if s is None or s.empty:
@@ -215,13 +221,18 @@ def _extract_close_at_timestamp(df: pd.DataFrame, target_ts, tolerance_minutes: 
     s = s[s > 0].dropna()
     if s.empty:
         return None
-    target_np = np.datetime64(pd.to_datetime(target_ts))
-    time_diffs_sec = np.abs((s.index.values - target_np).astype("timedelta64[s]").astype(float))
-    min_idx = int(np.argmin(time_diffs_sec))
-    if time_diffs_sec[min_idx] > tolerance_minutes * 60:
+
+    target_dt = pd.to_datetime(target_ts)
+    if getattr(target_dt, "tz", None) is not None:
+        target_dt = target_dt.tz_convert("Asia/Tokyo").tz_localize(None)
+
+    # 💡 PandasのDatetimeIndex同士で絶対時間差（分）を安全に計算
+    diff_minutes = np.abs((s.index - target_dt).total_seconds()) / 60.0
+    min_idx = int(np.argmin(diff_minutes))
+
+    if diff_minutes[min_idx] > tolerance_minutes:
         return None
     return float(s.iloc[min_idx])
-
 
 def _find_floor_value(s: pd.Series, target_ts):
     """
