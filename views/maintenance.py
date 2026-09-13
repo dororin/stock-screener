@@ -658,9 +658,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         "予定日の過去45日間におよぶ「面」のルックバック走査により、収集ズレや先回り調整された不整合（崖）も確実に見つけ出します。"
     )
 
-    # ── 状態管理フラグの初期化 ──
-    # 💡【重要】if btn_scan: のようなその場限りのボタン判定（1フレームしか真にならない）ではなく、
-    # セッションフラグで実行状態を保持することで、途中で再描画が起きても処理とUIが消失しないようにする。
     if "jp_scan_is_running" not in st.session_state:
         st.session_state["jp_scan_is_running"] = False
 
@@ -671,7 +668,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             key="btn_jp_split_scan",
             type="primary",
             use_container_width=True,
-            disabled=st.session_state["jp_scan_is_running"]  # 実行中は連打を物理ロック
+            disabled=st.session_state["jp_scan_is_running"]
         ):
             st.session_state["jp_scan_is_running"] = True
             st.rerun()
@@ -682,12 +679,10 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
                 st.session_state["jp_split_scan_result"] = None
                 st.rerun()
 
-    # ── スキャン実行ブロック（フラグがTrueの間は確実に表示・維持される） ──
     if st.session_state["jp_scan_is_running"]:
         status_box = st.status("📡 日本株 統合段差スキャンを実行中...", expanded=True)
         with status_box:
             def on_scan_progress(msg):
-                # ログをUIへリアルタイム送信してWebSocket切断（タイムアウト）を防止
                 st.write(msg)
 
             try:
@@ -701,10 +696,8 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             finally:
                 st.session_state["jp_scan_is_running"] = False
 
-        # 完了後に結果テーブルを即座に描画
         st.rerun()
 
-    # ── 結果テーブルの描画ブロック ──
     result_df = st.session_state.get("jp_split_scan_result")
     if result_df is None:
         return
@@ -715,9 +708,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
 
     st.warning(f"⚠️ {len(result_df)}件の不整合を検出しました（{result_df['ticker'].nunique()}銘柄）")
 
-    if "is_selectable" not in result_df.columns:
-        result_df["is_selectable"] = True
-
     display_df = result_df.copy()
     display_df["選択"] = False
 
@@ -727,8 +717,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         "interval": "時間足",
         "ex_date": "公式予定日(ex_date)",
         "actual_date": "実質段差日(actual_date)",
-        # 💡「真の境界日(cliff_date)」は実質段差日の1本前の足を表すだけで、
-        # 目視ではほぼ自明なため表示からは外す（内部変数(cliff_dt)としては引き続き使用する）
         "splits": "分割比率(splits)",
         "mode": "調整タイプ(mode)",
         "multiplier": "調整倍率(multiplier)",
@@ -737,8 +725,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         "yf_close": "yfinance突合値",
         "deviation_pct": "生値乖離率(%)",
         "split_explain_gap_pct": "分割説明ギャップ(%)",
-        "status": "警告状態(status)",
-        "is_selectable": "選択可否",
+        "status": "判定状態(status)",
     }
     display_df = display_df.rename(columns=rename_map)
     ordered_cols = [c for c in rename_map.values() if c in display_df.columns]
@@ -750,30 +737,22 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         hide_index=True,
         disabled=[c for c in ordered_cols if c != "選択"],
         column_config={
-            "選択": st.column_config.CheckboxColumn("選択", help="微小分割（ボラティリティ疑い）は手動目視で選択してください"),
-            "選択可否": st.column_config.CheckboxColumn("選択可否", help="False の行は突合乖離率が閾値超過のため、選択しても適用対象から除外されます"),
+            "選択": st.column_config.CheckboxColumn("選択", help="適用したい行にチェックを入れてください"),
         },
         key="jp_split_scan_editor",
     )
 
-    selected_rows = edited_df[(edited_df["選択"] == True) & (edited_df["選択可否"] == True)]
-    n_blocked = len(edited_df[(edited_df["選択"] == True) & (edited_df["選択可否"] == False)])
-    if n_blocked > 0:
-        st.error(f"🛑 {n_blocked}件は突合乖離率が閾値超過のため選択されていても適用対象から除外されます。")
+    # 💡 選択不可ロックを廃止：ユーザーが「選択」にチェックを入れた行をすべて適用対象にする
+    selected_rows = edited_df[edited_df["選択"] == True]
     st.caption(f"現在 {len(selected_rows)} 件が適用対象として選択されています。")
 
     if st.button("🚀 選択した日本株パッチを一括本番適用", key="btn_bulk_apply_jp_selected", type="primary", use_container_width=True, disabled=selected_rows.empty):
         status_box = st.status("📡 日本株一括修復パッチを実行中...", expanded=True)
         with status_box:
             from core.jp_price_corrector import apply_jp_patch_to_all_timeframes
-            import time
 
             grouped = {}
             for idx, r in selected_rows.iterrows():
-                # 💡【重要】表示用にリネーム・一部列を非表示にしたdisplay_df/edited_dfではなく、
-                # 元のresult_df（英語列名のまま、全列保持）からindexで引き直す。
-                # 表示列名の変更や列の非表示化に、パッチ適用ロジックが引きずられて
-                # KeyErrorになるのを防ぐため（実際、前回の列名変更でこの箇所は参照が古いままになっていた）。
                 orig = result_df.loc[idx]
                 ticker = orig["ticker"]
                 grouped.setdefault(ticker, []).append({

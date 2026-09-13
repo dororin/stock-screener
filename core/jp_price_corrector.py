@@ -477,28 +477,15 @@ def _verify_split_via_local_cliff_adjclose(ticker: str, cliff_dt, actual_dt,
 def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_val: float,
                           daily_after_close: float, yf_cache: dict, status_callback=None) -> dict:
     """
-    仕様書Ⅰ-④：下位時間足（60m/5m/1m）の段差オートフォーカス。
-    該当銘柄・該当時間足のみをピンポイント投影ロードし、
-    実際に価格が跳んでいる正確な日時（ミリ秒単位のタイムスタンプ）を自律特定します。
-
-    ⚠️【重要】楽天RSSの実データ取得は暦日ではなく「営業日ベースの本数」で制限されるため
-    （例：1mは実測9営業日分）、下位足の崖はex_date当日ではなく、そこから最大で
-    settings.SPLIT_SCAN_LOOKBACK_BDAYS[interval] 営業日分「過去にズレた位置」に出現しうる。
-    さらにメンテナンスジョブの実行が数日〜数週間放置されていた場合、そのズレは
-    「今日」に近づく方向にも動くため、走査の前方境界は固定日数ではなく常に現在時刻まで開放する。
+    下位時間足（60m/5m/1m）の段差オートフォーカス走査。
+    該当銘柄・時間足をピンポイント走査し、無条件で生値突合および分割説明ギャップを計算します。
     """
     logger.debug(f"_scan_intraday_cliff: 開始 ticker={ticker}, interval={interval}, ex_date={ex_date}, actual_day_dt={actual_day_dt}, s_val={s_val}")
 
     ex_date_ts = pd.to_datetime(ex_date)
     lookback_bdays = settings.SPLIT_SCAN_LOOKBACK_BDAYS.get(interval, 30)
     lookback_start = (ex_date_ts - pd.tseries.offsets.BDay(lookback_bdays)).strftime("%Y-%m-%d")
-    # 前方は固定日数で打ち切らず、常に「現在時刻」までフルカバーする
-    # （収集ジョブの放置期間次第で崖の位置が未来方向へズレるのを見逃さないため）
     lookback_end = pd.Timestamp.now().strftime("%Y-%m-%d")
-    logger.debug(
-        f"_scan_intraday_cliff: ピンポイント投影ロード範囲 [{lookback_start} 〜 {lookback_end}] "
-        f"(lookback_bdays={lookback_bdays})"
-    )
 
     try:
         df_tf = load_price_db(
@@ -508,13 +495,11 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
             columns=["date", "ticker", "close", "patched_multiplier"],
             filters=[("ticker", "==", ticker), ("date", ">=", lookback_start), ("date", "<=", lookback_end)]
         )
-        logger.debug(f"_scan_intraday_cliff: load_price_db 完了 -> {len(df_tf) if df_tf is not None else 0} 行")
     except Exception as e:
         _emit(status_callback, f"  ⚠️ [{interval}] ピンポイント投影ロード失敗 (ticker={ticker}): {e}", level="warning", exc=True)
         df_tf = pd.DataFrame()
 
     if df_tf is None or df_tf.empty:
-        logger.debug(f"_scan_intraday_cliff: {interval} データが空のためスキップ (ticker={ticker})")
         return {"mode": "メタデータのみ更新", "actual_dt": None, "cliff_dt": None,
                 "before_close": np.nan, "after_close": np.nan, "verify": {"yf_close": None, "deviation_pct": None, "passed": True},
                 "status": "[データ無し・スキップ]"}
@@ -526,28 +511,20 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
     try:
         df_tf["date_dt"] = df_tf["date_dt"].dt.tz_localize(None)
     except Exception:
-        logger.debug("_scan_intraday_cliff: tz_localize(None) をスキップ（すでにtz-naive）", exc_info=True)
+        pass
     df_tf = df_tf.sort_values("date_dt").reset_index(drop=True)
 
-    # 💡【重要】ここで対象日当日15時などに区切らない。上のload_price_db段階で
-    # すでに [ex_date - 営業日lookback, 現在] という必要十分な範囲に絞り込み済みのため、
-    # 取得した全行がそのまま走査対象のウィンドウになる。
     df_window = df_tf.tail(5000).reset_index(drop=True)
-    logger.debug(f"_scan_intraday_cliff: ウィンドウ抽出後 {len(df_window)} 行")
-
     if len(df_window) < 2:
-        logger.debug(f"_scan_intraday_cliff: {interval} データ不足のためスキップ (ticker={ticker}, rows={len(df_window)})")
         return {"mode": "メタデータのみ更新", "actual_dt": None, "cliff_dt": None,
                 "before_close": np.nan, "after_close": np.nan, "verify": {"yf_close": None, "deviation_pct": None, "passed": True},
                 "status": "[データ不足・スキップ]"}
 
     min_R, max_R = get_dynamic_threshold(s_val)
     rows = [{"dt": r["date_dt"], "close": r["close"]} for _, r in df_window.iterrows()]
-    # 時間足内なので、隔たりは日単位ではなく分単位で緩めに設定（休場を跨いでも許容）
     idx = _find_cliff_reverse(rows, min_R, max_R, max_gap_days=6)
 
     if idx == -1:
-        logger.debug(f"_scan_intraday_cliff: {interval} 段差未検出（すでに調整済みの可能性） ticker={ticker}")
         return {"mode": "メタデータのみ更新", "actual_dt": None, "cliff_dt": None,
                 "before_close": np.nan, "after_close": np.nan, "verify": {"yf_close": None, "deviation_pct": None, "passed": True},
                 "status": "[正常分割（段差未検出＝調整済み）]"}
@@ -558,52 +535,35 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
     cliff_dt = row_prev["date_dt"]
     before_close = row_prev["close"]
     after_close = row_T["close"]
-    logger.debug(
-        f"_scan_intraday_cliff: {interval} 段差ピンポイント特定 ticker={ticker}, "
-        f"cliff_dt={cliff_dt}, actual_dt={actual_dt}, before={before_close}, after={after_close}"
-    )
 
-    # 重複判定：すでに patched_multiplier が刻印済みならスキップ対象
+    # 重複判定：すでに patched_multiplier が書き換わっている場合はスキップ
     mult_T = row_T["patched_multiplier"]
     mult_prev = row_prev["patched_multiplier"]
     if mult_T > 0 and abs((mult_prev / mult_T) - 1.0) > 0.15:
-        logger.debug(
-            f"_scan_intraday_cliff: {interval} は既にパッチ適用済みと判定 "
-            f"(mult_prev={mult_prev}, mult_T={mult_T}) -> スキップ"
-        )
         return {"mode": None, "actual_dt": actual_dt, "cliff_dt": cliff_dt,
                 "before_close": before_close, "after_close": after_close,
                 "verify": {"yf_close": None, "deviation_pct": None, "passed": True},
                 "status": "[処理済み・スキップ]"}
 
-    # 仕様書Ⅰ-⑤：当該足自体のyfinance生値との突合（取得可能期間外なら日足に自動フォールバック）
+    # ① 当該足自体のyfinance生値との突合
     verify = _verify_against_yfinance_pure_close(ticker, actual_dt, after_close, yf_cache, interval=interval)
 
-    if not verify["passed"]:
-        status_label = "[不一致：暴落またはノイズ疑い]"
-    elif actual_dt < pd.to_datetime(ex_date):
-        # 💡【重要】先回り判定の基準は「日足で検出された段差日(actual_day_dt)」ではなく、
-        # 常に動かない基準点である「公式ex_date」に統一する。
-        # actual_day_dtは日足側の検出結果に過ぎず、それ自体が収集ラグでズレうる不安定な値
-        # （実際7649・8309では10〜16日ズレていた）であり、この不安定な値を基準に
-        # intraday側の先回り判定をすると、日足側の歪みがそのまま伝播してしまう。
-        # ex_dateより前にズレているケースは、この期間yfinance自身もまだ遡及調整の起点と
-        # 認識していないため、Adj Closeにも同じ変化が残ってしまい判定できない
-        # （暴落・ノイズとは無関係）。そのためこのチェックの対象から意図的に除外する。
-        status_label = "[要パッチ（要確認）]"
-    else:
-        # 仕様書Ⅰ-⑤拡張：崖の前後2点でDB生値変化率とyfinance Adj Close変化率を比較
-        # （先回り調整混入ではないケースにのみ適用）
-        adjfactor = _verify_split_via_local_cliff_adjclose(ticker, cliff_dt, actual_dt, before_close, after_close, yf_cache)
-        verify["split_explain_gap_pct"] = adjfactor["ratio_gap_pct"]
-        verify["split_explain_gap_passed"] = adjfactor["passed"]
-        verify["passed"] = bool(verify["passed"]) and bool(adjfactor["passed"])
+    # ② elifバイパスを廃止し、無条件で分割説明ギャップ（Adj Closeとの比較）を計算
+    adjfactor = _verify_split_via_local_cliff_adjclose(ticker, cliff_dt, actual_dt, before_close, after_close, yf_cache)
+    verify["split_explain_gap_pct"] = adjfactor["ratio_gap_pct"]
+    verify["split_explain_gap_passed"] = adjfactor["passed"]
 
-        # 💡【重要】「要パッチ」は「これから正しい分割としてパッチ適用する対象」を意味するので、
-        # 「メタデータのみ更新（何もしない）」側の「[正常分割]」とは別の文言にして混同を防ぐ
-        status_label = "[パッチ対象・分割整合OK]" if verify["passed"] else "[不一致：暴落またはノイズ疑い]"
-        if verify.get("is_daily_fallback") and verify["passed"]:
-            status_label = "[パッチ対象・分割整合OK（日足代用突合）]"
+    pure_passed = verify["passed"]
+    gap_passed = adjfactor["passed"]
+    verify["passed"] = bool(pure_passed) and bool(gap_passed)
+
+    # ステータス表示の判定（選択可否のロック文言は撤廃し、注意喚起にとどめる）
+    if pure_passed and gap_passed:
+        status_label = "[パッチ対象・分割整合OK（日足代用突合）]" if verify.get("is_daily_fallback") else "[パッチ対象・分割整合OK]"
+    elif not pure_passed:
+        status_label = "[要確認：生値不一致（暴落またはノイズ疑い）]"
+    else:
+        status_label = "[要確認：分割説明ギャップ乖離疑い]"
 
     logger.debug(f"_scan_intraday_cliff: {interval} 判定完了 ticker={ticker}, status={status_label}, verify={verify}")
 
@@ -617,43 +577,25 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
         "status": status_label
     }
 
-
 def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
     """
     本番日足データ(price_jp_1d.parquet)から監視銘柄リストのデータをロードし、
     yfinanceから公式の株式分割履歴を一時取得して、過去に遡ったルックバック走査診断を行います。
-    100銘柄ずつのバッチ処理により、外部通信回数を最小限に抑えます。
-
-    仕様書Ⅰの①〜⑥の全ステップに対応：
-      ① 1次フィルター（公式イベント銘柄のバルク高速抽出）
-      ② 照合用マスターの取得（配当抜きの純粋な分割調整後Close）
-      ③ 日足（1d）の面走査（Ex-Dateから過去30営業日）
-      ④ 下位時間足（60m, 5m, 1m）の段差オートフォーカス（自動特定）
-      ⑤ yfinance純粋Closeとの突合・多重防護アサーション（暴落の完全排除）
-      ⑥ プレビュー用データフレームの構築（UI描画はこの戻り値をもとに呼び出し側で行う）
-
-    戻り値の各行は「銘柄コード×時間足」の1組であり、1d・60m・5m・1mそれぞれについて
-    実質段差日時・前後Close・突合結果・検証ステータス・選択可否(is_selectable)を含みます。
-
-    ※ トラブル時は settings.WORK_DIR/jp_price_corrector_debug.log に詳細なDEBUGログが
-       すべて記録されます（どの銘柄・どの時間足で何が起きたか、例外のスタックトレース含む）。
+    全候補に分割説明ギャップを計算し、選択ロックを行わず全件手動選択可能にして返します。
     """
     def log(msg, level="info", exc=False):
         _emit(status_callback, msg, level=level, exc=exc)
 
     run_started_at = time.time()
     log("📊 日本株本番日足データ (price_jp_1d) をロード中...", level="info")
-    logger.debug("scan_jp_anomalies_with_yfinance: 処理開始")
 
     try:
-        # 日足の診断に必要なカラムのみを投影ロード
         df_1d = load_price_db(
             interval="1d",
             is_jp=True,
             is_raw=False,
             columns=["date", "ticker", "close", "patched_multiplier"]
         )
-        logger.debug(f"load_price_db(1d) 完了: {0 if df_1d is None else len(df_1d)} 行")
     except Exception as e:
         log(f"❌ 日足データのロードに失敗しました: {e}", level="error", exc=True)
         return pd.DataFrame()
@@ -662,30 +604,22 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
         log("⚠️ 日本株日足データが見つかりません。先にデータ収集・マージを行ってください。", level="warning")
         return pd.DataFrame()
 
-    # patched_multiplier カラムが存在しない場合は一律 1.0 で初期化
     if "patched_multiplier" not in df_1d.columns:
-        logger.debug("patched_multiplier カラムが存在しないため 1.0 で初期化します。")
         df_1d["patched_multiplier"] = 1.0
 
     df_1d["date_dt"] = pd.to_datetime(df_1d["date"]).dt.tz_localize(None)
     tickers = df_1d["ticker"].unique().tolist()
-    logger.debug(f"監視対象ユニーク銘柄数: {len(tickers)}")
 
-    # ── 仕様書Ⅰ-①：イベントターゲット絞り込み（直近3ヶ月間：90日に限定） ──
     target_start_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
     log(f"🔎 データベース内から {len(tickers)} 銘柄を検出し、直近3ヶ月間（{target_start_date}以降）の公式分割イベントを高速フィルタ中...", level="info")
 
     batch_size = 100
     ticker_batches = [tickers[i:i + batch_size] for i in range(0, len(tickers), batch_size)]
-    logger.debug(f"バッチ分割: {len(ticker_batches)} バッチ（{batch_size}銘柄/バッチ）")
-
-    event_tickers_with_splits = {}  # {ticker: {ex_date_timestamp: split_ratio}}
+    event_tickers_with_splits = {}
 
     for b_idx, batch in enumerate(ticker_batches):
         batch_tickers_T = [f"{t}.T" for t in batch]
-        logger.debug(f"バッチ[{b_idx + 1}/{len(ticker_batches)}] yf.download開始: {len(batch_tickers_T)}銘柄")
         try:
-            t0 = time.time()
             df_download = yf.download(
                 batch_tickers_T,
                 start=target_start_date,
@@ -696,10 +630,8 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                 threads=True,
                 timeout=30
             )
-            logger.debug(f"バッチ[{b_idx + 1}] yf.download完了 ({time.time() - t0:.2f}秒), shape={getattr(df_download, 'shape', None)}")
 
             if df_download.empty:
-                logger.debug(f"バッチ[{b_idx + 1}] ダウンロード結果が空のためスキップ")
                 continue
 
             df_splits = pd.DataFrame()
@@ -712,21 +644,14 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                     df_splits.columns = batch_tickers_T[:1]
 
             if df_splits.empty:
-                logger.debug(f"バッチ[{b_idx + 1}] Stock Splits列が空のためスキップ")
                 continue
 
-            batch_hit_count = 0
             for ticker_with_T in df_splits.columns:
                 splits_series_raw = df_splits[ticker_with_T]
                 splits_series = splits_series_raw[(splits_series_raw > 0) & (splits_series_raw != 1.0)].dropna()
-
                 if not splits_series.empty:
                     ticker = ticker_with_T.split(".")[0]
                     event_tickers_with_splits[ticker] = splits_series.to_dict()
-                    batch_hit_count += 1
-                    logger.debug(f"  ➕ 分割イベント検出: {ticker} -> {splits_series.to_dict()}")
-
-            logger.debug(f"バッチ[{b_idx + 1}] 完了: {batch_hit_count}銘柄で分割イベント検出")
 
         except Exception as ex:
             log(f"  ⚠️ バッチ [{b_idx + 1}] 処理中に例外検出 (スキップ): {ex}", level="warning", exc=True)
@@ -734,65 +659,49 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
 
     if not event_tickers_with_splits:
         log("✅ 直近3ヶ月間に株式分割イベントが検知された銘柄はありません。スキャンを正常終了します。", level="info")
-        logger.debug(f"scan_jp_anomalies_with_yfinance: 終了（対象0件, 所要{time.time() - run_started_at:.2f}秒）")
         return pd.DataFrame()
 
     log(f"🎯 公式分割イベントを検出。対象 {len(event_tickers_with_splits)} 銘柄に対して、詳細なインメモリ遡及走査を開始します。", level="info")
-    logger.debug(f"分割イベント検出銘柄一覧: {list(event_tickers_with_splits.keys())}")
 
     results = []
-    yf_cache = {}  # {"ticker_YYYY-MM-DD": yf_close|None} 突合キャッシュ（時間足間で使い回して通信を節約）
+    yf_cache = {}
 
-    # ── 仕様書Ⅰ-②〜③：日足のインメモリ投影走査（イベント適合銘柄のみに限定ループ） ──
     for ticker_idx, (ticker, splits_dict) in enumerate(event_tickers_with_splits.items()):
-        logger.debug(f"[{ticker_idx + 1}/{len(event_tickers_with_splits)}] ticker={ticker} 走査開始 splits_dict={splits_dict}")
         df_ticker = df_1d[df_1d["ticker"] == ticker].sort_values("date_dt").reset_index(drop=True)
         if df_ticker.empty or len(df_ticker) < 2:
-            logger.debug(f"ticker={ticker}: 日足データが不足（{len(df_ticker)}行）のためスキップ")
             continue
 
         for ex_date, s_val in splits_dict.items():
             if pd.isna(s_val) or s_val <= 0.0 or s_val == 1.0:
-                logger.debug(f"ticker={ticker}: ex_date={ex_date} の split値が不正({s_val})のためスキップ")
                 continue
 
             planned_dt = pd.to_datetime(ex_date).tz_localize(None)
             planned_date_str = planned_dt.strftime("%Y-%m-%d")
-            logger.debug(f"ticker={ticker}: 分割イベント処理開始 ex_date={planned_date_str}, s_val={s_val}")
 
-            # ── 仕様書Ⅰ-③：走査ロジック（「点」から「面」への移行：過去30営業日） ──
             ex_date_idx_list = df_ticker[df_ticker["date_dt"] <= planned_dt].index.tolist()
             if not ex_date_idx_list:
-                logger.debug(f"ticker={ticker}: planned_dt={planned_dt} 以前のデータが存在しないためスキップ")
                 continue
 
             ex_date_idx = ex_date_idx_list[-1]
             lookback_start_idx = max(0, ex_date_idx - settings.SPLIT_SCAN_LOOKBACK_BDAYS.get("1d", 30))
             df_window = df_ticker.iloc[lookback_start_idx: ex_date_idx + 1].copy()
-            logger.debug(f"ticker={ticker}: ルックバックウィンドウ {len(df_window)}行 (idx {lookback_start_idx}〜{ex_date_idx})")
 
             if len(df_window) < 2:
-                logger.debug(f"ticker={ticker}: ウィンドウ行数不足のためスキップ")
                 continue
 
             min_R, max_R = get_dynamic_threshold(s_val)
             rows = [{"dt": r["date_dt"], "close": r["close"]} for _, r in df_window.iterrows()]
             rel_idx = _find_cliff_reverse(rows, min_R, max_R, max_gap_days=15)
             detected_idx = df_window.index[rel_idx] if rel_idx != -1 else -1
-            logger.debug(f"ticker={ticker}: 日足段差検出結果 detected_idx={detected_idx}")
 
             M = 1.0 / s_val
 
-            # ── [安全・重複検知防止チェック] 既に累積乗数（マーク）が書き換わっているか判定 ──
+            # パッチ適用済みチェック
             check_idx = detected_idx if detected_idx != -1 else ex_date_idx
             check_prev_idx = max(0, check_idx - 1)
             mult_T = df_ticker.loc[check_idx, "patched_multiplier"]
             mult_prev = df_ticker.loc[check_prev_idx, "patched_multiplier"]
-            is_already_patched = mult_T > 0 and abs((mult_prev / mult_T) - 1.0) > 0.15
-            if is_already_patched:
-                logger.debug(
-                    f"ticker={ticker}: 既にパッチ適用済みと判定 (mult_prev={mult_prev}, mult_T={mult_T}) -> このイベントをスキップ"
-                )
+            if mult_T > 0 and abs((mult_prev / mult_T) - 1.0) > 0.15:
                 continue
 
             mode = None
@@ -812,46 +721,26 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                 close_T_val = row_T["close"]
                 close_prev_val = row_prev["close"]
 
-                # ── 仕様書Ⅰ-⑤：yfinance純粋Closeとの突合・多重防護アサーション ──
+                # 生値突合
                 verify = _verify_against_yfinance_pure_close(ticker, actual_dt, close_T_val, yf_cache, interval="1d")
-
                 mode = "要パッチ"
 
-                if not verify["passed"]:
-                    status_label = "[不一致：暴落またはノイズ疑い（選択不可）]"
-                    logger.warning(
-                        f"ticker={ticker}: 突合不一致を検出しました。安全ロックを適用します。 "
-                        f"deviation_pct={verify['deviation_pct']}, yf_close={verify['yf_close']}, detected_close={close_T_val}"
-                    )
-                elif actual_dt < planned_dt:
-                    # 💡【重要】「先回り調整混入」は actual_dt が公式 ex_date より前にズレているケース。
-                    # この期間はyfinance自身もまだ遡及調整の起点と認識していないため、
-                    # Adj Closeにも同じ変化が残ってしまい判定できない
-                    # （＝Yahooの調整ロジックの前提とズレているだけで、暴落・ノイズとは無関係）。
-                    # そのためこのケースは調整チェックの対象から意図的に除外し、
-                    # 生値突合の一致のみで「先回り調整混入（警告）」として確定させる。
-                    status_label = "[要パッチ（要確認）]"
-                    logger.debug(f"ticker={ticker}: 先回り調整混入を検出 actual_dt={actual_dt} < planned_dt={planned_dt}")
-                else:
-                    # ── 仕様書Ⅰ-⑤拡張：崖の前後2点でDB生値変化率とyfinance Adj Close変化率を比較 ──
-                    # （放置による崖ズレでも機能する独立検証。先回り調整混入ではないケースにのみ適用する）
-                    adjfactor = _verify_split_via_local_cliff_adjclose(ticker, cliff_dt, actual_dt, close_prev_val, close_T_val, yf_cache)
-                    verify["split_explain_gap_pct"] = adjfactor["ratio_gap_pct"]
-                    verify["split_explain_gap_passed"] = adjfactor["passed"]
-                    verify["passed"] = bool(verify["passed"]) and bool(adjfactor["passed"])
+                # elifバイパスを廃止し、無条件で分割説明ギャップを計算
+                adjfactor = _verify_split_via_local_cliff_adjclose(ticker, cliff_dt, actual_dt, close_prev_val, close_T_val, yf_cache)
+                verify["split_explain_gap_pct"] = adjfactor["ratio_gap_pct"]
+                verify["split_explain_gap_passed"] = adjfactor["passed"]
 
-                    if not verify["passed"]:
-                        status_label = "[不一致：暴落またはノイズ疑い（選択不可）]"
-                        logger.warning(
-                            f"ticker={ticker}: 調整係数チェック不合格。安全ロックを適用します。 "
-                            f"split_explain_gap_pct={verify['split_explain_gap_pct']}"
-                        )
-                    else:
-                        # 💡【重要】「メタデータのみ更新（何もしない）」側の「[正常分割]」と同じ文言だと、
-                        # 「要パッチ」なのに何もしなくていいように見えてしまうため、専用の文言にする
-                        status_label = "[パッチ対象・分割整合OK]"
+                pure_passed = verify["passed"]
+                gap_passed = adjfactor["passed"]
+                verify["passed"] = bool(pure_passed) and bool(gap_passed)
+
+                if pure_passed and gap_passed:
+                    status_label = "[パッチ対象・分割整合OK]"
+                elif not pure_passed:
+                    status_label = "[要確認：生値不一致（暴落またはノイズ疑い）]"
+                else:
+                    status_label = "[要確認：分割説明ギャップ乖離疑い]"
             else:
-                # 崖がルックバック期間内に検出されなかった場合（すでに全データが先回り調整済みなど）
                 mode = "メタデータのみ更新"
                 actual_dt = planned_dt
                 cliff_dt = planned_dt
@@ -862,11 +751,10 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                     close_prev_val = df_ticker.iloc[ex_date_idx - 1]["close"]
 
                 verify = _verify_against_yfinance_pure_close(ticker, actual_dt, close_T_val, yf_cache, interval="1d")
-                status_label = "[正常分割]" if verify["passed"] else "[不一致：要目視確認（選択不可）]"
-                logger.debug(f"ticker={ticker}: 日足段差なし -> メタデータのみ更新モード, status={status_label}")
+                status_label = "[正常分割]" if verify["passed"] else "[要確認：生値不一致]"
 
             if mode:
-                is_selectable = bool(verify["passed"])
+                # 💡 選択不可ロックを廃止：すべての行を True（手動選択可能）にする
                 results.append({
                     "ticker": ticker,
                     "interval": "1d",
@@ -882,12 +770,10 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                     "deviation_pct": verify["deviation_pct"],
                     "split_explain_gap_pct": verify.get("split_explain_gap_pct"),
                     "status": status_label,
-                    "is_selectable": is_selectable,
+                    "is_selectable": True,  # ロック廃止
                 })
-                logger.debug(f"ticker={ticker}: 1d 結果行を追加 mode={mode}, status={status_label}, selectable={is_selectable}")
 
-                # ── 仕様書Ⅰ-④：下位時間足（60m, 5m, 1m）の段差オートフォーカス ──
-                # 日足側で正しく崖を確定できた場合のみ、下位足のピンポイント投影ロード＆走査を行う
+                # 下位足（60m, 5m, 1m）の段差走査
                 if detected_idx != -1:
                     for tf in INTRADAY_TIMEFRAMES:
                         log(f"  🔬 [{ticker}] {tf} 足の段差オートフォーカス走査中...", level="info")
@@ -907,19 +793,17 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                             continue
 
                         if tf_result["mode"] is None:
-                            logger.debug(f"ticker={ticker}, interval={tf}: 処理済みのためスキップ")
-                            continue  # 処理済みスキップ
+                            continue
 
                         tf_actual_dt = tf_result["actual_dt"]
                         tf_cliff_dt = tf_result["cliff_dt"]
                         tf_verify = tf_result["verify"]
-                        tf_selectable = bool(tf_verify.get("passed", True))
 
-                        # メタデータのみ更新（＝下位足でも段差未検出）の場合は当日09:00を境界に採用
                         if tf_result["mode"] == "メタデータのみ更新" and tf_actual_dt is None:
                             tf_cliff_dt = pd.to_datetime(f"{actual_dt.strftime('%Y-%m-%d')} 09:00:00")
                             tf_actual_dt = tf_cliff_dt
 
+                        # 💡 下位足も選択不可ロックを廃止し、全件選択可能にする
                         results.append({
                             "ticker": ticker,
                             "interval": tf,
@@ -935,17 +819,14 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                             "deviation_pct": tf_verify.get("deviation_pct"),
                             "split_explain_gap_pct": tf_verify.get("split_explain_gap_pct"),
                             "status": tf_result["status"],
-                            "is_selectable": tf_selectable,
+                            "is_selectable": True,  # ロック廃止
                         })
-                        logger.debug(f"ticker={ticker}: {tf} 結果行を追加 mode={tf_result['mode']}, status={tf_result['status']}, selectable={tf_selectable}")
 
             time.sleep(1.0)
 
     elapsed = time.time() - run_started_at
     log(f"🎉 日本株段差スキャン完了。自動検出された修正候補: {len(results)} 件（全時間足合算）", level="info")
-    logger.debug(f"scan_jp_anomalies_with_yfinance: 終了（所要時間 {elapsed:.2f}秒, 結果件数={len(results)}）")
     return pd.DataFrame(results)
-
 
 def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callback=None) -> dict:
     """
