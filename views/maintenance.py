@@ -727,7 +727,8 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         "interval": "時間足",
         "ex_date": "公式予定日(ex_date)",
         "actual_date": "実質段差日(actual_date)",
-        "cliff_date": "真の境界日(cliff_date)",
+        # 💡「真の境界日(cliff_date)」は実質段差日の1本前の足を表すだけで、
+        # 目視ではほぼ自明なため表示からは外す（内部変数(cliff_dt)としては引き続き使用する）
         "splits": "分割比率(splits)",
         "mode": "調整タイプ(mode)",
         "multiplier": "調整倍率(multiplier)",
@@ -735,7 +736,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         "after_close": "直後値(段差後)",
         "yf_close": "yfinance突合値",
         "deviation_pct": "生値乖離率(%)",
-        "adj_factor_change_pct": "調整係数変化率(%)",
+        "split_explain_gap_pct": "分割説明ギャップ(%)",
         "status": "警告状態(status)",
         "is_selectable": "選択可否",
     }
@@ -768,17 +769,22 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             import time
 
             grouped = {}
-            for _, r in selected_rows.iterrows():
-                ticker = r["銘柄"]
+            for idx, r in selected_rows.iterrows():
+                # 💡【重要】表示用にリネーム・一部列を非表示にしたdisplay_df/edited_dfではなく、
+                # 元のresult_df（英語列名のまま、全列保持）からindexで引き直す。
+                # 表示列名の変更や列の非表示化に、パッチ適用ロジックが引きずられて
+                # KeyErrorになるのを防ぐため（実際、前回の列名変更でこの箇所は参照が古いままになっていた）。
+                orig = result_df.loc[idx]
+                ticker = orig["ticker"]
                 grouped.setdefault(ticker, []).append({
-                    "interval": r["時間足"],
-                    "cliff_date": r["真の境界日(cliff_date)"],
-                    "multiplier": r["調整倍率(multiplier)"],
-                    "mode": r["調整タイプ(mode)"],
-                    "before_close": r["前日終値"],
-                    "after_close": r["当日終値"],
-                    "deviation_pct": r.get("乖離率(%)"),
-                    "status": r["警告状態(status)"],
+                    "interval": orig["interval"],
+                    "cliff_date": orig["cliff_date"],
+                    "multiplier": orig["multiplier"],
+                    "mode": orig["mode"],
+                    "before_close": orig["before_close"],
+                    "after_close": orig["after_close"],
+                    "deviation_pct": orig.get("deviation_pct"),
+                    "status": orig["status"],
                 })
 
             repaired_count = 0
