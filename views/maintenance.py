@@ -735,7 +735,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         "after_close": "直後値(段差後)",
         "yf_close": "yfinance突合値",
         "deviation_pct": "生値乖離率(%)",
-        "adjclose_max_jump_pct": "Adj Close断絶率(%)",
+        "adj_factor_change_pct": "調整係数変化率(%)",
         "status": "警告状態(status)",
         "is_selectable": "選択可否",
     }

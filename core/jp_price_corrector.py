@@ -92,9 +92,9 @@ def _emit(status_callback, msg: str, level: str = "info", exc: bool = False):
 # 突合の許容乖離率（仕様書Ⅰ-⑤）：これを超えると「不一致（暴落疑い）」として自動安全ロック
 VERIFY_DEVIATION_THRESHOLD_PCT = 2.0
 
-# Adj Close（auto_adjust=True）連続性チェックの許容ジャンプ率：
-# 既知の分割はすべて遡及調整済みになっているはずなので、崖の前後でこれを超える断絶が
-# 残っている場合は「既知の分割では説明できない崖（暴落・データ異常の疑い）」として扱う
+# 調整係数（生値÷Adj Close）が崖の前後でこれ以上変化していれば「既知の分割による説明がつく」と判定する閾値：
+# 変化がこれ未満（＝調整係数がほぼ一定のまま）の場合は、既知の分割では説明できない
+# 崖（暴落・データ異常の疑い）として扱う
 ADJCLOSE_JUMP_THRESHOLD_PCT = 3.0
 
 # 下位時間足オートフォーカス走査の対象（仕様書Ⅰ-④）
@@ -317,59 +317,85 @@ def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: 
     }
 
 
-def _verify_adjclose_continuity(ticker: str, cliff_dt, actual_dt, cache: dict,
-                                 window_days: int = 10,
-                                 jump_threshold_pct: float = ADJCLOSE_JUMP_THRESHOLD_PCT) -> dict:
+def _verify_split_via_adjustment_factor(ticker: str, cliff_dt, actual_dt, cache: dict,
+                                         window_days: int = 10,
+                                         min_side_points: int = 2,
+                                         ratio_change_threshold_pct: float = ADJCLOSE_JUMP_THRESHOLD_PCT) -> dict:
     """
-    仕様書Ⅰ-⑤拡張：Adj Close（auto_adjust=True）による独立した連続性チェック。
+    仕様書Ⅰ-⑤拡張：「調整係数（生Close ÷ Adj Close）」が崖を境に変化するかどうかによる、
+    分割と暴落・ノイズを見分ける独立検証。
 
-    既知の公式分割はすべてyfinance側で遡及調整（back-adjust）されているはずなので、
-    「本当にその公式分割による崖」であれば、Adj Close系列は崖の前後で滑らか（断絶なし）になる。
-    逆に、崖の位置が既知の分割では説明できない暴落やデータ異常であれば、
-    Adj Closeで補正してもなお断絶（大きな変化率）が残る。
+    考え方：
+    ・調整係数は「その日以降に起きた全ての既知分割・配当をどれだけ遡及調整しているか」を表す。
+    ・本物の分割なら、その分割のex_dateを境に調整係数そのものが変化する
+      （その分割ぶんの遡及調整が、ex_date以降は不要になるため）。
+    ・単なる暴落やデータ異常なら、それは「既知の調整イベント」ではないので、
+      調整係数は崖の前後で変化しない（同じ係数のまま）。
+    ・崖の前後どちらにも同じように乗る「将来の無関係な分割・配当の影響」は、
+      前後の比率同士を比較することで自動的に相殺される（絶対値比較ではなく差分比較にしているため）。
 
     ⚠️ これは _verify_against_yfinance_pure_close（生値の絶対一致チェック）とは独立した、
     別の観点の安全網。特に収集ラグにより崖の位置が公式ex_dateから大きくズレているケース
-    （放置による崖ズレ）では、この連続性チェックが最も効く。
+    （放置による崖ズレ）でも、ex_date自体さえ跨いでいれば機能する。
 
-    戻り値: {"max_jump_pct": float|None, "passed": bool}
+    戻り値: {"ratio_before": float|None, "ratio_after": float|None,
+             "ratio_change_pct": float|None, "passed": bool}
     """
     boundary_date = pd.to_datetime(actual_dt).normalize()
-    cache_key = f"adjcont_{ticker}_{boundary_date.strftime('%Y-%m-%d')}"
+    cache_key = f"adjfactor_{ticker}_{boundary_date.strftime('%Y-%m-%d')}"
 
     if cache_key not in cache:
-        logger.debug(f"_verify_adjclose_continuity: キャッシュ未ヒット。yfinanceへ問い合わせ中 ({cache_key})")
-        result = {"max_jump_pct": None, "passed": False}
+        logger.debug(f"_verify_split_via_adjustment_factor: キャッシュ未ヒット。yfinanceへ問い合わせ中 ({cache_key})")
+        result = {"ratio_before": None, "ratio_after": None, "ratio_change_pct": None, "passed": False}
         try:
-            start = (boundary_date - timedelta(days=window_days * 2)).strftime("%Y-%m-%d")
-            end = (boundary_date + timedelta(days=window_days * 2)).strftime("%Y-%m-%d")
-            df_adj = yf.download(
-                f"{ticker}.T", start=start, end=end,
-                auto_adjust=True,  # 既知の分割・配当を遡及調整した「連続な」価格系列
-                actions=False, progress=False, timeout=15
-            )
-            s = _extract_close_series(df_adj)
-            if s is not None and len(s) >= 2:
-                pct_changes = s.pct_change().abs() * 100.0
-                # 境界日 ±window_days 営業日程度の範囲だけを見る（無関係な遠い変動を拾わないため）
-                near_mask = (
-                    (s.index >= boundary_date - pd.Timedelta(days=window_days)) &
-                    (s.index <= boundary_date + pd.Timedelta(days=window_days))
-                )
-                near_changes = pct_changes[near_mask].dropna()
-                if not near_changes.empty:
-                    max_jump = float(near_changes.max())
-                    result = {"max_jump_pct": round(max_jump, 3), "passed": max_jump <= jump_threshold_pct}
+            start = (boundary_date - timedelta(days=window_days * 3)).strftime("%Y-%m-%d")
+            end = (boundary_date + timedelta(days=window_days * 3)).strftime("%Y-%m-%d")
+
+            df_raw = yf.download(f"{ticker}.T", start=start, end=end,
+                                  auto_adjust=False, actions=False, progress=False, timeout=15)
+            df_adj = yf.download(f"{ticker}.T", start=start, end=end,
+                                  auto_adjust=True, actions=False, progress=False, timeout=15)
+
+            s_raw = _extract_close_series(df_raw)
+            s_adj = _extract_close_series(df_adj)
+
+            if s_raw is not None and s_adj is not None:
+                df_ratio = pd.DataFrame({"raw": s_raw, "adj": s_adj}).dropna()
+                df_ratio = df_ratio[(df_ratio["raw"] > 0) & (df_ratio["adj"] > 0)]
+                # 調整係数 = 生値 ÷ Adj Close（分割・配当を遡及調整するために掛けている倍率の逆数）
+                df_ratio["ratio"] = df_ratio["raw"] / df_ratio["adj"]
+
+                before_mask = (df_ratio.index < boundary_date) & (df_ratio.index >= boundary_date - pd.Timedelta(days=window_days))
+                after_mask = (df_ratio.index >= boundary_date) & (df_ratio.index <= boundary_date + pd.Timedelta(days=window_days))
+
+                ratios_before = df_ratio.loc[before_mask, "ratio"].tail(min_side_points)
+                ratios_after = df_ratio.loc[after_mask, "ratio"].head(min_side_points)
+
+                if len(ratios_before) >= 1 and len(ratios_after) >= 1:
+                    ratio_before = float(ratios_before.mean())
+                    ratio_after = float(ratios_after.mean())
+                    if ratio_before > 0:
+                        ratio_change_pct = abs(ratio_after - ratio_before) / ratio_before * 100.0
+                        # 💡【重要】ここは「一致度」ではなく「変化度」を見ている。
+                        # 変化が大きい＝既知の分割イベントによる調整係数の切り替わりが実在する＝分割
+                        # 変化が小さい＝調整係数は変わっていない＝この崖は分割で説明できない＝暴落・ノイズ疑い
+                        passed = ratio_change_pct >= ratio_change_threshold_pct
+                        result = {
+                            "ratio_before": round(ratio_before, 4),
+                            "ratio_after": round(ratio_after, 4),
+                            "ratio_change_pct": round(ratio_change_pct, 3),
+                            "passed": passed
+                        }
             cache[cache_key] = result
-            logger.debug(f"_verify_adjclose_continuity: 取得結果 {cache_key} -> {result}")
+            logger.debug(f"_verify_split_via_adjustment_factor: 取得結果 {cache_key} -> {result}")
         except Exception as e:
             logger.warning(
-                f"_verify_adjclose_continuity: yfinance取得失敗 ticker={ticker}, boundary_date={boundary_date}: {e}",
+                f"_verify_split_via_adjustment_factor: yfinance取得失敗 ticker={ticker}, boundary_date={boundary_date}: {e}",
                 exc_info=True
             )
-            cache[cache_key] = {"max_jump_pct": None, "passed": False}
+            cache[cache_key] = {"ratio_before": None, "ratio_after": None, "ratio_change_pct": None, "passed": False}
     else:
-        logger.debug(f"_verify_adjclose_continuity: キャッシュヒット ({cache_key})")
+        logger.debug(f"_verify_split_via_adjustment_factor: キャッシュヒット ({cache_key})")
 
     return cache[cache_key]
 
@@ -478,19 +504,26 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
     # 仕様書Ⅰ-⑤：当該足自体のyfinance生値との突合（取得可能期間外なら日足に自動フォールバック）
     verify = _verify_against_yfinance_pure_close(ticker, actual_dt, after_close, yf_cache, interval=interval)
 
-    # 仕様書Ⅰ-⑤拡張：Adj Close連続性チェック（既知の分割で本当に説明できる崖かの独立検証）
-    adjcont = _verify_adjclose_continuity(ticker, cliff_dt, actual_dt, yf_cache)
-    verify["adjclose_max_jump_pct"] = adjcont["max_jump_pct"]
-    verify["adjclose_passed"] = adjcont["passed"]
-    verify["passed"] = bool(verify["passed"]) and bool(adjcont["passed"])
-
-    # 💡【重要】「要パッチ」は「これから正しい分割としてパッチ適用する対象」を意味するので、
-    # 「メタデータのみ更新（何もしない）」側の「[正常分割]」とは別の文言にして混同を防ぐ
-    status_label = "[パッチ対象・分割整合OK]" if verify["passed"] else "[不一致：暴落またはノイズ疑い]"
-    if verify.get("is_daily_fallback") and verify["passed"]:
-        status_label = "[パッチ対象・分割整合OK（日足代用突合）]"
-    if actual_dt < pd.to_datetime(actual_day_dt):
+    if not verify["passed"]:
+        status_label = "[不一致：暴落またはノイズ疑い]"
+    elif actual_dt < pd.to_datetime(actual_day_dt):
+        # 💡【重要】先回り調整混入はex_dateより前にズレているケースであり、
+        # 調整係数チェックはYahoo自身のex_date基準に依存するため、
+        # このケースでは構造的に必ず不合格になる（暴落・ノイズとは無関係）。
+        # そのためこのチェックの対象から意図的に除外する。
         status_label = "[⚠️先回り調整混入（警告）]"
+    else:
+        # 仕様書Ⅰ-⑤拡張：調整係数（生値÷Adj Close）の前後変化チェック（先回り調整混入ではないケースにのみ適用）
+        adjfactor = _verify_split_via_adjustment_factor(ticker, cliff_dt, actual_dt, yf_cache)
+        verify["adj_factor_change_pct"] = adjfactor["ratio_change_pct"]
+        verify["adj_factor_passed"] = adjfactor["passed"]
+        verify["passed"] = bool(verify["passed"]) and bool(adjfactor["passed"])
+
+        # 💡【重要】「要パッチ」は「これから正しい分割としてパッチ適用する対象」を意味するので、
+        # 「メタデータのみ更新（何もしない）」側の「[正常分割]」とは別の文言にして混同を防ぐ
+        status_label = "[パッチ対象・分割整合OK]" if verify["passed"] else "[不一致：暴落またはノイズ疑い]"
+        if verify.get("is_daily_fallback") and verify["passed"]:
+            status_label = "[パッチ対象・分割整合OK（日足代用突合）]"
 
     logger.debug(f"_scan_intraday_cliff: {interval} 判定完了 ticker={ticker}, status={status_label}, verify={verify}")
 
@@ -702,28 +735,41 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                 # ── 仕様書Ⅰ-⑤：yfinance純粋Closeとの突合・多重防護アサーション ──
                 verify = _verify_against_yfinance_pure_close(ticker, actual_dt, close_T_val, yf_cache, interval="1d")
 
-                # ── 仕様書Ⅰ-⑤拡張：Adj Close連続性チェック（放置による崖ズレでも機能する独立検証） ──
-                adjcont = _verify_adjclose_continuity(ticker, cliff_dt, actual_dt, yf_cache)
-                verify["adjclose_max_jump_pct"] = adjcont["max_jump_pct"]
-                verify["adjclose_passed"] = adjcont["passed"]
-                verify["passed"] = bool(verify["passed"]) and bool(adjcont["passed"])
-
                 mode = "要パッチ"
 
                 if not verify["passed"]:
                     status_label = "[不一致：暴落またはノイズ疑い（選択不可）]"
                     logger.warning(
                         f"ticker={ticker}: 突合不一致を検出しました。安全ロックを適用します。 "
-                        f"deviation_pct={verify['deviation_pct']}, yf_close={verify['yf_close']}, detected_close={close_T_val}, "
-                        f"adjclose_max_jump_pct={verify['adjclose_max_jump_pct']}"
+                        f"deviation_pct={verify['deviation_pct']}, yf_close={verify['yf_close']}, detected_close={close_T_val}"
                     )
                 elif actual_dt < planned_dt:
+                    # 💡【重要】「先回り調整混入」は actual_dt が公式 ex_date より前にズレているケース。
+                    # 調整係数チェックはYahoo自身が記録するex_dateを基準に変化するため、
+                    # ex_dateより前の時点では構造的に不合格になりうる
+                    # （＝Yahooの調整ロジックの前提とズレているだけで、暴落・ノイズとは無関係）。
+                    # そのためこのケースは調整係数チェックの対象から意図的に除外し、
+                    # 生値突合の一致のみで「先回り調整混入（警告）」として確定させる。
                     status_label = "[⚠️先回り調整混入（警告）]"
                     logger.debug(f"ticker={ticker}: 先回り調整混入を検出 actual_dt={actual_dt} < planned_dt={planned_dt}")
                 else:
-                    # 💡【重要】「メタデータのみ更新（何もしない）」側の「[正常分割]」と同じ文言だと、
-                    # 「要パッチ」なのに何もしなくていいように見えてしまうため、専用の文言にする
-                    status_label = "[パッチ対象・分割整合OK]"
+                    # ── 仕様書Ⅰ-⑤拡張：調整係数（生値÷Adj Close）の前後変化チェック ──
+                    # （放置による崖ズレでも機能する独立検証。先回り調整混入ではないケースにのみ適用する）
+                    adjfactor = _verify_split_via_adjustment_factor(ticker, cliff_dt, actual_dt, yf_cache)
+                    verify["adj_factor_change_pct"] = adjfactor["ratio_change_pct"]
+                    verify["adj_factor_passed"] = adjfactor["passed"]
+                    verify["passed"] = bool(verify["passed"]) and bool(adjfactor["passed"])
+
+                    if not verify["passed"]:
+                        status_label = "[不一致：暴落またはノイズ疑い（選択不可）]"
+                        logger.warning(
+                            f"ticker={ticker}: 調整係数チェック不合格。安全ロックを適用します。 "
+                            f"adj_factor_change_pct={verify['adj_factor_change_pct']}"
+                        )
+                    else:
+                        # 💡【重要】「メタデータのみ更新（何もしない）」側の「[正常分割]」と同じ文言だと、
+                        # 「要パッチ」なのに何もしなくていいように見えてしまうため、専用の文言にする
+                        status_label = "[パッチ対象・分割整合OK]"
             else:
                 # 崖がルックバック期間内に検出されなかった場合（すでに全データが先回り調整済みなど）
                 mode = "メタデータのみ更新"
@@ -754,7 +800,7 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                     "after_close": round(close_T_val, 2) if not pd.isna(close_T_val) else 0.0,
                     "yf_close": verify["yf_close"],
                     "deviation_pct": verify["deviation_pct"],
-                    "adjclose_max_jump_pct": verify.get("adjclose_max_jump_pct"),
+                    "adj_factor_change_pct": verify.get("adj_factor_change_pct"),
                     "status": status_label,
                     "is_selectable": is_selectable,
                 })
@@ -807,7 +853,7 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                             "after_close": round(tf_result["after_close"], 2) if not pd.isna(tf_result["after_close"]) else 0.0,
                             "yf_close": tf_verify.get("yf_close"),
                             "deviation_pct": tf_verify.get("deviation_pct"),
-                            "adjclose_max_jump_pct": tf_verify.get("adjclose_max_jump_pct"),
+                            "adj_factor_change_pct": tf_verify.get("adj_factor_change_pct"),
                             "status": tf_result["status"],
                             "is_selectable": tf_selectable,
                         })
