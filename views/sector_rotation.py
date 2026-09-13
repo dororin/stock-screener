@@ -124,7 +124,23 @@ def render_watchlist_editor_fragment():
 @st.fragment
 def render_overlay_chart_fragment(is_jp: bool):
     """重ね合わせ比較チャートの計算と描画をカプセル化。ウィジェット操作時に下部チャートは再計算されません。"""
-    st.markdown("### 📊 セクター・テーマ相対強度（RS）重ね合わせ比較")
+    
+    # 💡【修正案4】タイトルの横にキャッシュ強制クリア＆全体再読込ボタンを配置
+    title_col, refresh_col = st.columns([3, 1])
+    with title_col:
+        st.markdown("### 📊 セクター・テーマ相対強度（RS）重ね合わせ比較")
+    with refresh_col:
+        if st.button(
+            "🔄 最新データ再読込", 
+            help="ローカルParquetおよび計算キャッシュを全クリアし、最新データで画面全体を再読み込みします", 
+            use_container_width=True
+        ):
+            from data_access.local_db import clear_local_parquet_cache
+            clear_local_parquet_cache(is_jp=is_jp)
+            st.cache_data.clear()
+            st.toast("✅ キャッシュをクリアしました。最新データを再読み込みします。")
+            # フラグメント内だけでなく、下部のミニチャート等も含めて画面全体を再描画
+            st.rerun(scope="app")
     
     # 閉域コントロールパネル
     col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4 = st.columns(4)
@@ -196,7 +212,6 @@ def render_overlay_chart_fragment(is_jp: bool):
         )
     else:
         st.caption("表示対象のデータがありません。")
-
 
 # =====================================================================
 # 📈 【フラグメント2】セクターミニチャート一覧（完全独立）

@@ -57,21 +57,30 @@ def render_screener_controls_panel():
                         st.session_state.result_df = load_history(sid)
                         st.session_state.performed_scan = True
                         st.session_state.last_id = sid
-                        # 履歴をロードしたら、表示エリアを全体更新するため1回だけリラン
                         st.rerun()
             else:
                 st.caption("過去の履歴はありません")
 
         with col_ctrl2:
-            st.markdown("**🚀 スクリーニング操作**")
+            # 操作ヘッダーと最新データ強制リフレッシュボタン
+            header_col, refresh_col = st.columns([2, 1])
+            with header_col:
+                st.markdown("**🚀 スクリーニング操作**")
+            with refresh_col:
+                # 💡【修正案4】メモリキャッシュをクリアして再読込するボタン
+                if st.button("🔄 キャッシュ更新", help="メモリ上のキャッシュを消去して最新データを強制再取得します", use_container_width=True):
+                    from data_access.local_db import clear_local_parquet_cache
+                    clear_local_parquet_cache(interval="1d", is_jp=True)
+                    st.cache_data.clear()
+                    st.success("キャッシュをクリアしました。")
+                    st.rerun()
+
             col_b1, col_b2 = st.columns(2)
-            
             with col_b1:
                 if st.button("🚀 判定開始 (TOPIX500)", use_container_width=True, type="primary"):
                     with st.spinner("データベースから対象データを抽出・判定中..."):
                         db_df = load_unified_db("1d", is_jp=True)
                         if not db_df.empty:
-                            # 判定開始時にログを初期化して蓄積
                             temp_logs = []
                             st.session_state.result_df = run_fast_screening(db_df, log_accumulator=temp_logs)
                             st.session_state.screening_logs = temp_logs
@@ -91,7 +100,6 @@ def render_screener_controls_panel():
                                 st.rerun()
                 else:
                     st.button("💾 Google Sheetsに保存", use_container_width=True, disabled=True, help="判定結果が空のため保存できません。")
-
 
 # =====================================================================
 # 📌 【フラグメント2】個別銘柄カード（お気に入り⭐局所完結型）

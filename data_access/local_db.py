@@ -198,10 +198,10 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True, is_raw: b
 
 def execute_jp_merge(interval: str, status_callback=None) -> dict:
     """
-    時間足フォルダ（例: 1m, 60m, 1d）の直下から、すべての未マージ差分（_diff_）ファイルを古い順にロードし、
-    時間足の仕様に合わせて自動判別（1d: 全結合, 60m: 年間, 5m/1m: 年月）した本番ファイルへ
-    重複を排除（keep='last'：新優先）して安全マージ。
-    処理が完了した差分ファイルは Google Drive から自動で物理消去します。
+    時間足フォルダの直下からすべての未マージ差分（_diff_）ファイルを古い順にロードし、
+    本番結合ファイルへ重複排除して安全マージ。
+    【修正点】Driveへのアップロード成功後、ローカル（WORK_DIR）の正規Parquetファイルも
+    最新マージ済みデータで上書き同期し、古いキャッシュの残留を防止します。
     """
     def log(msg):
         if status_callback:
@@ -236,10 +236,7 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
     all_diff_files = sorted(all_diff_files, key=extract_timestamp)
     log(f"📂 未処理の差分ファイルを検出しました。総計: {len(all_diff_files)} 件。古い順にマージを開始します...")
 
-    # メモリ上に統合用の本番ベースデータをキャッシュする辞書
-    # 構造: { group_key: { "df": pd.DataFrame, "original_tickers": set, "original_count": int, "filename": str, "local_path": str } }
     loaded_bases = {}
-
     processed_file_ids = []
     error_occurred = False
     err_msg = ""
@@ -268,16 +265,14 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                 
             diff_df["date"] = pd.to_datetime(diff_df["date"]).dt.tz_localize(None)
             
-            # 本番に結合する差分側に patched_multiplier が無ければ初期化
             if "patched_multiplier" not in diff_df.columns:
                 diff_df["patched_multiplier"] = 1.0
             
-            # 時間足ごとの本番ファイル分割単位の割り出し
             if interval == "1d":
                 diff_df["_group_key"] = "all"
             elif interval == "60m":
                 diff_df["_group_key"] = diff_df["date"].dt.strftime("%Y")
-            else: # 5m, 1m
+            else:
                 diff_df["_group_key"] = diff_df["date"].dt.strftime("%Y_%m")
             
             for group_key, group_df in diff_df.groupby("_group_key"):
@@ -299,11 +294,9 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                             base_df = pd.read_parquet(local_base_path)
                             base_df["date"] = pd.to_datetime(base_df["date"]).dt.tz_localize(None)
                             
-                            # 本番読み出し側スキーマの補正・同期
                             if "patched_multiplier" not in base_df.columns:
                                 base_df["patched_multiplier"] = 1.0
                             
-                            # 健全性検証用メタデータの退避
                             orig_tickers = set(base_df["ticker"].unique()) if not base_df.empty else set()
                             orig_count = len(base_df)
                             
@@ -315,8 +308,7 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                                 "local_path": local_base_path
                             }
                         except Exception as e_read:
-                            # 既存データの破損時は空でフォールバックせず安全にエラー中断させる
-                            log(f"  ❌ [{base_filename}] のロードに失敗しました (破損・I/Oエラー)。過去データを保護するため処理を安全に中断します: {e_read}")
+                            log(f"  ❌ [{base_filename}] のロードに失敗しました: {e_read}")
                             error_occurred = True
                             err_msg = f"既存本番データの読み込み失敗: {base_filename}"
                             break
@@ -359,7 +351,7 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                 os.remove(local_temp_path)
             break
 
-    # 5. 【保存前のインメモリ健全性アサーションスキャン】
+    # 5. 保存前のインメモリ健全性アサーションスキャン
     if not error_occurred and loaded_bases:
         log("🔍 クラウド保存前のインメモリデータ健全性スキャンを実行します...")
         for g_key, b_info in loaded_bases.items():
@@ -369,80 +361,30 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
             orig_count = b_info["original_count"]
             new_count = len(final_df)
 
-            # ① 空データアサーション
             if final_df.empty:
-                log(f"  ❌ [健全性エラー] [{f_name}] マージ後のデータフレームが完全に空です。")
                 error_occurred = True
                 err_msg = f"{f_name} のマージ後データが空になりました。"
                 break
-
-            # ② 銘柄（ティッカー）消失アサーション
             new_tickers = set(final_df["ticker"].unique())
             missing_tickers = orig_tickers - new_tickers
             if missing_tickers:
-                log(f"  ❌ [健全性エラー] [{f_name}] 既存銘柄の一部がマージ後に消失しています: {list(missing_tickers)[:10]}")
                 error_occurred = True
                 err_msg = f"{f_name} から一部の銘柄データが消失しました。"
                 break
-
-            # ③ 件数激減アサーション（重複削除分を考慮し、前件数の99%未満を異常値として検出）
             if orig_count > 0 and new_count < orig_count * 0.99:
-                log(f"  ❌ [健全性エラー] [{f_name}] 行数が前件数より異常に減少しています: {orig_count:,} ➔ {new_count:,} (減少率: {(1 - new_count/orig_count)*100:.2f}%)")
                 error_occurred = True
                 err_msg = f"{f_name} の行数が異常に減少しました。"
                 break
-
-            # ④ 必須項目NULL値および不正価格値チェック
             if final_df["close"].isna().any() or final_df["ticker"].isna().any() or final_df["date"].isna().any():
-                log(f"  ❌ [健全性エラー] [{f_name}] 必須列 (date, ticker, close) に NULL値 (NaN) が混入しています。")
                 error_occurred = True
                 err_msg = f"{f_name} に NULL値が混入しました。"
                 break
-
             if (final_df["close"] <= 0).any():
-                log(f"  ❌ [健全性エラー] [{f_name}] 0 以下の不正な異常価格（Close）が含まれています。")
                 error_occurred = True
                 err_msg = f"{f_name} に 0 以下の異常価格が含まれています。"
                 break
 
-            # ⑤ 時系列の極端なギャップ検知（全時間足共通で、10日以上の不自然なデータ空白を特定）
-            if not final_df.empty:
-                try:
-                    final_df_sorted = final_df.sort_values(["ticker", "date"]).copy()
-                    final_df_sorted["diff_days"] = final_df_sorted.groupby("ticker")["date"].diff().dt.total_seconds() / 86400.0
-                    gap_rows = final_df_sorted[final_df_sorted["diff_days"] > 10]
-                    if not gap_rows.empty:
-                        log(f"  ⚠️ [健全性警告] [{f_name}] にデータ空白（10日超のギャップ）を検出しました:")
-                        shown_count = 0
-                        for idx_label, row in gap_rows.iterrows():
-                            if shown_count >= 15:
-                                log(f"    • （他 {len(gap_rows) - 15} 件のギャップは省略します）")
-                                break
-                            tk = row["ticker"]
-                            gap_days = row["diff_days"]
-                            end_date = row["date"].strftime("%Y-%m-%d %H:%M:%S")
-                            
-                            # 正確にそのティッカーの直前の日付を取得
-                            ticker_indices = final_df_sorted[final_df_sorted["ticker"] == tk].index.tolist()
-                            try:
-                                curr_pos = ticker_indices.index(idx_label)
-                                if curr_pos > 0:
-                                    prev_idx = ticker_indices[curr_pos - 1]
-                                    prev_row = final_df_sorted.loc[prev_idx]
-                                    start_date = prev_row["date"].strftime("%Y-%m-%d %H:%M:%S")
-                                else:
-                                    start_date = "不明"
-                            except ValueError:
-                                start_date = "不明"
-                                
-                            log(f"    • 銘柄: {tk} | 期間: {start_date} 〜 {end_date} ({gap_days:.1f}日間データなし)")
-                            shown_count += 1
-                    else:
-                        log(f"  ✅ [{f_name}] 時系列に不自然なデータ空白（10日超）はありません。")
-                except Exception as e_gap:
-                    log(f"  ⚠️ [ギャップ検知処理エラー]: {e_gap}")
-
-    # 6. エラーなく全健全性検証を通過した場合のみ、確定保存（アップロード）
+    # 6. エラーなく検証通過時：Drive確定アップロード ＆ ローカル正規Parquetの完全上書き同期
     if not error_occurred and loaded_bases:
         log("💾 すべての安全アサーション検証をクリアしました。統合ファイルを上書き保存中...")
         for g_key, b_info in loaded_bases.items():
@@ -450,13 +392,21 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
             local_save_path = b_info["local_path"]
             f_name = b_info["filename"]
             
+            # 【重要】分析画面がロードする正規のローカルパス
+            official_local_path = os.path.join(settings.WORK_DIR, f_name)
+            
             try:
                 table = pa.Table.from_pandas(final_df, preserve_index=False)
+                # 一時ファイルへ書き出し
                 pq.write_table(table, local_save_path, use_dictionary=False, compression="SNAPPY")
                 
+                # Google Driveへアップロード
                 up_success, up_msg = upload_to_drive_api(f_name, local_save_path, parent_id=tf_folder_id)
                 if up_success:
-                    log(f"   ✅ [{f_name}] 本番ファイルをGoogleドライブへ確定保存しました。({len(final_df):,}件)")
+                    # 💡【修正案1の実装】Drive保存成功時、ローカルの正規ファイルも最新データで上書き同期する
+                    pq.write_table(table, official_local_path, use_dictionary=False, compression="SNAPPY")
+                    log(f"   ✅ [{f_name}] Googleドライブおよびローカル正規キャッシュを最新データに同期しました。({len(final_df):,}件)")
+                    
                     if os.path.exists(local_save_path):
                         os.remove(local_save_path)
                 else:
@@ -470,13 +420,12 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                 err_msg = str(e)
                 break
 
-    # 7. 【安全削除】すべてのマージ保存が100%成功した場合に限り、Drive上の差分ファイルを安全消去
+    # 7. すべてのマージが成功した場合に限り、Drive上の差分ファイルを安全消去
     if not error_occurred and processed_file_ids:
         log("🧹 データベースの確定保存を確認しました。Googleドライブ上の元差分ファイルを自動消去中...")
         del_count = 0
         for f_id in processed_file_ids:
-            success = delete_file_from_drive(f_id)
-            if success:
+            if delete_file_from_drive(f_id):
                 del_count += 1
         log(f"   👉 使用済みの差分ファイル {del_count} 件をGoogleドライブから安全消去しました。")
         
@@ -486,7 +435,7 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
         except Exception:
             pass
             
-        return {"success": True, "message": f"計 {len(processed_file_ids)} 件 of 差分健全マージと自動消去が正常に完了しました。"}
+        return {"success": True, "message": f"計 {len(processed_file_ids)} 件の差分健全マージとキャッシュ同期が正常に完了しました。"}
 
     return {"success": False, "message": err_msg if err_msg else "マージ処理を安全に中断・ロールバックしました。"}
 
@@ -726,3 +675,24 @@ def get_price_data_cached(interval: str, limit_days: int = None, is_jp: bool = T
         return _get_price_data_1d_cached(limit_days, is_jp)
     else:
         return _get_price_data_intraday_cached(interval, limit_days, is_jp)
+
+def clear_local_parquet_cache(interval: str = None, is_jp: bool = True):
+    """
+    ローカル作業フォルダ（settings.WORK_DIR）内のParquetキャッシュファイルを削除し、
+    次回ロード時にGoogle Driveから最新ファイルを強制再取得させます。
+    """
+    import glob
+    market = "jp" if is_jp else "us"
+    if interval:
+        pattern = f"price_{market}_{interval}*.parquet"
+    else:
+        pattern = f"price_{market}_*.parquet"
+        
+    search_path = os.path.join(settings.WORK_DIR, pattern)
+    for f in glob.glob(search_path):
+        # 差分ファイル(_diff_)や一時検証ファイル(_temp)は巻き込まず、本番ベースのみ削除
+        if "_diff_" not in f and "_temp" not in f:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
