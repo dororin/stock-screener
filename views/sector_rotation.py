@@ -1,5 +1,6 @@
 # sector_rotation.py
 
+import os
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
@@ -23,7 +24,8 @@ from core.calculator import (
 )
 from utils.plotting import (
     render_lwc_rs_overlay,
-    render_lwc_sector_mini
+    render_lwc_sector_mini,
+    render_lwc_candle_mini
 )
 
 CUSTOM_SECTOR_KEY = "custom_sector_tickers"
@@ -34,7 +36,68 @@ if CUSTOM_SECTOR_KEY not in st.session_state:
 
 
 # =====================================================================
-# 🪟 【共通モーダルダイアログ】構成個別株ミニチャート一覧展開
+# 🏷️ 【東証全銘柄・社名マスタキャッシュ】英数字コード(167A等)・中小型完全対応
+# =====================================================================
+@st.cache_data(ttl=86400)
+def get_all_stock_names_map(is_jp: bool = True) -> dict:
+    """
+    東証全銘柄（英字入りコード 167A, 285A 等や中小型株を含む）および
+    スプレッドシート(sector_JP)に登録された銘柄名・社名を網羅した完全辞書を生成。
+    """
+    name_map = {}
+    if not is_jp:
+        return name_map
+
+    # 1. sector_JP シートから備考/銘柄名を吸い上げ
+    try:
+        from data_access.sheets_api import get_sector_spreadsheet
+        sh = get_sector_spreadsheet()
+        if sh:
+            ws = sh.worksheet("sector_JP")
+            all_vals = ws.get_all_values()
+            if all_vals and len(all_vals) > 1:
+                headers = [str(h).strip() for h in all_vals[0]]
+                code_idx = next((i for i, h in enumerate(headers) if h in ["銘柄コード", "code", "ticker", "コード"]), -1)
+                memo_idx = next((i for i, h in enumerate(headers) if h in ["備考", "銘柄名", "name", "memo"]), -1)
+                if code_idx != -1 and memo_idx != -1:
+                    for row in all_vals[1:]:
+                        if len(row) > max(code_idx, memo_idx):
+                            c = str(row[code_idx]).strip().split(".")[0].upper()
+                            m = str(row[memo_idx]).strip()
+                            if c and m:
+                                name_map[c] = m
+    except Exception:
+        pass
+
+    # 2. JPX全銘柄リスト(data_j.xls)から全上場企業の銘柄名を網羅取得（英数字コードも完全保持）
+    try:
+        jpx_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
+        if not os.path.exists(jpx_path):
+            import requests
+            resp = requests.get(settings.JPX_URL, timeout=10)
+            if resp.status_code == 200:
+                with open(jpx_path, "wb") as f:
+                    f.write(resp.content)
+        if os.path.exists(jpx_path):
+            df_full = pd.read_excel(jpx_path)
+            # 1列目(B列): コード, 2列目(C列): 銘柄名
+            if df_full.shape[1] >= 3:
+                for _, r in df_full.iterrows():
+                    code_raw = str(r.iloc[1]).strip()
+                    if code_raw.endswith(".0"):
+                        code_raw = code_raw[:-2]
+                    code_clean = code_raw.upper()
+                    name_raw = str(r.iloc[2]).strip()
+                    if code_clean and name_raw and code_clean not in name_map:
+                        name_map[code_clean] = name_raw
+    except Exception:
+        pass
+
+    return name_map
+
+
+# =====================================================================
+# 🪟 【共通モーダルダイアログ】個別株ローソク足ミニチャート一覧展開
 # =====================================================================
 @st.dialog("📊 構成銘柄ミニチャート一覧", width="large")
 def show_constituents_dialog(
@@ -47,24 +110,22 @@ def show_constituents_dialog(
 ):
     """
     テーマ名クリック時に最前面にオーバーレイ展開する共通モーダルダイアログ。
-    17業種ETF、厳選テーマ、米国株セクターのすべてで共通して利用されます。
+    個別株のOHLCVデータから「ローソク足チャート＋移動平均線」を描画します。
     """
     st.subheader(f"📊 {title}（構成: {len(constituent_codes)} 銘柄）")
-    st.caption(f"足種: {interval} ｜ 表示期間: {period_days}日")
+    tf_display_name = "週足" if resample_weekly else ("日足" if interval == "1d" else interval)
+    st.caption(f"足種: {tf_display_name} ｜ 表示期間: {period_days}日")
 
     if not constituent_codes:
         st.info("構成銘柄が登録されていません。")
         return
 
-    # 日本株の場合はJPXリストから会社名辞書を生成
-    name_map = {}
-    if is_jp:
-        try:
-            jpx_df = get_jpx_full_list()
-            if not jpx_df.empty:
-                name_map = dict(zip(jpx_df["symbol"].astype(str), jpx_df["name"]))
-        except Exception:
-            name_map = {}
+    # 全銘柄社名マスタの取得
+    name_map = get_all_stock_names_map(is_jp)
+
+    # OHLCVデータベースを一括事前ロード（高速化）
+    db_df = get_price_data_cached(interval, limit_days=period_days + 365, is_jp=is_jp)
+    display_start = pd.Timestamp.now() - pd.Timedelta(days=period_days)
 
     cols_per_row = 3  # モーダル内は3列でゆったりと配置
     rows = [constituent_codes[i:i + cols_per_row] for i in range(0, len(constituent_codes), cols_per_row)]
@@ -72,27 +133,45 @@ def show_constituents_dialog(
     for row_codes in rows:
         grid_cols = st.columns(cols_per_row)
         for ci, stock_code in enumerate(row_codes):
-            with grid_cols[ci]:
-                try:
-                    s_abs, s_sma75, s_sma200, s_wvf, s_vol = get_sector_absolute_data_cached(
-                        interval, (stock_code,), period_days, resample_weekly, is_jp=is_jp
-                    )
-                except Exception:
-                    s_abs = pd.Series(dtype=float)
-                    s_sma75 = s_sma200 = s_wvf = s_vol = pd.Series(dtype=float)
+            clean_code = str(stock_code).strip().upper()
+            stock_name = name_map.get(clean_code, "")
+            display_label = f"{clean_code}　{stock_name}" if stock_name else clean_code
 
-                s_mom = get_sector_momentum(
-                    get_sector_index_cached(interval, (stock_code,), period_days, resample_weekly, is_jp=is_jp),
-                    days=min(5, period_days)
-                )
+            with grid_cols[ci]:
+                # 個別銘柄のOHLCV抽出
+                df_stock = pd.DataFrame()
+                if not db_df.empty and "ticker" in db_df.columns:
+                    mask = db_df["ticker"] == clean_code
+                    if mask.any():
+                        df_stock = db_df[mask].copy().sort_values("date").reset_index(drop=True)
+
+                s_mom = 0.0
+                df_display = pd.DataFrame()
+
+                if not df_stock.empty and len(df_stock) >= 2:
+                    # 週足リサンプル処理
+                    if resample_weekly:
+                        df_stock = df_stock.set_index("date").resample("W-FRI").agg({
+                            "open": "first", "high": "max", "low": "min",
+                            "close": "last", "volume": "sum", "ticker": "last"
+                        }).dropna().reset_index()
+
+                    df_stock["sma75"] = df_stock["close"].rolling(window=75, min_periods=1).mean()
+                    df_stock["sma200"] = df_stock["close"].rolling(window=200, min_periods=1).mean()
+
+                    # 直近5期間モメンタム
+                    recent_closes = df_stock["close"].tail(min(5, len(df_stock))).values
+                    if len(recent_closes) >= 2 and recent_closes[0] > 0:
+                        s_mom = float((recent_closes[-1] / recent_closes[0] - 1) * 100)
+
+                    # 表示期間フィルタ
+                    df_display = df_stock[df_stock["date"] >= display_start].copy().reset_index(drop=True)
+
                 s_badge = "🟢" if s_mom >= 3.0 else "🔴" if s_mom <= -3.0 else "⚪"
                 s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
 
-                stock_name = name_map.get(str(stock_code), "")
-                display_label = f"{stock_code} {stock_name}".strip()
-
                 with st.container(border=True):
-                    hc1, hc2 = st.columns([3, 2])
+                    hc1, hc2 = st.columns([3.5, 1.5])
                     hc1.markdown(
                         f"<div style='font-size:0.85rem; font-weight:600; color:{s_color}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;' title='{display_label}'>"
                         f"{s_badge} {display_label}</div>",
@@ -104,11 +183,16 @@ def show_constituents_dialog(
                         unsafe_allow_html=True
                     )
 
-                    if not s_abs.empty:
-                        render_lwc_sector_mini(
-                            s_abs, sma_fast=s_sma75, sma_slow=s_sma200,
-                            wvf_lit=s_wvf, volume_series=s_vol,
-                            key=f"dlg_mini_{title}_{stock_code}", height=140
+                    # 💡 ローソク足ミニチャート（SMA75/SMA200、出来高付き）で描画
+                    if not df_display.empty and len(df_display) >= 2:
+                        sma_fast = df_display.set_index("date")["sma75"]
+                        sma_slow = df_display.set_index("date")["sma200"]
+                        render_lwc_candle_mini(
+                            df_display,
+                            sma_fast=sma_fast,
+                            sma_slow=sma_slow,
+                            key=f"dlg_candle_{title}_{clean_code}",
+                            height=150
                         )
                     else:
                         st.caption("データなし")
@@ -341,7 +425,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
             def toggle_etf_visibility(code):
                 st.session_state[f"etf_visible_{code}"] = not st.session_state[f"etf_visible_{code}"]
 
-            # 事前にセクター構成辞書をロード
             sectors_loaded = load_sector_master_from_sheets(True)
 
             def render_etf_card(code, name):
