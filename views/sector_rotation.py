@@ -563,9 +563,9 @@ with st.sidebar:
     is_jp = (market_mode == "日本株 🇯🇵")
 
 # 2. データベースの健全性（軽量サンプル）確認
-sample_df = get_price_data_cached("1d", limit_days=7, is_jp=is_jp)
+sample_df = get_price_data_cached("1d", limit_days=None, is_jp=is_jp)
 if sample_df.empty:
-    st.info("💡 データベースがまだ作成されていません。「データ管理・保守」画面で差分ダウンロードを実行してください。")
+    st.warning("⚠️ データベースが見つかりません。Google Drive上にデータが存在するか確認、または「データ管理・保守」画面で構築を行ってください。")
     st.stop()
 
 # ── 1. 重ね合わせ比較チャートフラグメントを実行
