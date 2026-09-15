@@ -1,3 +1,5 @@
+# sector_rotation.py
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
@@ -29,6 +31,87 @@ CUSTOM_SECTOR_KEY = "custom_sector_tickers"
 # セッション状態にウォッチリストがなければSheetsから読み込み
 if CUSTOM_SECTOR_KEY not in st.session_state:
     st.session_state[CUSTOM_SECTOR_KEY] = load_watchlist_from_sheets()
+
+
+# =====================================================================
+# 🪟 【共通モーダルダイアログ】構成個別株ミニチャート一覧展開
+# =====================================================================
+@st.dialog("📊 構成銘柄ミニチャート一覧", width="large")
+def show_constituents_dialog(
+    title: str,
+    constituent_codes: list,
+    interval: str,
+    period_days: int,
+    resample_weekly: bool,
+    is_jp: bool = True
+):
+    """
+    テーマ名クリック時に最前面にオーバーレイ展開する共通モーダルダイアログ。
+    17業種ETF、厳選テーマ、米国株セクターのすべてで共通して利用されます。
+    """
+    st.subheader(f"📊 {title}（構成: {len(constituent_codes)} 銘柄）")
+    st.caption(f"足種: {interval} ｜ 表示期間: {period_days}日")
+
+    if not constituent_codes:
+        st.info("構成銘柄が登録されていません。")
+        return
+
+    # 日本株の場合はJPXリストから会社名辞書を生成
+    name_map = {}
+    if is_jp:
+        try:
+            jpx_df = get_jpx_full_list()
+            if not jpx_df.empty:
+                name_map = dict(zip(jpx_df["symbol"].astype(str), jpx_df["name"]))
+        except Exception:
+            name_map = {}
+
+    cols_per_row = 3  # モーダル内は3列でゆったりと配置
+    rows = [constituent_codes[i:i + cols_per_row] for i in range(0, len(constituent_codes), cols_per_row)]
+
+    for row_codes in rows:
+        grid_cols = st.columns(cols_per_row)
+        for ci, stock_code in enumerate(row_codes):
+            with grid_cols[ci]:
+                try:
+                    s_abs, s_sma75, s_sma200, s_wvf, s_vol = get_sector_absolute_data_cached(
+                        interval, (stock_code,), period_days, resample_weekly, is_jp=is_jp
+                    )
+                except Exception:
+                    s_abs = pd.Series(dtype=float)
+                    s_sma75 = s_sma200 = s_wvf = s_vol = pd.Series(dtype=float)
+
+                s_mom = get_sector_momentum(
+                    get_sector_index_cached(interval, (stock_code,), period_days, resample_weekly, is_jp=is_jp),
+                    days=min(5, period_days)
+                )
+                s_badge = "🟢" if s_mom >= 3.0 else "🔴" if s_mom <= -3.0 else "⚪"
+                s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
+
+                stock_name = name_map.get(str(stock_code), "")
+                display_label = f"{stock_code} {stock_name}".strip()
+
+                with st.container(border=True):
+                    hc1, hc2 = st.columns([3, 2])
+                    hc1.markdown(
+                        f"<div style='font-size:0.85rem; font-weight:600; color:{s_color}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;' title='{display_label}'>"
+                        f"{s_badge} {display_label}</div>",
+                        unsafe_allow_html=True
+                    )
+                    hc2.markdown(
+                        f"<div style='font-size:0.8rem; text-align:right; color:{s_color}; font-weight:bold;'>"
+                        f"{s_mom:+.2f}%</div>",
+                        unsafe_allow_html=True
+                    )
+
+                    if not s_abs.empty:
+                        render_lwc_sector_mini(
+                            s_abs, sma_fast=s_sma75, sma_slow=s_sma200,
+                            wvf_lit=s_wvf, volume_series=s_vol,
+                            key=f"dlg_mini_{title}_{stock_code}", height=140
+                        )
+                    else:
+                        st.caption("データなし")
 
 
 # =====================================================================
@@ -125,7 +208,6 @@ def render_watchlist_editor_fragment():
 def render_overlay_chart_fragment(is_jp: bool):
     """重ね合わせ比較チャートの計算と描画をカプセル化。ウィジェット操作時に下部チャートは再計算されません。"""
     
-    # 💡【修正案4】タイトルの横にキャッシュ強制クリア＆全体再読込ボタンを配置
     title_col, refresh_col = st.columns([3, 1])
     with title_col:
         st.markdown("### 📊 セクター・テーマ相対強度（RS）重ね合わせ比較")
@@ -139,10 +221,8 @@ def render_overlay_chart_fragment(is_jp: bool):
             clear_local_parquet_cache(is_jp=is_jp)
             st.cache_data.clear()
             st.toast("✅ キャッシュをクリアしました。最新データを再読み込みします。")
-            # フラグメント内だけでなく、下部のミニチャート等も含めて画面全体を再描画
             st.rerun(scope="app")
     
-    # 閉域コントロールパネル
     col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4 = st.columns(4)
     with col_ctrl1:
         period_label = st.radio("表示期間", ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "全期間"], index=1, horizontal=True, key="ov_period")
@@ -164,7 +244,6 @@ def render_overlay_chart_fragment(is_jp: bool):
     resample_weekly = (tf_label == "週足")
     bm_ticker = benchmarks[bm_label]
 
-    # ベンチマーク基準系列の取得
     bm_series = get_benchmark_data_cached(bm_ticker, period_days, interval, is_jp=is_jp) if bm_ticker else None
 
     overlay_series_cache = {}
@@ -189,7 +268,6 @@ def render_overlay_chart_fragment(is_jp: bool):
                         if not idx_series.empty:
                             overlay_series_cache[t_name] = relativize_series(idx_series, bm_series)
         else:
-            # 米国株
             sectors = load_sector_master_from_sheets(is_jp=False)
             for sname, tickers in sectors.items():
                 idx_series = get_sector_index_cached(interval, tuple(tickers), period_days, resample_weekly, is_jp=is_jp)
@@ -213,6 +291,7 @@ def render_overlay_chart_fragment(is_jp: bool):
     else:
         st.caption("表示対象のデータがありません。")
 
+
 # =====================================================================
 # 📈 【フラグメント2】セクターミニチャート一覧（完全独立）
 # =====================================================================
@@ -221,7 +300,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
     """17業種ETF、厳選テーマなどのミニチャート群を描画。リラン時に上部重ね書きに影響を与えません。"""
     st.markdown("### 📈 セクター・テーマ ミニチャート")
 
-    # 閉域コントロールパネル
     col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1.5, 1.5, 1])
     with col_ctrl1:
         period_label = st.radio("表示期間", ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "全期間"], index=1, horizontal=True, key="mini_period")
@@ -248,9 +326,10 @@ def render_sector_mini_charts_fragment(is_jp: bool):
         if view_mode == "📊 17業種ETF（絶対価格表示）":
             TOPIX17_TO_JP_SECTOR = {
                 "1617": "食品", "1618": "エネルギー", "1619": "建設・インフラ",
-                "1621": "医薬品", "1622": "自動車", "1625": "電気機器",
-                "1626": "通信", "1629": "商社", "1630": "小売",
-                "1631": "銀行", "1632": "保険", "1633": "不動産",
+                "1620": "素材", "1621": "医薬品", "1622": "自動車", "1623": "鉄鋼",
+                "1624": "機械", "1625": "電気機器", "1626": "通信", "1627": "公益",
+                "1628": "運輸", "1629": "商社", "1630": "小売", "1631": "銀行",
+                "1632": "保険", "1633": "不動産",
             }
             all_etf_codes = list(settings.TOPIX17_NAMES.keys())
 
@@ -262,9 +341,20 @@ def render_sector_mini_charts_fragment(is_jp: bool):
             def toggle_etf_visibility(code):
                 st.session_state[f"etf_visible_{code}"] = not st.session_state[f"etf_visible_{code}"]
 
-            # フラグメント内ヘルパー
+            # 事前にセクター構成辞書をロード
+            sectors_loaded = load_sector_master_from_sheets(True)
+
             def render_etf_card(code, name):
                 visible = st.session_state[f"etf_visible_{code}"]
+                
+                # 構成銘柄の特定
+                jp_sector_name = TOPIX17_TO_JP_SECTOR.get(code)
+                constituent_codes = settings.JP_SECTORS.get(jp_sector_name, []) if jp_sector_name else []
+                if not constituent_codes and jp_sector_name:
+                    constituent_codes = sectors_loaded.get(jp_sector_name, [])
+                if not constituent_codes:
+                    constituent_codes = sectors_loaded.get(name, [])
+
                 with st.container(border=True):
                     hc1, hc2 = st.columns([5, 1])
                     vis_label = "表示" if not visible else "非表示"
@@ -286,12 +376,17 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                         badge_e = "🟢" if etf_mom >= 0 else "🔴"
                         color_e = "#26a69a" if etf_mom >= 0 else "#ef5350"
 
-                        hc1.markdown(
-                            f"<span style='font-size:0.9rem; font-weight:600; color:{color_e}'>"
-                            f"{badge_e} {code} {name}</span>"
-                            f"<span style='font-size:0.8rem; color:{color_e}; margin-left:6px;'>{etf_mom:+.2f}%</span>",
-                            unsafe_allow_html=True
-                        )
+                        # 💡 テーマ名ボタン：クリックで構成銘柄のモーダルダイアログを展開
+                        btn_label = f"{badge_e} {code} {name} ({etf_mom:+.2f}%) 🔍"
+                        if hc1.button(btn_label, key=f"btn_dlg_etf_{code}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
+                            show_constituents_dialog(
+                                title=f"{code} {name}",
+                                constituent_codes=constituent_codes,
+                                interval=interval,
+                                period_days=period_days,
+                                resample_weekly=resample_weekly,
+                                is_jp=is_jp
+                            )
 
                         if not etf_abs.empty:
                             render_lwc_sector_mini(
@@ -301,49 +396,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             )
                         else:
                             st.caption("データなし")
-
-                        jp_sector_name = TOPIX17_TO_JP_SECTOR.get(code)
-                        constituent_codes = settings.JP_SECTORS.get(jp_sector_name, []) if jp_sector_name else []
-                        if not constituent_codes:
-                            sectors_loaded = load_sector_master_from_sheets(True)
-                            constituent_codes = sectors_loaded.get(jp_sector_name, []) if jp_sector_name else []
-
-                        if constituent_codes:
-                            with st.popover(f"🔍 構成{len(constituent_codes)}銘柄一覧", use_container_width=True):
-                                p_cols = st.columns(5)
-                                for s_idx, stock_code in enumerate(constituent_codes):
-                                    col_to_use = p_cols[s_idx % 5]
-                                    with col_to_use:
-                                        try:
-                                            s_abs, s_sma75, s_sma200, s_wvf, s_vol = get_sector_absolute_data_cached(
-                                                interval, (stock_code,), period_days, resample_weekly, is_jp=is_jp
-                                            )
-                                        except Exception:
-                                            s_abs = pd.Series(dtype=float)
-                                            s_sma75 = s_sma200 = s_wvf = s_vol = pd.Series(dtype=float)
-
-                                        s_mom = get_sector_momentum(
-                                            get_sector_index_cached(interval, (stock_code,), period_days, resample_weekly, is_jp=is_jp),
-                                            days=min(5, period_days)
-                                        )
-                                        s_badge = "🟢" if s_mom >= 3.0 else "🔴" if s_mom <= -3.0 else "⚪"
-                                        s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
-
-                                        with st.container(border=True):
-                                            st.markdown(
-                                                f"<div style='font-size:0.78rem; font-weight:600; color:{s_color};'>"
-                                                f"{s_badge} {stock_code}</div>"
-                                                f"<div style='font-size:0.75rem; color:#9e9e9e;'>{s_mom:+.2f}%</div>",
-                                                unsafe_allow_html=True
-                                            )
-                                            if not s_abs.empty:
-                                                render_lwc_sector_mini(
-                                                    s_abs, sma_fast=s_sma75, sma_slow=s_sma200,
-                                                    wvf_lit=s_wvf, volume_series=s_vol,
-                                                    key=f"stock_pop_mini_{code}_{stock_code}", height=120
-                                                )
-                                            else:
-                                                st.caption("データなし")
                     else:
                         hc1.markdown(f"<span style='font-size:0.85rem; color:#9e9e9e;'>{code} {name}</span>", unsafe_allow_html=True)
 
@@ -356,7 +408,7 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                         render_etf_card(code, name)
 
         else:
-            # 厳選テーマ
+            # 厳選テーマ (シートA)
             sectors_loaded = load_sector_master_from_sheets(is_jp=True)
             if not sectors_loaded:
                 st.info("テーマデータが読み取れませんでした。")
@@ -386,12 +438,17 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                                 badge_t = "🟢" if last_ret >= 0 else "🔴"
                                 color_t = "#26a69a" if last_ret >= 0 else "#ef5350"
 
-                                hc1.markdown(
-                                    f"<span style='font-size:0.9rem; font-weight:600; color:{color_t}'>"
-                                    f"{badge_t} {t_name}</span>"
-                                    f"<span style='font-size:0.8rem; color:{color_t}; margin-left:6px;'>リターン: {last_ret:+.2f}%</span>",
-                                    unsafe_allow_html=True
-                                )
+                                # 💡 テーマ名ボタン：クリックで構成銘柄のモーダルダイアログを展開
+                                btn_label = f"{badge_t} {t_name} ({last_ret:+.2f}%) 🔍"
+                                if hc1.button(btn_label, key=f"btn_dlg_theme_{t_name}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
+                                    show_constituents_dialog(
+                                        title=t_name,
+                                        constituent_codes=tickers,
+                                        interval=interval,
+                                        period_days=period_days,
+                                        resample_weekly=resample_weekly,
+                                        is_jp=is_jp
+                                    )
 
                                 render_lwc_sector_mini(
                                     ret_rate, sma_fast=sma75, sma_slow=sma200,
@@ -415,7 +472,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
     else:
         sectors = load_sector_master_from_sheets(is_jp)
         
-        # モメンタム順位の計算
         sector_index_cache = {}
         momentum_scores = {}
         for sname, tickers in sectors.items():
@@ -463,8 +519,19 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                 with cols[col_i]:
                     with st.container(border=True):
                         hc1, hc2 = st.columns([3, 1])
-                        wvf_badge = " <span style='color:#ef5350;font-weight:bold;'>🔥 押し目</span>" if wvf_active else ""
-                        hc1.markdown(f"<span style='font-weight:600;color:{color_theme}'>{badge} {sname}</span>{wvf_badge}", unsafe_allow_html=True)
+                        wvf_badge = " 🔥" if wvf_active else ""
+                        
+                        # 💡 米国株セクター名ボタン：クリックで構成銘柄のモーダルダイアログを展開
+                        btn_label = f"{badge} {sname}{wvf_badge} 🔍"
+                        if hc1.button(btn_label, key=f"btn_dlg_us_{sname}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
+                            show_constituents_dialog(
+                                title=sname,
+                                constituent_codes=tickers,
+                                interval=interval,
+                                period_days=period_days,
+                                resample_weekly=resample_weekly,
+                                is_jp=is_jp
+                            )
                         hc2.metric("", f"{mom:+.2f}%", label_visibility="collapsed")
 
                         if not sec_abs.empty:
@@ -515,7 +582,6 @@ def render_watchlist_mini_charts_fragment(is_jp: bool):
             code = custom_codes[idx]
             name = custom_tickers[code]
 
-            # 削除時用の内局所ハンドラ
             def remove_item(c):
                 del st.session_state[CUSTOM_SECTOR_KEY][c]
                 save_watchlist_to_sheets(st.session_state[CUSTOM_SECTOR_KEY])
@@ -553,16 +619,14 @@ def render_watchlist_mini_charts_fragment(is_jp: bool):
 
 
 # =====================================================================
-# 🛠️ メイン画面描画制御 (全体リランをトリガーする大枠市場選択のみ配置)
+# 🛠️ メイン画面描画制御
 # =====================================================================
 
-# 1. ページ全体の共通データ境界（日本株/米国株の選択のみサイドバーに維持、またはメイン上部）
 with st.sidebar:
     st.subheader("🌐 市場の選択")
     market_mode = st.radio("マーケット", ["日本株 🇯🇵", "米国株 🇺🇸"], horizontal=True, label_visibility="collapsed")
     is_jp = (market_mode == "日本株 🇯🇵")
 
-# 2. データベースの健全性（軽量サンプル）確認
 sample_df = get_price_data_cached("1d", limit_days=None, is_jp=is_jp)
 if sample_df.empty:
     st.warning("⚠️ データベースが見つかりません。Google Drive上にデータが存在するか確認、または「データ管理・保守」画面で構築を行ってください。")
