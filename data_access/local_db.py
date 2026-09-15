@@ -8,6 +8,7 @@ import re
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import streamlit as st
 from config import settings
 from data_access.drive_api import (
     download_from_drive_api, 
@@ -17,190 +18,51 @@ from data_access.drive_api import (
     delete_file_from_drive
 )
 
+def clear_local_parquet_cache(interval: str = None, is_jp: bool = True):
+    """
+    ローカル作業フォルダ（settings.WORK_DIR）内のParquetキャッシュファイルを削除し、
+    次回ロード時にGoogle Driveから最新ファイルを強制再取得させます。
+    """
+    market = "jp" if is_jp else "us"
+    if interval:
+        pattern = f"price_{market}_{interval}*.parquet"
+    else:
+        pattern = f"price_{market}_*.parquet"
+        
+    search_path = os.path.join(settings.WORK_DIR, pattern)
+    for f in glob.glob(search_path):
+        if "_diff_" not in f and "_temp" not in f:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+
 def get_ledger_filename(interval: str, is_jp: bool = True, is_raw: bool = False) -> str:
     market = "jp" if is_jp else "us"
     suffix = "_raw" if is_raw else ""
     return f"ledger_{market}_{interval}{suffix}.json"
 
-# ─────────────────────────────────────────────────────────────────────
-# data_access/local_db.py への差し替えコード (load_price_db 関数)
-# ─────────────────────────────────────────────────────────────────────
-
-def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_temp: bool = False, columns: list = None, filters: list = None) -> pd.DataFrame:
-    """
-    1m, 5m, 60m, 1d 等の本番Parquetファイルを投影ロード・フィルタリングロードします。
-    【修正点】ローカル（WORK_DIR）にファイルが存在しない場合、Google Driveから自動ダウンロードして
-    透過的に読み込み、不要なエラー停止を防ぎます。
-    """
-    def _apply_pandas_filters_safe(df_target: pd.DataFrame) -> pd.DataFrame:
-        if df_target.empty or not filters:
-            return df_target
-        for f in filters:
-            if isinstance(f, (tuple, list)) and len(f) == 3:
-                col, op, val = f
-                if col in df_target.columns:
-                    if op == "==":
-                        df_target = df_target[df_target[col] == val]
-                    elif op == ">=":
-                        df_target = df_target[df_target[col] >= val]
-                    elif op == "<=":
-                        df_target = df_target[df_target[col] <= val]
-        return df_target
-
-    min_date_limit = None
-    if filters:
-        for f in filters:
-            if isinstance(f, (tuple, list)) and len(f) == 3:
-                col, op, val = f
-                if col == "date" and op in [">=", ">"]:
-                    min_date_limit = pd.to_datetime(val)
-                    break
-
-    # ───── 日本株（JP）のロード処理 ─────
-    if is_jp:
-        tf_folder_id = get_or_create_drive_folder(interval, settings.FOLDER_ID)
-        from data_access.drive_api import get_drive_service
-        service = get_drive_service()
-        if not service:
-            return pd.DataFrame()
-            
-        try:
-            query = f"'{tf_folder_id}' in parents and name contains 'price_jp_' and not name contains '_diff_' and name contains '.parquet' and trashed=false"
-            results = service.files().list(q=query, fields="files(id, name)").execute()
-            base_files = results.get('files', [])
-        except Exception:
-            base_files = []
-
-        dfs = []
-        for b_file in base_files:
-            b_name = b_file['name']
-            
-            # 年月・年によるファイル単位スキップ判定
-            if min_date_limit is not None:
-                m_ym = re.search(r'price_jp_\w+_(\d{4})_(\d{2})\.parquet', b_name)
-                if m_ym:
-                    file_year = int(m_ym.group(1))
-                    file_month = int(m_ym.group(2))
-                    if (file_year < min_date_limit.year) or (file_year == min_date_limit.year and file_month < min_date_limit.month):
-                        continue
-                else:
-                    m_y = re.search(r'price_jp_\w+_(\d{4})\.parquet', b_name)
-                    if m_y:
-                        file_year = int(m_y.group(1))
-                        if file_year < min_date_limit.year:
-                            continue
-            
-            local_path = os.path.join(settings.WORK_DIR, b_name)
-            # 💡 ローカルにない場合はDriveから自動取得
-            if not os.path.exists(local_path):
-                download_from_drive_api(b_name, local_path, parent_id=tf_folder_id)
-                
-            if os.path.exists(local_path):
-                try:
-                    df = pd.read_parquet(local_path, columns=columns, filters=filters, engine='pyarrow')
-                except Exception:
-                    try:
-                        df = pd.read_parquet(local_path, columns=columns, engine='pyarrow')
-                        df = _apply_pandas_filters_safe(df)
-                    except Exception:
-                        df = pd.DataFrame()
-                if not df.empty:
-                    dfs.append(df)
-                    
-        if not dfs:
-            return pd.DataFrame()
-        combined = pd.concat(dfs, ignore_index=True)
-        if "date" in combined.columns:
-            combined["date"] = pd.to_datetime(combined["date"]).dt.tz_localize(None)
-            if min_date_limit is not None:
-                combined = combined[combined["date"] >= min_date_limit]
-        return combined.drop_duplicates(subset=["date", "ticker"], keep="last")
-
-    # ───── 米国株（US）のロード処理 ─────
-    if interval in ["1m", "5m", "60m"]:
-        pattern = get_db_filename_pattern(interval, is_jp, is_raw, is_temp)
-        search_path = os.path.join(settings.WORK_DIR, pattern)
-        files = glob.glob(search_path)
+def load_price_db_ledger(interval: str, is_jp: bool = True, is_raw: bool = False, is_temp: bool = False) -> dict:
+    if is_temp:
+        return {"db_max_date": None, "last_updates_map": {}}
         
-        if not files and not is_temp:
-            if interval == "60m":
-                now_y = pd.Timestamp.now().strftime("%Y")
-                temp_filename = get_db_filename(interval, is_jp, is_raw, is_temp, year=now_y)
-            else:
-                now_ym = pd.Timestamp.now().strftime("%Y_%m")
-                temp_filename = get_db_filename(interval, is_jp, is_raw, is_temp, year_month=now_ym)
-            temp_work_file = os.path.join(settings.WORK_DIR, temp_filename)
-            download_from_drive_api(temp_filename, temp_work_file)
-            files = glob.glob(search_path)
-            
-        if not files:
-            mono_filename = get_db_filename(interval, is_jp, is_raw, is_temp)
-            mono_work_file = os.path.join(settings.WORK_DIR, mono_filename)
-            if not os.path.exists(mono_work_file) and not is_temp:
-                download_from_drive_api(mono_filename, mono_work_file)
-            if os.path.exists(mono_work_file):
-                files = [mono_work_file]
-            else:
-                return pd.DataFrame()
-            
-        dfs = []
-        for filepath in files:
-            fname = os.path.basename(filepath)
-            if min_date_limit is not None:
-                m_ym = re.search(r'price_us_\w+_(\d{4})_(\d{2})', fname)
-                if m_ym:
-                    file_year = int(m_ym.group(1))
-                    file_month = int(m_ym.group(2))
-                    if (file_year < min_date_limit.year) or (file_year == min_date_limit.year and file_month < min_date_limit.month):
-                        continue
-                else:
-                    m_y = re.search(r'price_us_\w+_(\d{4})', fname)
-                    if m_y:
-                        file_year = int(m_y.group(1))
-                        if file_year < min_date_limit.year:
-                            continue
-            try:
-                df = pd.read_parquet(filepath, columns=columns, filters=filters, engine='pyarrow')
-            except Exception:
-                try:
-                    df = pd.read_parquet(filepath, columns=columns, engine='pyarrow')
-                    df = _apply_pandas_filters_safe(df)
-                except Exception:
-                    df = pd.DataFrame()
-            if not df.empty:
-                dfs.append(df)
-                
-        if not dfs:
-            return pd.DataFrame()
-        combined_df = pd.concat(dfs, ignore_index=True)
-        if "date" in combined_df.columns:
-            combined_df["date"] = pd.to_datetime(combined_df["date"]).dt.tz_localize(None)
-            if min_date_limit is not None:
-                combined_df = combined_df[combined_df["date"] >= min_date_limit]
-        return combined_df.drop_duplicates(subset=["date", "ticker"], keep="last")
-
-    # 米国株 日足（1d）のロード
-    filename = get_db_filename(interval, is_jp, is_raw, is_temp)
+    filename = get_ledger_filename(interval, is_jp, is_raw)
     work_file = os.path.join(settings.WORK_DIR, filename)
-    # 💡【重要修正】ローカルに存在しない場合、Google Driveから自動ダウンロードを実行
-    if not os.path.exists(work_file) and not is_temp:
-        download_from_drive_api(filename, work_file)
+    drive_file = os.path.join(settings.DRIVE_DIR, filename)
 
+    if not os.path.exists(work_file):
+        api_success = download_from_drive_api(filename, work_file)
+        if not api_success and os.path.exists(drive_file):
+            shutil.copy2(drive_file, work_file)
+                
     if os.path.exists(work_file):
         try:
-            df = pd.read_parquet(work_file, columns=columns, filters=filters, engine='pyarrow')
+            with open(work_file, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
-            try:
-                df = pd.read_parquet(work_file, columns=columns, engine='pyarrow')
-                df = _apply_pandas_filters_safe(df)
-            except Exception:
-                df = pd.DataFrame()
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-            if min_date_limit is not None:
-                df = df[df["date"] >= min_date_limit]
-        return df
-    return pd.DataFrame()
+            pass
+            
+    return {"db_max_date": None, "last_updates_map": {}}
 
 def save_price_db_ledger(ledger_data: dict, interval: str, is_jp: bool = True, is_raw: bool = False) -> tuple[bool, str]:
     filename = get_ledger_filename(interval, is_jp, is_raw)
@@ -270,7 +132,6 @@ def compute_ledger_from_df(df: pd.DataFrame) -> dict:
         "last_updates_map": last_updates_map
     }
 
-# --- 🚀 完全フラット設計仕様：日本株は時間足フォルダ（例：1m）直下に「差分のみ」を即時保存 ---
 def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True, is_raw: bool = False, is_temp: bool = False, custom_ledger: dict = None) -> tuple[bool, str]:
     if df.empty:
         return False, "保存対象のデータが空（Empty）です。"
@@ -279,17 +140,15 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True, is_raw: b
     suffix = "_raw" if is_raw else ""
     temp_suffix = "_temp" if is_temp else ""
 
-    # ───── 日本株（JP）の差分ファイル・時間足直下フラット保存 ─────
+    # 日本株の差分ファイル保存
     if is_jp and not is_temp and "date" in df.columns:
         timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
         df_target = df.copy()
         df_target["date"] = pd.to_datetime(df_target["date"])
         
-        # 累積調整倍率カラム(patched_multiplier)の自動同期・スキーマ防護
         if "patched_multiplier" not in df_target.columns:
             df_target["patched_multiplier"] = 1.0
         
-        # 1. ローカル作業ディレクトリに一時Parquet出力
         filename = f"price_jp_{interval}_diff_{timestamp}.parquet"
         local_work_path = os.path.join(settings.WORK_DIR, filename)
         try:
@@ -298,16 +157,13 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True, is_raw: b
         except Exception as e:
             return False, f"Parquetのローカル差分書き出しに失敗: {e}"
             
-        # 2. Google Drive上に時間足フォルダ（例: settings.FOLDER_ID / 1m）のみを検出・自動作成
         try:
             tf_folder_id = get_or_create_drive_folder(interval, settings.FOLDER_ID)
         except Exception as ex:
             return False, f"Google Drive上の時間足フォルダ自動作成に失敗: {ex}"
 
-        # 3. 月別フォルダは「作らず」、時間足フォルダの直下へ差分ファイルを直接アップロード
         success, msg = upload_to_drive_api(filename, local_work_path, parent_id=tf_folder_id)
         
-        # 4. アップロード完了後、独立JSON台帳の最終更新日時を同期
         if success:
             try:
                 ledger = load_price_db_ledger(interval, is_jp=True, is_raw=is_raw)
@@ -323,10 +179,9 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True, is_raw: b
             except Exception as le:
                 print(f"⚠️ 独立JSON台帳の更新に失敗しました: {le}")
                 
-        # 正常に終了
         return success, msg
 
-    # 米国株（US）または一時検証データ（_temp）の場合は、従来通りのモノリス保存（従来互換）
+    # 米国株または一時データ（_temp）
     filename = get_db_filename(interval, is_jp, is_raw, is_temp)
     work_file = os.path.join(settings.WORK_DIR, filename)
     drive_file = os.path.join(settings.DRIVE_DIR, filename)
@@ -351,15 +206,11 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True, is_raw: b
     except Exception as e:
         return False, str(e)
 
-
-# ─── 🚀 刷新：日本株専用 手動「上書きマージ（後勝ち・自動消去）」最適化エンジン ───
-
 def execute_jp_merge(interval: str, status_callback=None) -> dict:
     """
     時間足フォルダの直下からすべての未マージ差分（_diff_）ファイルを古い順にロードし、
     本番結合ファイルへ重複排除して安全マージ。
-    【修正点】Driveへのアップロード成功後、ローカル（WORK_DIR）の正規Parquetファイルも
-    最新マージ済みデータで上書き同期し、古いキャッシュの残留を防止します。
+    Driveへのアップロード成功後、ローカル（WORK_DIR）の正規Parquetファイルも最新データで上書き同期します。
     """
     def log(msg):
         if status_callback:
@@ -369,21 +220,18 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
 
     log(f"⚙️ 【日本株 {interval}】の最適化手動マージ（コンパクション）を開始します...")
 
-    # 1. 時間足フォルダのフォルダIDを取得
     try:
         tf_folder_id = get_or_create_drive_folder(interval, settings.FOLDER_ID)
     except Exception as e:
         log(f"❌ 親フォルダの検出に失敗しました: {e}")
         return {"success": False, "message": str(e)}
 
-    # 2. 時間足フォルダの直下にある未処理の差分ファイル（_diff_を含むもの）を検索取得
     all_diff_files = list_drive_diff_files(tf_folder_id)
 
     if not all_diff_files:
         log("✅ 未処理の差分ファイルは検出されませんでした（最新状態です）。")
         return {"success": True, "message": "マージ対象 of 差分ファイルはありません。"}
 
-    # 3. 差分ファイルを「タイムスタンプ（古い順）」にソート
     def extract_timestamp(f_meta):
         name = f_meta['name']
         m = re.search(r'_diff_(\d{8}_\d{6})', name)
@@ -399,7 +247,6 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
     error_occurred = False
     err_msg = ""
 
-    # 4. 差分ファイルを古い順に累積ループマージ
     for diff_meta in all_diff_files:
         filename = diff_meta['name']
         file_id = diff_meta['id']
@@ -509,7 +356,6 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                 os.remove(local_temp_path)
             break
 
-    # 5. 保存前のインメモリ健全性アサーションスキャン
     if not error_occurred and loaded_bases:
         log("🔍 クラウド保存前のインメモリデータ健全性スキャンを実行します...")
         for g_key, b_info in loaded_bases.items():
@@ -542,26 +388,21 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                 err_msg = f"{f_name} に 0 以下の異常価格が含まれています。"
                 break
 
-    # 6. エラーなく検証通過時：Drive確定アップロード ＆ ローカル正規Parquetの完全上書き同期
     if not error_occurred and loaded_bases:
         log("💾 すべての安全アサーション検証をクリアしました。統合ファイルを上書き保存中...")
         for g_key, b_info in loaded_bases.items():
             final_df = b_info["df"].sort_values(["ticker", "date"]).reset_index(drop=True)
             local_save_path = b_info["local_path"]
             f_name = b_info["filename"]
-            
-            # 【重要】分析画面がロードする正規のローカルパス
             official_local_path = os.path.join(settings.WORK_DIR, f_name)
             
             try:
                 table = pa.Table.from_pandas(final_df, preserve_index=False)
-                # 一時ファイルへ書き出し
                 pq.write_table(table, local_save_path, use_dictionary=False, compression="SNAPPY")
                 
-                # Google Driveへアップロード
                 up_success, up_msg = upload_to_drive_api(f_name, local_save_path, parent_id=tf_folder_id)
                 if up_success:
-                    # 💡【修正案1の実装】Drive保存成功時、ローカルの正規ファイルも最新データで上書き同期する
+                    # ローカル正規キャッシュファイルも最新版で上書き同期
                     pq.write_table(table, official_local_path, use_dictionary=False, compression="SNAPPY")
                     log(f"   ✅ [{f_name}] Googleドライブおよびローカル正規キャッシュを最新データに同期しました。({len(final_df):,}件)")
                     
@@ -578,7 +419,6 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                 err_msg = str(e)
                 break
 
-    # 7. すべてのマージが成功した場合に限り、Drive上の差分ファイルを安全消去
     if not error_occurred and processed_file_ids:
         log("🧹 データベースの確定保存を確認しました。Googleドライブ上の元差分ファイルを自動消去中...")
         del_count = 0
@@ -588,7 +428,6 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
         log(f"   👉 使用済みの差分ファイル {del_count} 件をGoogleドライブから安全消去しました。")
         
         try:
-            import streamlit as st
             st.cache_data.clear()
         except Exception:
             pass
@@ -597,13 +436,11 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
 
     return {"success": False, "message": err_msg if err_msg else "マージ処理を安全に中断・ロールバックしました。"}
 
-# --- 🚀 投影ロード & フィルタリング最適化型 DBロード ---
 def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_temp: bool = False, columns: list = None, filters: list = None) -> pd.DataFrame:
     """
-    1m, 5m, 60m, 1d 等の本番統合Parquetファイルを投影ロード（columns）および
-    フィルタリングロード（filters）でピンポイント取得します。
+    1m, 5m, 60m, 1d 等の本番Parquetファイルを投影ロード・フィルタリングロードします。
+    ローカルにない場合はGoogle Driveから自動取得します。
     """
-    # ── [安全対策] フィルタがPyArrowレベルで失敗した際、Pandas側でエミュレート適用するヘルパー ──
     def _apply_pandas_filters_safe(df_target: pd.DataFrame) -> pd.DataFrame:
         if df_target.empty or not filters:
             return df_target
@@ -619,7 +456,6 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
                         df_target = df_target[df_target[col] <= val]
         return df_target
 
-    # filtersからlimit_start_dateを解析して古いファイルの処理をスキップ
     min_date_limit = None
     if filters:
         for f in filters:
@@ -629,6 +465,7 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
                     min_date_limit = pd.to_datetime(val)
                     break
 
+    # 日本株（JP）のロード処理
     if is_jp:
         tf_folder_id = get_or_create_drive_folder(interval, settings.FOLDER_ID)
         from data_access.drive_api import get_drive_service
@@ -641,15 +478,13 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
             results = service.files().list(q=query, fields="files(id, name)").execute()
             base_files = results.get('files', [])
         except Exception:
-            return pd.DataFrame()
-            
+            base_files = []
+
         dfs = []
         for b_file in base_files:
             b_name = b_file['name']
             
-            # 年月・年によるファイル単位スキップ判定
             if min_date_limit is not None:
-                # price_jp_1m_YYYY_MM.parquet
                 m_ym = re.search(r'price_jp_\w+_(\d{4})_(\d{2})\.parquet', b_name)
                 if m_ym:
                     file_year = int(m_ym.group(1))
@@ -657,7 +492,6 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
                     if (file_year < min_date_limit.year) or (file_year == min_date_limit.year and file_month < min_date_limit.month):
                         continue
                 else:
-                    # price_jp_60m_YYYY.parquet
                     m_y = re.search(r'price_jp_\w+_(\d{4})\.parquet', b_name)
                     if m_y:
                         file_year = int(m_y.group(1))
@@ -674,7 +508,7 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
                 except Exception:
                     try:
                         df = pd.read_parquet(local_path, columns=columns, engine='pyarrow')
-                        df = _apply_pandas_filters_safe(df)  # 確実なフィルタ適用
+                        df = _apply_pandas_filters_safe(df)
                     except Exception:
                         df = pd.DataFrame()
                 if not df.empty:
@@ -689,7 +523,7 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
                 combined = combined[combined["date"] >= min_date_limit]
         return combined.drop_duplicates(subset=["date", "ticker"], keep="last")
 
-    # 米国株
+    # 米国株（US）のロード処理
     if interval in ["1m", "5m", "60m"]:
         pattern = get_db_filename_pattern(interval, is_jp, is_raw, is_temp)
         search_path = os.path.join(settings.WORK_DIR, pattern)
@@ -707,13 +541,12 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
             files = glob.glob(search_path)
             
         if not files:
-            # 分割ファイルが無い場合、一体型ファイルがあるか探索
             mono_filename = get_db_filename(interval, is_jp, is_raw, is_temp)
             mono_work_file = os.path.join(settings.WORK_DIR, mono_filename)
+            if not os.path.exists(mono_work_file) and not is_temp:
+                download_from_drive_api(mono_filename, mono_work_file)
             if os.path.exists(mono_work_file):
                 files = [mono_work_file]
-            elif is_raw:
-                return pd.DataFrame()
             else:
                 return pd.DataFrame()
             
@@ -738,7 +571,7 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
             except Exception:
                 try:
                     df = pd.read_parquet(filepath, columns=columns, engine='pyarrow')
-                    df = _apply_pandas_filters_safe(df)  # 確実なフィルタ適用
+                    df = _apply_pandas_filters_safe(df)
                 except Exception:
                     df = pd.DataFrame()
             if not df.empty:
@@ -753,15 +586,19 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
                 combined_df = combined_df[combined_df["date"] >= min_date_limit]
         return combined_df.drop_duplicates(subset=["date", "ticker"], keep="last")
 
+    # 米国株 日足（1d）
     filename = get_db_filename(interval, is_jp, is_raw, is_temp)
     work_file = os.path.join(settings.WORK_DIR, filename)
+    if not os.path.exists(work_file) and not is_temp:
+        download_from_drive_api(filename, work_file)
+
     if os.path.exists(work_file):
         try:
             df = pd.read_parquet(work_file, columns=columns, filters=filters, engine='pyarrow')
         except Exception:
             try:
                 df = pd.read_parquet(work_file, columns=columns, engine='pyarrow')
-                df = _apply_pandas_filters_safe(df)  # 確実なフィルタ適用
+                df = _apply_pandas_filters_safe(df)
             except Exception:
                 df = pd.DataFrame()
         if "date" in df.columns:
@@ -775,16 +612,12 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
 # ⚡ レイヤー1：材料（ロード）キャッシュ設計
 # =====================================================================
 
-import streamlit as st
-
 def _fetch_price_data_internal(interval: str, limit_days: int, is_jp: bool) -> pd.DataFrame:
     """Parquetから必要なカラムと足切り期間だけを投影・フィルタリングロードします。"""
     limit_dt = pd.Timestamp.now() - pd.Timedelta(days=limit_days)
     limit_start_date = limit_dt.strftime("%Y-%m-%d %H:%M:%S")
     
-    # ── [修正点] wvfの計算やローソク足描画に必要なため、open, high, low を追加 ──
     target_columns = ["date", "ticker", "open", "high", "low", "close", "volume"]
-    
     if not is_jp:
         target_columns.extend(["adj close", "stock splits"])
         
@@ -833,24 +666,3 @@ def get_price_data_cached(interval: str, limit_days: int = None, is_jp: bool = T
         return _get_price_data_1d_cached(limit_days, is_jp)
     else:
         return _get_price_data_intraday_cached(interval, limit_days, is_jp)
-
-def clear_local_parquet_cache(interval: str = None, is_jp: bool = True):
-    """
-    ローカル作業フォルダ（settings.WORK_DIR）内のParquetキャッシュファイルを削除し、
-    次回ロード時にGoogle Driveから最新ファイルを強制再取得させます。
-    """
-    import glob
-    market = "jp" if is_jp else "us"
-    if interval:
-        pattern = f"price_{market}_{interval}*.parquet"
-    else:
-        pattern = f"price_{market}_*.parquet"
-        
-    search_path = os.path.join(settings.WORK_DIR, pattern)
-    for f in glob.glob(search_path):
-        # 差分ファイル(_diff_)や一時検証ファイル(_temp)は巻き込まず、本番ベースのみ削除
-        if "_diff_" not in f and "_temp" not in f:
-            try:
-                os.remove(f)
-            except Exception:
-                pass
