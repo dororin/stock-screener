@@ -141,6 +141,35 @@ def get_download_symbol(ticker: str, is_jp: bool = True) -> str:
         return f"{pure_ticker}.T"
     return pure_ticker
 
+def _download_jpx_file(save_path: str) -> bool:
+    """JPX公式Excelをブラウザ偽装ヘッダー付きで安全にダウンロードします。"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
+    }
+    try:
+        resp = requests.get(settings.JPX_URL, headers=headers, timeout=15)
+        # 10KB以上の有効なファイルのみ保存（エラーHTMLを排除）
+        if resp.status_code == 200 and len(resp.content) > 10000:
+            with open(save_path, "wb") as f:
+                f.write(resp.content)
+            return True
+    except Exception as e:
+        print(f"⚠️ JPXダウンロード失敗: {e}")
+    return False
+
+def _read_excel_safely(file_path_or_bytes) -> pd.DataFrame:
+    """複数のエンジン（自動、xlrd、openpyxl）をフォールバック試行してExcelを確実に読み込みます。"""
+    for eng in [None, "xlrd", "openpyxl"]:
+        try:
+            df = pd.read_excel(file_path_or_bytes, engine=eng)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame()
+
 def get_topix500_tickers() -> list:
     """JPX公式ExcelからTOPIX500（Core/Large/Mid）の株式コードを取得します。"""
     cache_path = os.path.join(settings.WORK_DIR, "jpx_ticker_cache.json")
@@ -153,13 +182,13 @@ def get_topix500_tickers() -> list:
                 return cache["tickers"]
         except Exception:
             pass
-    try:
-        resp = requests.get(settings.JPX_URL, timeout=10)
-        jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
-        with open(jpx_save_path, "wb") as f:
-            f.write(resp.content)
-        df_full = pd.read_excel(jpx_save_path)
 
+    jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
+    if not os.path.exists(jpx_save_path) or os.path.getsize(jpx_save_path) < 10000:
+        _download_jpx_file(jpx_save_path)
+
+    df_full = _read_excel_safely(jpx_save_path)
+    if not df_full.empty and df_full.shape[1] >= 10:
         df_scale = df_full.iloc[:, [1, 2, 3, 9]].copy()
         df_scale.columns = ['symbol', 'name', 'market', 'scale_type']
         target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
@@ -173,52 +202,39 @@ def get_topix500_tickers() -> list:
         except Exception:
             pass
         return codes
-    except Exception as e:
-        print(f"JPX銘柄リスト取得失敗: {e}")
-        return []
+    return []
 
 def get_jpx_scale_map() -> dict:
     """JPXのキャッシュファイルから {銘柄コード: 規模区分} の辞書を構築します。"""
     jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
     
-    if not os.path.exists(jpx_save_path):
-        print("📥 JPX銘柄リストが存在しないため、新規ダウンロードします...")
-        try:
-            resp = requests.get(settings.JPX_URL, timeout=10)
-            with open(jpx_save_path, "wb") as f:
-                f.write(resp.content)
-        except Exception as e:
-            print(f"⚠️ [get_jpx_scale_map] JPXリストのダウンロードに失敗しました: {e}")
+    # ファイルが存在しない、または10KB未満（壊れたHTML）ならダウンロード
+    if not os.path.exists(jpx_save_path) or os.path.getsize(jpx_save_path) < 10000:
+        print("📥 JPX銘柄リストが存在しないか破損しているため、新規ダウンロードします...")
+        success = _download_jpx_file(jpx_save_path)
+        if not success:
+            print("⚠️ [get_jpx_scale_map] JPXリストのダウンロードに失敗しました。")
             return {}
 
-    try:
-        df_full = pd.read_excel(jpx_save_path)
-        if df_full.shape[1] >= 10:
-            df_scale = df_full.iloc[:, [1, 9]].copy()
-            df_scale.columns = ['symbol', 'scale_type']
-            df_scale['symbol'] = df_scale['symbol'].astype(str).str.strip().str.split('.').str[0]
-            df_scale['scale_type'] = df_scale['scale_type'].astype(str).str.strip()
-            return dict(zip(df_scale['symbol'], df_scale['scale_type']))
-    except Exception as e:
-        print(f"⚠️ [get_jpx_scale_map] 読み込みエラー: {e}")
+    df_full = _read_excel_safely(jpx_save_path)
+    if not df_full.empty and df_full.shape[1] >= 10:
+        df_scale = df_full.iloc[:, [1, 9]].copy()
+        df_scale.columns = ['symbol', 'scale_type']
+        df_scale['symbol'] = df_scale['symbol'].astype(str).str.strip().str.split('.').str[0]
+        df_scale['scale_type'] = df_scale['scale_type'].astype(str).str.strip()
+        return dict(zip(df_scale['symbol'], df_scale['scale_type']))
         
     return {}
 
-# 互換性維持のための空関数
 def get_extra_tickers() -> list:
-    """【廃止】後方互換性のため空リストを返します。"""
     return []
 
 def sync_extra_tickers_to_local() -> tuple:
-    """【廃止】後方互換性のため空の処理を返します。"""
     return [], None
 
 def get_all_collection_tickers() -> list:
-    """TOPIX500、およびセクター定義シート（sector_JP）の個別株・ETFをマージしたリストを取得します（重複排除）。"""
     from data_access.sheets_api import get_sector_spreadsheet
-    
     topix = get_topix500_tickers()
-    
     sector_tickers = []
     try:
         sh = get_sector_spreadsheet()
@@ -240,12 +256,10 @@ def get_all_collection_tickers() -> list:
                             code = code_raw.split(".")[0]
                             if code and len(code) > 0:
                                 sector_tickers.append(code)
-                                
     except Exception as e:
         print(f"❌ [get_all_collection_tickers] sector_JP シートからの銘柄コード抽出に失敗しました: {e}")
 
     merged = topix + sector_tickers
-    
     cleaned = []
     seen = set()
     for t in merged:
@@ -253,11 +267,9 @@ def get_all_collection_tickers() -> list:
         if t_clean and t_clean not in seen:
             seen.add(t_clean)
             cleaned.append(t_clean)
-            
     return cleaned
 
 def load_tickers_from_file(file_path: str) -> list:
-    """ユーザーがアップロードしたCSV/Excelファイルをパースして、銘柄コードを抽出します。"""
     possible_paths = [
         file_path,
         os.path.join("/content/drive/MyDrive", file_path),

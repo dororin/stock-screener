@@ -15,7 +15,6 @@ except ImportError:
     HAS_STREAMLIT = False
 
 def get_oauth2_config() -> dict:
-    """認証情報(google_oauth)をst.secretsまたはローカルのsecrets.tomlからロードします。"""
     cfg = None
     if HAS_STREAMLIT:
         try:
@@ -34,7 +33,6 @@ def get_oauth2_config() -> dict:
     return cfg
 
 def get_gspread_client():
-    """gspreadを使用したシート書き込み用クライアントを作成して返します。"""
     cfg = get_oauth2_config()
     if not cfg or "refresh_token" not in cfg:
         print("❌ [sheets_api] OAuth2の設定(google_oauth)が見つかりません。")
@@ -53,7 +51,6 @@ def get_gspread_client():
         return None
 
 def get_drive_service():
-    """Google Drive API操作用のサービスクライアントを作成して返します。"""
     cfg = get_oauth2_config()
     if not cfg or "refresh_token" not in cfg:
         return None
@@ -72,7 +69,6 @@ def get_drive_service():
         return None
 
 def upload_sync_log_to_drive(log_lines: list, is_jp: bool = True, prefix: str = "sync") -> str:
-    """同期処理中にメモリへ蓄積された詳細ログをバッチアップロードします。"""
     if not log_lines:
         return None
     service = get_drive_service()
@@ -93,7 +89,6 @@ def upload_sync_log_to_drive(log_lines: list, is_jp: bool = True, prefix: str = 
         return None
 
 def get_sector_spreadsheet():
-    """各種マスタースプレッドシートを取得してオープンします。"""
     gc = get_gspread_client()
     if gc is None:
         print("❌ [sheets_api] gspreadクライアントの認証に失敗しました。")
@@ -104,21 +99,16 @@ def get_sector_spreadsheet():
         print(f"❌ [sheets_api] マスタースプレッドシートのオープンに失敗しました: {e}")
         return None
 
-# --- 🚀 スクリーニング履歴管理 ---
 def save_history(df: pd.DataFrame) -> str:
     gc = get_gspread_client()
     if gc is None:
-        print("❌ [sheets_api] gspreadクライアントの取得に失敗したため、履歴を保存できません。")
         return None
-
     screening_id = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_df = df.copy()
     save_df['screening_id'] = screening_id
-
     try:
         sh = gc.open_by_url(settings.SPREADSHEET_VWF_URL)
         ws = sh.get_worksheet(0)
-
         try:
             raw_records = ws.get_all_records()
             if raw_records:
@@ -136,7 +126,6 @@ def save_history(df: pd.DataFrame) -> str:
 
         headers = updated_data.columns.tolist()
         rows = [headers] + updated_data.values.tolist()
-
         ws.clear()
         ws.update(values=rows, range_name="A1")
         return screening_id
@@ -154,7 +143,6 @@ def get_history_list() -> list:
         raw_records = ws.get_all_records()
         if not raw_records:
             return []
-        
         df = pd.DataFrame(raw_records)
         if df.empty or 'screening_id' not in df.columns:
             return []
@@ -173,10 +161,8 @@ def load_history(screening_id: str) -> pd.DataFrame:
         raw_records = ws.get_all_records()
         if not raw_records:
             return pd.DataFrame()
-        
         df = pd.DataFrame(raw_records)
         target_df = df[df['screening_id'] == screening_id].copy()
-        
         if not target_df.empty and 'コード' in target_df.columns:
             target_df['コード'] = target_df['コード'].astype(str).str.replace(r'\.0$', '', regex=True)
         if not target_df.empty and 'お気に入り' not in target_df.columns:
@@ -186,9 +172,7 @@ def load_history(screening_id: str) -> pd.DataFrame:
         print(f"❌ [sheets_api] 履歴({screening_id})のデータ復元に失敗しました: {e}")
         return pd.DataFrame()
 
-# --- セクター定義シート連携 ---
 def load_sector_master_from_sheets(is_jp: bool) -> dict:
-    """セクターと構成ティッカーの対応マップをSheetsからロードします。"""
     sh = get_sector_spreadsheet()
     default_sectors = settings.JP_SECTORS if is_jp else settings.US_SECTORS
     if sh is None:
@@ -204,7 +188,6 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
                 manual_headers = [str(h).strip() for h in manual_records[0]]
                 sec_col_idx = next((i for i, h in enumerate(manual_headers) if h in ["セクター名", "sector", "sector_name"]), -1)
                 hide_col_idx = next((i for i, h in enumerate(manual_headers) if h in ["非表示", "hidden", "is_hidden"]), -1)
-                
                 if sec_col_idx != -1 and hide_col_idx != -1:
                     for row in manual_records[1:]:
                         if len(row) > max(sec_col_idx, hide_col_idx):
@@ -238,17 +221,14 @@ def load_sector_master_from_sheets(is_jp: bool) -> dict:
         for _, row in df.iterrows():
             sec = str(row["sector"]).strip()
             code = str(row["code"]).strip().split(".")[0]
-            
             if sec in hidden_sectors:
                 continue
-                
             if sec and code:
                 result.setdefault(sec, []).append(code)
         return result if result else default_sectors
     except Exception:
         return default_sectors
 
-# --- ウォッチリスト連携 ---
 def load_watchlist_from_sheets() -> dict:
     sh = get_sector_spreadsheet()
     if sh is None:
@@ -281,7 +261,6 @@ def save_watchlist_to_sheets(watchlist: dict):
     except Exception:
         pass
 
-# --- 修復ログ連携 ---
 REPAIR_LOG_COLUMNS = ["executed_at", "ticker", "market", "cliff_date", "interval", "before_close", "after_close", "multiplier", "memo"]
 
 def save_repair_log_to_sheets(log_rows: list) -> bool:
@@ -337,7 +316,6 @@ def load_repair_log_from_sheets() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame(columns=REPAIR_LOG_COLUMNS)
 
-# --- 手動登録台帳（extra_tickers）の連携 ---
 EXTRA_TICKERS_COLUMNS = ["セクター名", "銘柄コード", "備考", "ETFコード", "ファンド", "非表示"]
 
 def load_extra_tickers_from_sheets() -> pd.DataFrame:
@@ -416,7 +394,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     etf_master_sheet_name = "etf_master"
     topix500_sheet_name = "topix500"
     
-    # 必要シートの自動チェックと生成
     try:
         ws_master = sh.worksheet(etf_master_sheet_name)
     except Exception:
@@ -453,22 +430,46 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     jpx_name_map = {}
     if is_jp:
         import requests
+        import io
         try:
             print("[CONSOLE_DEBUG] [SHEETS_SYNC] JPX公式サイトから全上場銘柄マスタ(data_j.xls)を自動ダウンロード中...")
-            resp = requests.get(settings.JPX_URL, timeout=15)
-            if resp.status_code == 200:
-                df_jpx = pd.read_excel(resp.content)
-                
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
+            }
+            resp = requests.get(settings.JPX_URL, headers=headers, timeout=15)
+            
+            df_jpx = None
+            if resp.status_code == 200 and len(resp.content) > 10000:
+                for eng in [None, "xlrd", "openpyxl"]:
+                    try:
+                        df_jpx = pd.read_excel(io.BytesIO(resp.content), engine=eng)
+                        if df_jpx is not None and not df_jpx.empty:
+                            break
+                    except Exception:
+                        continue
+                        
+                # ダウンロード成功した正常なファイルをキャッシュ保存
+                jpx_cache_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
+                try:
+                    with open(jpx_cache_path, "wb") as f:
+                        f.write(resp.content)
+                except Exception:
+                    pass
+
+            if df_jpx is not None and not df_jpx.empty and df_jpx.shape[1] >= 3:
                 # 💡【重要】全4,000銘柄のコード -> 日本語名称の完全対照マップを作成
-                if df_jpx.shape[1] >= 3:
-                    for _, row_jpx in df_jpx.iterrows():
-                        c_raw = str(row_jpx.iloc[1]).strip()
-                        if c_raw.endswith(".0"):
-                            c_raw = c_raw[:-2]
-                        c_clean = c_raw.upper()
-                        n_raw = str(row_jpx.iloc[2]).strip()
-                        if c_clean and n_raw and c_clean not in ["CODE", "コード", "SYMBOL", "証券コード"]:
-                            jpx_name_map[c_clean] = n_raw
+                for _, row_jpx in df_jpx.iterrows():
+                    c_raw = str(row_jpx.iloc[1]).strip()
+                    if c_raw.endswith(".0"):
+                        c_raw = c_raw[:-2]
+                    c_clean = c_raw.upper()
+                    n_raw = str(row_jpx.iloc[2]).strip()
+                    if c_clean and n_raw and c_clean not in ["CODE", "コード", "SYMBOL", "証券コード"]:
+                        jpx_name_map[c_clean] = n_raw
+
+                print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ✅ JPX日本語社名マスタ構築完了: {len(jpx_name_map)} 銘柄")
 
                 # TOPIX500シートの更新
                 df_scale = df_jpx.iloc[:, [1, 2, 9]].copy()
@@ -498,7 +499,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                 ws_topix500.update(topix500_values, "A1")
                 sync_results["TOPIX500 (JPX)"] = f"同期成功 ({len(topix500_df)}銘柄を 'topix500' シートへ保存完了)"
             else:
-                sync_results["TOPIX500 (JPX)"] = "⚠️ JPXダウンロード失敗（ステータスコード異常）"
+                sync_results["TOPIX500 (JPX)"] = "⚠️ JPXダウンロードまたはパースに失敗しました"
         except Exception as e:
             sync_results["TOPIX500 (JPX)"] = f"❌ JPX自動取得中にエラー: {e}"
 
@@ -605,7 +606,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
             memo_val = str(row.get("備考", "")).strip()
             etf_val = str(row.get("ETFコード", "")).strip()
             
-            # 手動登録でもJPX日本語名があれば優先して補完
+            # 手動登録でもJPX日本語名があれば優先補完
             if is_jp and code_val in jpx_name_map and not memo_val:
                 memo_val = jpx_name_map[code_val]
 
