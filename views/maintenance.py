@@ -104,7 +104,6 @@ def render_etf_manager():
                                 sync_extra_tickers_to_local()
                                 st.success(f"{code_str} を追加しました。")
                                 time.sleep(0.3)
-                                # フラグメントだけを再読込
                                 st.rerun(scope="fragment")
                 else:
                     st.caption(f"「{q}」の候補なし")
@@ -137,6 +136,52 @@ def render_etf_manager():
                 st.rerun(scope="fragment")
         else:
             st.caption("登録されている追加ETFはありません。")
+
+
+# ── 🔄 ETF構成銘柄の同期（結果が消えないように永続表示化） ──
+@st.fragment
+def render_sync_etf_master_ui(is_jp: bool):
+    """ETFセクター構成の同期を実行し、結果をUI上に永続保持・表示するコンポーネント"""
+    st.subheader("🔄 ETFセクター構成の同期（スプレッドシート連動）")
+    st.caption("JPX公式上場企業マスタおよび各社ETFの最新構成銘柄を自動取得し、スプレッドシートを更新します。")
+
+    if "etf_sync_result_data" not in st.session_state:
+        st.session_state["etf_sync_result_data"] = None
+    if "etf_sync_error_msg" not in st.session_state:
+        st.session_state["etf_sync_error_msg"] = None
+
+    if st.button("🚀 ETF構成銘柄を同期する", key="btn_sync_etf_master", use_container_width=True, type="primary"):
+        with st.spinner("スプレッドシートおよび構成銘柄マスタを更新中..."):
+            try:
+                from data_access.sheets_api import sync_etf_sectors_consolidated
+                results = sync_etf_sectors_consolidated(is_jp=is_jp)
+                if "error" in results:
+                    st.session_state["etf_sync_error_msg"] = results["error"]
+                    st.session_state["etf_sync_result_data"] = None
+                else:
+                    st.session_state["etf_sync_result_data"] = results
+                    st.session_state["etf_sync_error_msg"] = None
+                st.cache_data.clear()
+            except Exception as e:
+                st.session_state["etf_sync_error_msg"] = str(e)
+                st.session_state["etf_sync_result_data"] = None
+
+    # 同期エラーの永続表示
+    if st.session_state["etf_sync_error_msg"]:
+        st.error(f"❌ 同期に失敗しました: {st.session_state['etf_sync_error_msg']}")
+        if st.button("🗑️ エラー表示をクリア", key="btn_clear_etf_sync_err", use_container_width=True):
+            st.session_state["etf_sync_error_msg"] = None
+            st.rerun(scope="fragment")
+
+    # 同期結果ログの永続表示（勝手に消えないようにする）
+    if st.session_state["etf_sync_result_data"]:
+        results = st.session_state["etf_sync_result_data"]
+        sync_results_text = "\n".join([f"• {k}: {v}" for k, v in results.items()])
+        st.success(f"✅ 同期が完了しました！\n\n{sync_results_text}")
+
+        if st.button("🗑️ 同期結果表示を閉じる", key="btn_clear_etf_sync_res", use_container_width=True):
+            st.session_state["etf_sync_result_data"] = None
+            st.rerun(scope="fragment")
 
 
 # ── 🔍 US専用：統合データスキャン ──
@@ -228,7 +273,7 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
             )
         st.success(f"✅ {summary['repaired']}件修復、{summary['skipped']}件スキップしました。")
         del st.session_state["unified_scan_result"]
-        st.cache_data.clear() # キャッシュクリア
+        st.cache_data.clear()
         time.sleep(1.0)
         st.rerun(scope="fragment")
 
@@ -305,7 +350,7 @@ def render_commit_verified_data_ui(is_jp: bool):
                 del st.session_state["temp_manual_repair_payload"]
             
             if success_count > 0:
-                st.cache_data.clear() # 更新完了に付き最終更新日キャッシュをクリア
+                st.cache_data.clear()
                 status_box.update(label=f"🎉 計 {success_count} 個の時間足データの本番同期が完了しました！", state="complete")
                 time.sleep(1.0)
                 st.rerun(scope="fragment")
@@ -450,7 +495,7 @@ def render_delete_before_date_ui(is_jp: bool):
                 del_results = delete_data_before_date(pure_t, del_date_str, is_jp=False)
                 for interval, msg in del_results.items():
                     st.write(f" **{interval}**: {msg}")
-            st.cache_data.clear() # 物理削除が成功したらキャッシュクリア
+            st.cache_data.clear()
             st.rerun(scope="fragment")
 
 
@@ -531,7 +576,7 @@ def run_full_rebuild_dialog(interval: str, is_jp: bool, market_mode: str):
                 st.rerun()
 
     elif st.session_state.rebuild_status == "success":
-        st.cache_data.clear() # フルリビルド後はキャッシュクリア
+        st.cache_data.clear()
         st.success("🎉 一括フルダウンロード・再構築に成功しました！")
         if st.button("確認して閉じる", type="primary", use_container_width=True):
             st.session_state.show_rebuild_dialog = False
@@ -570,13 +615,8 @@ def render_jp_manual_merge_center(is_jp: bool):
         "古い順に累積ソートした上で、対応する月別本番結合ファイル（例：`price_jp_1m_2026_07.parquet`）へ `keep='last'` で安全上書きマージします。"
     )
 
-    # 💡【重要】ここではボタンや枠だけを描画し、Google Driveへの通信は一切行わない（実行コスト 0.001秒）。
-    # 以前はここで無条件にDrive差分検索を4回叩いていたため、下流のスキャンボタンを押した際にも
-    # 毎回このマージ検索が強制的に走り、処理とUIが吹き飛ぶ原因になっていた。
-
     merge_tf = st.selectbox("マージを強制実行する時間足を選択", ["1d", "60m", "5m", "1m"], index=0, key="jp_merge_tf_select")
 
-    # ログ状態管理用のセッションキー初期化
     if "jp_merge_logs_list" not in st.session_state:
         st.session_state["jp_merge_logs_list"] = []
     if "jp_merge_running" not in st.session_state:
@@ -592,7 +632,6 @@ def render_jp_manual_merge_center(is_jp: bool):
     with col_m1:
         st.caption(f"※実行ボタンを押すと、Google Drive上の【{merge_tf}】時間足フォルダ直下の差分を一括統合マージします。")
     with col_m2:
-        # 実行中は重複起動できないようロック
         btn_disabled = st.session_state["jp_merge_running"]
         if st.button("🚀 マージを実行する", key="btn_execute_jp_manual_merge", type="primary", use_container_width=True, disabled=btn_disabled):
             st.session_state["jp_merge_logs_list"] = []
@@ -602,7 +641,6 @@ def render_jp_manual_merge_center(is_jp: bool):
             st.session_state["jp_merge_success"] = False
             st.rerun()
 
-    # マージ実処理中のスピナー & コールバック
     if st.session_state["jp_merge_running"] and not st.session_state["jp_merge_finished"]:
         status_box = st.status(f"🔄 【{merge_tf}】の上書き累積マージ処理を実行中...", expanded=True)
         with status_box:
@@ -616,7 +654,7 @@ def render_jp_manual_merge_center(is_jp: bool):
             st.session_state["jp_merge_running"] = False
             
             if result.get("success"):
-                st.cache_data.clear() # マージ成功に付き、キャッシュデータを全面フラッシュ
+                st.cache_data.clear()
                 status_box.update(label="🎉 統合マージおよび不要差分ファイルの自動消去が正常に完了しました！", state="complete")
                 st.session_state["jp_merge_success"] = True
                 st.session_state["jp_merge_result_msg"] = result.get("message")
@@ -627,14 +665,12 @@ def render_jp_manual_merge_center(is_jp: bool):
             
             st.rerun()
 
-    # 完了後の表示（ログが自動で閉じられるのを防ぐ）
     if st.session_state["jp_merge_finished"]:
         if st.session_state["jp_merge_success"]:
             st.success(f"🎉 成功: {st.session_state['jp_merge_result_msg']}")
         else:
             st.error(f"❌ 失敗: {st.session_state['jp_merge_result_msg']}")
 
-        # 溜まったログ一覧を閉じるまで常時表示
         with st.expander("📝 実行ログ詳細", expanded=True):
             st.code("\n".join(st.session_state["jp_merge_logs_list"]), language="text")
             
@@ -646,7 +682,7 @@ def render_jp_manual_merge_center(is_jp: bool):
                 st.rerun()
 
 
-# ─── 🚀 【新設】日本株専用：統合段差スキャン・一括自動修復 ───
+# ─── 🚀 日本株専用：統合段差スキャン・一括自動修復 ───
 def render_jp_split_scan_and_repair_ui(is_jp: bool):
     if not is_jp:
         return
@@ -742,7 +778,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         key="jp_split_scan_editor",
     )
 
-    # 💡 選択不可ロックを廃止：ユーザーが「選択」にチェックを入れた行をすべて適用対象にする
     selected_rows = edited_df[edited_df["選択"] == True]
     st.caption(f"現在 {len(selected_rows)} 件が適用対象として選択されています。")
 
@@ -794,6 +829,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             time.sleep(1.0)
             st.rerun()
 
+
 @st.fragment
 def render_parquet_data_inspector(is_jp: bool):
     """
@@ -807,7 +843,6 @@ def render_parquet_data_inspector(is_jp: bool):
         "銘柄、時間足、および「表示開始日」を絞り込むことで、古いデータから順番に追跡できます。"
     )
 
-    # 1. 時間足の選択
     inspect_interval = st.selectbox(
         "時間足を選択", 
         ["1d", "60m", "5m", "1m"], 
@@ -815,21 +850,17 @@ def render_parquet_data_inspector(is_jp: bool):
         key="inspect_interval_select"
     )
 
-    # 2. 表示開始日の指定 (新設)
     inspect_start_date = st.date_input(
         "表示開始日を指定（この日付以降のデータを表示）",
         value=datetime.now().date() - timedelta(days=90),
         key="inspect_start_date_input"
     )
 
-    # 3. 対象年・月の選択（5m / 1m の場合のみ年月プルダウンを表示）
     inspect_ym = None
     if inspect_interval in ["5m", "1m"]:
-        # 現在日時から過去3年分までの年月リスト（YYYY_MM）を動的に生成
         now_dt = datetime.now()
         ym_options = []
         for year in range(now_dt.year, now_dt.year - 3, -1):
-            # 現在年なら現在月まで、過去年なら12月まで
             max_month = now_dt.month if year == now_dt.year else 12
             for month in range(max_month, 0, -1):
                 ym_options.append(f"{year:04d}_{month:02d}")
@@ -841,28 +872,21 @@ def render_parquet_data_inspector(is_jp: bool):
             key="inspect_ym_select"
         )
 
-    # 4. 銘柄コードの入力
     inspect_ticker_raw = st.text_input(
         "銘柄コードを入力（1件指定）", 
         placeholder="例: 7203 や AAPL", 
         key="inspect_ticker_input"
     ).strip()
 
-    # 5. 「データを表示」ボタン
     is_ready = bool(inspect_ticker_raw)
     btn_label = "🔍 データをロードして表示" if is_ready else "⚠️ 銘柄コードを入力してください"
     
     if st.button(btn_label, key="btn_execute_parquet_inspect", type="primary", disabled=not is_ready):
-        # 銘柄コードの整形（大文字化・日本株用の末尾削除など）
         target_ticker = sanitize_ticker(inspect_ticker_raw, is_jp=is_jp)
-        
-        # 開始日付の文字列化 (例: "2026-07-15 00:00:00")
         start_date_filter_str = inspect_start_date.strftime("%Y-%m-%d 00:00:00")
         
-        # フィルタポリシーの初期構築
         filters = [("ticker", "==", target_ticker)]
         
-        # 分足（5m, 1m）の場合は、対象年月ファイル範囲と開始日の整合性を取る
         if inspect_interval in ["5m", "1m"] and inspect_ym:
             try:
                 y_str, m_str = inspect_ym.split("_")
@@ -870,12 +894,9 @@ def render_parquet_data_inspector(is_jp: bool):
                 month_val = int(m_str)
                 _, last_day = calendar.monthrange(year_val, month_val)
                 
-                # 対象年月の初日と最終日を定義
                 month_start_str = f"{year_val:04d}-{month_val:02d}-01 00:00:00"
                 month_end_str = f"{year_val:04d}-{month_val:02d}-{last_day:02d} 23:59:59"
                 
-                # 指定開始日が選択年月の初日より前の場合は初日から、
-                # 選択年月の中にある場合は指定開始日を優先させてロード範囲を決定
                 actual_start_dt = max(pd.to_datetime(month_start_str), pd.to_datetime(start_date_filter_str))
                 actual_start_str = actual_start_dt.strftime("%Y-%m-%d %H:%M:%S")
                 
@@ -885,12 +906,10 @@ def render_parquet_data_inspector(is_jp: bool):
                 st.error(f"年月範囲の解釈に失敗しました: {e}")
                 return
         else:
-            # 1d / 60m の場合は純粋に「指定開始日以降」をフィルターとして適用
             filters.append(("date", ">=", start_date_filter_str))
 
         with st.spinner(f"📥 Parquetから [{target_ticker}] のデータを検索中..."):
             try:
-                # 必要最小限の列のみを投影ロード
                 target_cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
                 if not is_jp:
                     target_cols.extend(["adj close", "stock splits"])
@@ -898,7 +917,7 @@ def render_parquet_data_inspector(is_jp: bool):
                 df_result = load_price_db(
                     interval=inspect_interval,
                     is_jp=is_jp,
-                    is_raw=False, # Activeデータベースを参照
+                    is_raw=False,
                     columns=target_cols,
                     filters=filters
                 )
@@ -906,15 +925,12 @@ def render_parquet_data_inspector(is_jp: bool):
                 if df_result.empty:
                     st.warning("⚠️ 指定された条件に合致するデータはデータベース内に見つかりませんでした。")
                 else:
-                    # 時系列順（昇順）にソートして整理
                     if "date" in df_result.columns:
                         df_result = df_result.sort_values("date").reset_index(drop=True)
-                        # 表示フォーマットの整形
                         df_result["date"] = pd.to_datetime(df_result["date"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
                     st.success(f"✅ ロード完了（フィルタ該当件数: {len(df_result):,} 件）")
                     
-                    # 💡 送信データ量抑制およびブラウザクラッシュ回避のセーフガード
                     MAX_DISPLAY_ROWS = 2000
                     if len(df_result) > MAX_DISPLAY_ROWS:
                         st.warning(
@@ -922,12 +938,10 @@ def render_parquet_data_inspector(is_jp: bool):
                             f"指定開始日を起点とした先頭 {MAX_DISPLAY_ROWS:,} 件のみを表示しています。\n\n"
                             f"これより後ろの（より新しい）データを確認したい場合は、表示開始日を後ろにずらしてください。"
                         )
-                        # 指定開始日を起点とした「古い順から2,000件」を表示するためにheadを適用
                         df_display = df_result.head(MAX_DISPLAY_ROWS)
                     else:
                         df_display = df_result
 
-                    # グリッド描画
                     st.dataframe(
                         df_display, 
                         use_container_width=True, 
@@ -935,6 +949,7 @@ def render_parquet_data_inspector(is_jp: bool):
                     )
             except Exception as ex:
                 st.error(f"❌ データのロード中に例外が発生しました: {ex}")
+
 
 # =====================================================================
 # 🛠️ メイン画面描画
@@ -948,7 +963,6 @@ with m_col1:
     market_mode = st.radio("対象市場の選択", ["日本株 🇯🇵", "米国株 🇺🇸"], horizontal=True)
     is_jp = (market_mode == "日本株 🇯🇵")
 with m_col2:
-    # 投影ロード & キャッシュ化により、1d最終更新日をミリ秒レベルで解決。市場選択切替時も完全ノーウェイト化
     last_date = get_db_last_update_cached("1d", is_jp=is_jp)
     st.metric(label="現在のActive日足(1d)最終更新日", value=last_date)
     
@@ -965,32 +979,17 @@ if st.session_state["sync_logs_history"]:
             st.rerun()
     st.divider()
 
-# 一時ファイルのコミットUI（US株選択時のみ有効化・独立フラグメントで閉域実行）
+# 一時ファイルのコミットUI（US株選択時のみ有効化）
 render_commit_verified_data_ui(is_jp)
 
-# 🚀 日本株専用：手動上書きマージセンター（日本株選択時のみ増設表示・独立フラグメント）
+# 🚀 日本株専用：手動上書きマージセンター（日本株選択時のみ）
 render_jp_manual_merge_center(is_jp)
 
-# 🚀 日本株専用：統合段差スキャン・一括自動修復（日本株選択時のみ増設表示・独立フラグメント）
+# 🚀 日本株専用：統合段差スキャン・一括自動修復（日本株選択時のみ）
 render_jp_split_scan_and_repair_ui(is_jp)
 
-# 🔄 ETF構成銘柄の同期（共通機能）
-st.subheader("🔄 ETFセクター構成の同期（スプレッドシート連動）")
-if st.button("🚀 ETF構成銘柄を同期する", key="btn_sync_etf_master", use_container_width=True, type="primary"):
-    with st.spinner("スプレッドシートを更新中..."):
-        try:
-            from data_access.sheets_api import sync_etf_sectors_consolidated
-            results = sync_etf_sectors_consolidated(is_jp=is_jp)
-            if "error" in results:
-                st.error(f"❌ 同期に失敗しました: {results['error']}")
-            else:
-                sync_results = [f"• {k}: {v}" for k, v in results.items()]
-                st.success("✅ 同期が完了しました！\n\n" + "\n".join(sync_results))
-                st.cache_data.clear() # データ同期によりキャッシュを破棄
-                time.sleep(1.0)
-                st.rerun()
-        except Exception as e:
-            st.error(f"❌ エラーが発生しました: {e}")
+# 🔄 ETF構成銘柄の同期（結果が消えないように新設関数で呼出）
+render_sync_etf_master_ui(is_jp)
 
 st.divider()
 
@@ -1053,7 +1052,7 @@ if not is_jp:
                 st.write(msg)
             try:
                 count = apply_all_saved_patches(is_jp=False, status_callback=update_patch_status)
-                st.cache_data.clear() # アクティブ再構築に伴い更新日付などのキャッシュをクリア
+                st.cache_data.clear()
                 status_box.update(label="✅ Activeの再構築・検証・パッチ復元が全て完了しました！", state="complete")
             except Exception as e:
                 st.error(f"パッチの一括適用中にエラーが発生しました: {e}")
@@ -1070,5 +1069,5 @@ if not is_jp:
 if st.session_state.get("show_rebuild_dialog"):
     run_full_rebuild_dialog(rebuild_interval, is_jp=False, market_mode=market_mode)
 
-# 5. データベース生データ確認（新規実装コンポーネント）
+# 5. データベース生データ確認
 render_parquet_data_inspector(is_jp)

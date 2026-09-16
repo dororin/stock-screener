@@ -141,23 +141,56 @@ def get_download_symbol(ticker: str, is_jp: bool = True) -> str:
         return f"{pure_ticker}.T"
     return pure_ticker
 
+# core/collector.py
+
 def _download_jpx_file(save_path: str) -> bool:
-    """JPX公式Excelをブラウザ偽装ヘッダー付きで安全にダウンロードします。"""
+    """JPX公式Excelをブラウザ偽装ヘッダー付きでダウンロードします（詳細デバッグログ付き）。"""
+    import traceback
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
     }
+    url = settings.JPX_URL
+    print(f"[DEBUG] [JPX_DL] ダウンロード要求送信: {url}")
+    print(f"[DEBUG] [JPX_DL] 保存先パス: {save_path}")
+
     try:
-        resp = requests.get(settings.JPX_URL, headers=headers, timeout=15)
-        # 10KB以上の有効なファイルのみ保存（エラーHTMLを排除）
-        if resp.status_code == 200 and len(resp.content) > 10000:
-            with open(save_path, "wb") as f:
-                f.write(resp.content)
-            return True
+        resp = requests.get(url, headers=headers, timeout=15)
+        status = resp.status_code
+        content_len = len(resp.content) if resp.content else 0
+        content_type = resp.headers.get("Content-Type", "unknown")
+        
+        print(f"[DEBUG] [JPX_DL] HTTPステータス: {status}, Content-Type: {content_type}, サイズ: {content_len:,} bytes")
+
+        if status != 200:
+            print(f"❌ [JPX_DL] HTTPエラー返却: status={status}")
+            if content_len > 0:
+                print(f"   ↳ レスポンス抜粋: {resp.text[:300]}")
+            return False
+
+        if content_len < 10000:
+            print(f"⚠️ [JPX_DL] ファイルサイズが小さすぎます ({content_len:,} bytes < 10KB)。")
+            print(f"   ↳ 返却内容（HTMLエラーページの可能性）: {resp.text[:300]}")
+            return False
+
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, "wb") as f:
+            f.write(resp.content)
+        print(f"✅ [JPX_DL] ダウンロードおよび保存成功 ({content_len:,} bytes): {save_path}")
+        return True
+
+    except requests.exceptions.Timeout:
+        print("❌ [JPX_DL] 接続タイムアウト (15秒経過)")
+        return False
+    except requests.exceptions.RequestException as e_req:
+        print(f"❌ [JPX_DL] 通信エラー: {e_req}")
+        return False
     except Exception as e:
-        print(f"⚠️ JPXダウンロード失敗: {e}")
-    return False
+        print(f"❌ [JPX_DL] 予期しない例外が発生しました: {e}")
+        print(traceback.format_exc())
+        return False
 
 def _read_excel_safely(file_path_or_bytes) -> pd.DataFrame:
     """複数のエンジン（自動、xlrd、openpyxl）をフォールバック試行してExcelを確実に読み込みます。"""
@@ -205,11 +238,15 @@ def get_topix500_tickers() -> list:
     return []
 
 def get_jpx_scale_map() -> dict:
-    """JPXのキャッシュファイルから {銘柄コード: 規模区分} の辞書を構築します。"""
+    """JPXのキャッシュファイルから {銘柄コード: 規模区分} の辞書を構築します（詳細ログ付き）。"""
     jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
     
-    # ファイルが存在しない、または10KB未満（壊れたHTML）ならダウンロード
-    if not os.path.exists(jpx_save_path) or os.path.getsize(jpx_save_path) < 10000:
+    file_exists = os.path.exists(jpx_save_path)
+    file_size = os.path.getsize(jpx_save_path) if file_exists else 0
+    print(f"[DEBUG] [JPX_SCALE] キャッシュ確認: 存在={file_exists}, サイズ={file_size:,} bytes, パス={jpx_save_path}")
+
+    # ファイルが存在しない、または10KB未満（壊れたHTML）なら新規ダウンロード
+    if not file_exists or file_size < 10000:
         print("📥 JPX銘柄リストが存在しないか破損しているため、新規ダウンロードします...")
         success = _download_jpx_file(jpx_save_path)
         if not success:
@@ -217,13 +254,21 @@ def get_jpx_scale_map() -> dict:
             return {}
 
     df_full = _read_excel_safely(jpx_save_path)
-    if not df_full.empty and df_full.shape[1] >= 10:
+    if df_full.empty:
+        print("❌ [get_jpx_scale_map] Excelファイルの読み込み結果が空(Empty)でした。")
+        return {}
+
+    print(f"[DEBUG] [JPX_SCALE] Excel読み込み成功: 形状={df_full.shape}")
+    if df_full.shape[1] >= 10:
         df_scale = df_full.iloc[:, [1, 9]].copy()
         df_scale.columns = ['symbol', 'scale_type']
         df_scale['symbol'] = df_scale['symbol'].astype(str).str.strip().str.split('.').str[0]
         df_scale['scale_type'] = df_scale['scale_type'].astype(str).str.strip()
-        return dict(zip(df_scale['symbol'], df_scale['scale_type']))
+        result_map = dict(zip(df_scale['symbol'], df_scale['scale_type']))
+        print(f"✅ [get_jpx_scale_map] 規模区分マッピング生成完了: {len(result_map):,} 件")
+        return result_map
         
+    print(f"⚠️ [get_jpx_scale_map] 列数が不足しています (列数: {df_full.shape[1]} < 10)")
     return {}
 
 def get_extra_tickers() -> list:

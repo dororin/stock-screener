@@ -380,11 +380,7 @@ TOPIX500_OUT_COLUMNS = ["銘柄コード", "銘柄名", "規模区分"]
 def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     """
     【ステップ1：クラウドマスタ完全同期】
-    1. JPX公式サイトから data_j.xls を取得し、全上場企業の「日本語銘柄名マスタ」を構築。
-    2. etf_master から自動同期ポリシーをロードしてETF構成をWebスクレイピング取得。
-       取得した英語社名はJPX日本語マスタと突合し、正規の日本語社名に変換して格納。
-    3. 【日本株限定】TOPIX500リストを「topix500」シートへ自動更新。
-    4. extra_tickers(手動台帳)およびETF構成銘柄を重複排除マージして sector_JP / sector_US へ保存。
+    JPX公式サイトからの取得成否を詳細にログ出力し、ETF構成銘柄および手動セクターをマージして保存します。
     """
     sh = get_sector_spreadsheet()
     if sh is None:
@@ -431,35 +427,48 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     if is_jp:
         import requests
         import io
+        import traceback
         try:
-            print("[CONSOLE_DEBUG] [SHEETS_SYNC] JPX公式サイトから全上場銘柄マスタ(data_j.xls)を自動ダウンロード中...")
+            print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] JPX公式サイトから全上場銘柄マスタをダウンロード中... URL={settings.JPX_URL}")
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
             }
             resp = requests.get(settings.JPX_URL, headers=headers, timeout=15)
+            status = resp.status_code
+            content_len = len(resp.content) if resp.content else 0
+            content_type = resp.headers.get("Content-Type", "unknown")
+            print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] JPXレスポンス: status={status}, Content-Type={content_type}, サイズ={content_len:,} bytes")
             
             df_jpx = None
-            if resp.status_code == 200 and len(resp.content) > 10000:
+            if status == 200 and content_len > 10000:
                 for eng in [None, "xlrd", "openpyxl"]:
                     try:
                         df_jpx = pd.read_excel(io.BytesIO(resp.content), engine=eng)
                         if df_jpx is not None and not df_jpx.empty:
+                            print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] pd.read_excel 成功 (エンジン: {eng or 'default'}, 形状: {df_jpx.shape})")
                             break
-                    except Exception:
+                    except Exception as e_engine:
+                        print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] pd.read_excel 失敗 (エンジン: {eng or 'default'}): {e_engine}")
                         continue
                         
                 # ダウンロード成功した正常なファイルをキャッシュ保存
                 jpx_cache_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
                 try:
+                    os.makedirs(os.path.dirname(jpx_cache_path), exist_ok=True)
                     with open(jpx_cache_path, "wb") as f:
                         f.write(resp.content)
-                except Exception:
-                    pass
+                    print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] JPXファイルキャッシュ保存完了: {jpx_cache_path}")
+                except Exception as e_save:
+                    print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ⚠️ JPXキャッシュ保存失敗: {e_save}")
+            else:
+                reason = f"status={status}" if status != 200 else f"サイズ不足({content_len:,} bytes)"
+                print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ⚠️ JPXダウンロード失敗判定: {reason}")
+                if content_len > 0:
+                    print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] レスポンス冒頭: {resp.text[:250]}")
 
             if df_jpx is not None and not df_jpx.empty and df_jpx.shape[1] >= 3:
-                # 💡【重要】全4,000銘柄のコード -> 日本語名称の完全対照マップを作成
                 for _, row_jpx in df_jpx.iterrows():
                     c_raw = str(row_jpx.iloc[1]).strip()
                     if c_raw.endswith(".0"):
@@ -469,7 +478,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                     if c_clean and n_raw and c_clean not in ["CODE", "コード", "SYMBOL", "証券コード"]:
                         jpx_name_map[c_clean] = n_raw
 
-                print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ✅ JPX日本語社名マスタ構築完了: {len(jpx_name_map)} 銘柄")
+                print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ✅ JPX日本語社名マスタ構築完了: {len(jpx_name_map):,} 銘柄")
 
                 # TOPIX500シートの更新
                 df_scale = df_jpx.iloc[:, [1, 2, 9]].copy()
@@ -499,8 +508,10 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                 ws_topix500.update(topix500_values, "A1")
                 sync_results["TOPIX500 (JPX)"] = f"同期成功 ({len(topix500_df)}銘柄を 'topix500' シートへ保存完了)"
             else:
-                sync_results["TOPIX500 (JPX)"] = "⚠️ JPXダウンロードまたはパースに失敗しました"
+                fail_detail = f"status={resp.status_code}, size={len(resp.content):,} bytes" if 'resp' in locals() else "不明"
+                sync_results["TOPIX500 (JPX)"] = f"⚠️ JPXダウンロードまたはパースに失敗しました ({fail_detail})"
         except Exception as e:
+            print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ❌ JPX自動取得例外: {e}\n{traceback.format_exc()}")
             sync_results["TOPIX500 (JPX)"] = f"❌ JPX自動取得中にエラー: {e}"
 
     # ────── 2. ETF構成銘柄および手動セクターのマージ処理 ──────
@@ -584,7 +595,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                         
         for code, name in sub_consts.items():
             code_str = str(code).strip().upper()
-            # 💡【重要】英語社名(name)は破棄し、JPX公式の正規日本語社名に変換して登録
             japanese_name = jpx_name_map.get(code_str, name) if is_jp else name
             
             auto_rows.append({
@@ -606,7 +616,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
             memo_val = str(row.get("備考", "")).strip()
             etf_val = str(row.get("ETFコード", "")).strip()
             
-            # 手動登録でもJPX日本語名があれば優先補完
             if is_jp and code_val in jpx_name_map and not memo_val:
                 memo_val = jpx_name_map[code_val]
 
@@ -633,7 +642,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
             seen_pairs.add(pair_key)
             final_rows.append(r)
             
-    # sector_JP / sector_US へ一括上書き出力（正規日本語社名）
     output_values = [SECTOR_JP_COLUMNS]
     for r in final_rows:
         output_values.append([
