@@ -40,7 +40,6 @@ def get_gspread_client():
         print("❌ [sheets_api] OAuth2の設定(google_oauth)が見つかりません。")
         return None
     try:
-        # OAuth2個人アカウントの認証インスタンスを作成してgspreadに適用
         creds = OAuth2Credentials(
             token=None,
             refresh_token=cfg["refresh_token"],
@@ -100,15 +99,13 @@ def get_sector_spreadsheet():
         print("❌ [sheets_api] gspreadクライアントの認証に失敗しました。")
         return None
     try:
-        # settings.py で解決済みのマスターURLを使用
         return gc.open_by_url(settings.MARKET_DATA_URL)
     except Exception as e:
         print(f"❌ [sheets_api] マスタースプレッドシートのオープンに失敗しました: {e}")
         return None
 
-# --- 🚀 スクリーニング履歴管理 (gspread個人OAuth対応版) ---
+# --- 🚀 スクリーニング履歴管理 ---
 def save_history(df: pd.DataFrame) -> str:
-    """WVFスクリーナーの結果（履歴）を VWF用スプレッドシートの最初のシートに末尾アペンド上書き保存します。"""
     gc = get_gspread_client()
     if gc is None:
         print("❌ [sheets_api] gspreadクライアントの取得に失敗したため、履歴を保存できません。")
@@ -119,33 +116,27 @@ def save_history(df: pd.DataFrame) -> str:
     save_df['screening_id'] = screening_id
 
     try:
-        # 指定されたVWF結果保存シートをオープン
         sh = gc.open_by_url(settings.SPREADSHEET_VWF_URL)
-        ws = sh.get_worksheet(0)  # 最初のワークシートをオープン
+        ws = sh.get_worksheet(0)
 
-        # 既存データのロード試行
         try:
             raw_records = ws.get_all_records()
             if raw_records:
                 existing_df = pd.DataFrame(raw_records)
-                # 古い履歴データに今回の新しいスクリーニング履歴を追加
                 updated_data = pd.concat([existing_df, save_df], ignore_index=True)
             else:
                 updated_data = save_df
         except Exception:
             updated_data = save_df
 
-        # pandasの特殊オブジェクトやTimestampのシリアライズエラー防止のためのサニタイズ処理
         for col in updated_data.columns:
             if pd.api.types.is_datetime64_any_dtype(updated_data[col]):
                 updated_data[col] = updated_data[col].dt.strftime("%Y-%m-%d %H:%M:%S")
         updated_data = updated_data.fillna("")
 
-        # ヘッダー行と値をネストされた配列にパース
         headers = updated_data.columns.tolist()
         rows = [headers] + updated_data.values.tolist()
 
-        # スプレッドシートの一括クリアと最上部からの物理再書き込み（上書き）
         ws.clear()
         ws.update(values=rows, range_name="A1")
         return screening_id
@@ -154,7 +145,6 @@ def save_history(df: pd.DataFrame) -> str:
         return None
 
 def get_history_list() -> list:
-    """保存されたスクリーニング履歴の screening_id の降順リストを返します。"""
     gc = get_gspread_client()
     if gc is None:
         return []
@@ -174,7 +164,6 @@ def get_history_list() -> list:
         return []
 
 def load_history(screening_id: str) -> pd.DataFrame:
-    """指定された screening_id の時系列スクリーニング履歴を復元・ロードします。"""
     gc = get_gspread_client()
     if gc is None:
         return pd.DataFrame()
@@ -405,7 +394,7 @@ def save_extra_tickers_to_sheets(df: pd.DataFrame):
         pass
 
 
-# --- 🚀 フィルタポリシー＆マージ対応型 統合マスタ同期システム（TOPIX500クラウド分離対応版） ---
+# --- 🚀 フィルタポリシー＆マージ対応型 統合マスタ同期システム ---
 ETF_MASTER_COLUMNS = ["ETFコード", "セクター名", "フィルターポリシー", "ファンド"]
 SECTOR_JP_COLUMNS = ["セクター名", "銘柄コード", "備考", "ETFコード"]
 TOPIX500_OUT_COLUMNS = ["銘柄コード", "銘柄名", "規模区分"]
@@ -413,9 +402,11 @@ TOPIX500_OUT_COLUMNS = ["銘柄コード", "銘柄名", "規模区分"]
 def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     """
     【ステップ1：クラウドマスタ完全同期】
-    1. etf_master から自動同期ポリシーをロードしてETF構成をWebスクレイピング取得。
-    2. 【日本株限定】JPX公式サイトからTOPIX500リストを自動ダウンロードし、新規「topix500」シートを生成・一括保存。
-    3. extra_tickers(手動台帳)の個別設定、およびETF構成銘柄を重複排除マージして sector_JP / sector_US へ保存。
+    1. JPX公式サイトから data_j.xls を取得し、全上場企業の「日本語銘柄名マスタ」を構築。
+    2. etf_master から自動同期ポリシーをロードしてETF構成をWebスクレイピング取得。
+       取得した英語社名はJPX日本語マスタと突合し、正規の日本語社名に変換して格納。
+    3. 【日本株限定】TOPIX500リストを「topix500」シートへ自動更新。
+    4. extra_tickers(手動台帳)およびETF構成銘柄を重複排除マージして sector_JP / sector_US へ保存。
     """
     sh = get_sector_spreadsheet()
     if sh is None:
@@ -449,7 +440,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
         ws_out = sh.add_worksheet(title=sheet_name, rows=2000, cols=len(SECTOR_JP_COLUMNS))
         ws_out.update(values=[SECTOR_JP_COLUMNS], range_name="A1")
 
-    # TOPIX500用シートオブジェクトの生成・確認は、日本株(is_jp=True)の時のみ制限して実行
     if is_jp:
         try:
             ws_topix500 = sh.worksheet(topix500_sheet_name)
@@ -459,22 +449,34 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
 
     sync_results = {}
 
-    # ────── 1. 【クラウド側自動取得】JPX公式のTOPIX500 Excelをロード ──────
-    # 日本株（is_jp=True）の場合のみに完全限定化
+    # ────── 1. 【JPX公式マスタ取得】東証全銘柄の「日本語社名」マップを構築 ──────
+    jpx_name_map = {}
     if is_jp:
         import requests
         try:
-            print("[CONSOLE_DEBUG] [SHEETS_SYNC] JPX公式サイトからTOPIX500リストを自動ダウンロード中...")
+            print("[CONSOLE_DEBUG] [SHEETS_SYNC] JPX公式サイトから全上場銘柄マスタ(data_j.xls)を自動ダウンロード中...")
             resp = requests.get(settings.JPX_URL, timeout=15)
             if resp.status_code == 200:
                 df_jpx = pd.read_excel(resp.content)
+                
+                # 💡【重要】全4,000銘柄のコード -> 日本語名称の完全対照マップを作成
+                if df_jpx.shape[1] >= 3:
+                    for _, row_jpx in df_jpx.iterrows():
+                        c_raw = str(row_jpx.iloc[1]).strip()
+                        if c_raw.endswith(".0"):
+                            c_raw = c_raw[:-2]
+                        c_clean = c_raw.upper()
+                        n_raw = str(row_jpx.iloc[2]).strip()
+                        if c_clean and n_raw and c_clean not in ["CODE", "コード", "SYMBOL", "証券コード"]:
+                            jpx_name_map[c_clean] = n_raw
+
+                # TOPIX500シートの更新
                 df_scale = df_jpx.iloc[:, [1, 2, 9]].copy()
                 df_scale.columns = ['symbol', 'name', 'scale_type']
                 target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
                 
                 topix500_df = df_scale[df_scale['scale_type'].isin(target_scales)].copy()
                 
-                # symbol列を文字列型に変換
                 def clean_symbol(val):
                     if pd.isna(val):
                         return ""
@@ -484,13 +486,10 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                     return val_str
 
                 topix500_df['symbol'] = topix500_df['symbol'].apply(clean_symbol)
-                
-                # 正規表現で「4桁の半角英数字（例: 7203, 285A）」のみを完全に抽出
                 topix500_df = topix500_df[topix500_df['symbol'].str.match(r'^[0-9A-Za-z]{4}$')].copy()
                 topix500_df['symbol'] = topix500_df['symbol'].str.upper()
                 topix500_df = topix500_df.fillna("")
                 
-                # topix500 シートへ一括更新
                 topix500_values = [TOPIX500_OUT_COLUMNS]
                 for _, r in topix500_df.iterrows():
                     topix500_values.append([r['symbol'], r['name'], r['scale_type']])
@@ -583,10 +582,14 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                         sub_consts[code] = name
                         
         for code, name in sub_consts.items():
+            code_str = str(code).strip().upper()
+            # 💡【重要】英語社名(name)は破棄し、JPX公式の正規日本語社名に変換して登録
+            japanese_name = jpx_name_map.get(code_str, name) if is_jp else name
+            
             auto_rows.append({
                 "sector": sec_name,
-                "code": code,
-                "memo": name,
+                "code": code_str,
+                "memo": japanese_name,
                 "etf": etf_code
             })
             filtered_count += 1
@@ -598,10 +601,14 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     if not manual_df.empty:
         for _, row in manual_df.iterrows():
             sec_val = str(row.get("セクター名", "")).strip()
-            code_val = str(row.get("銘柄コード", "")).strip()
+            code_val = str(row.get("銘柄コード", "")).strip().upper()
             memo_val = str(row.get("備考", "")).strip()
             etf_val = str(row.get("ETFコード", "")).strip()
             
+            # 手動登録でもJPX日本語名があれば優先して補完
+            if is_jp and code_val in jpx_name_map and not memo_val:
+                memo_val = jpx_name_map[code_val]
+
             if sec_val and code_val:
                 manual_rows.append({
                     "sector": sec_val,
@@ -625,7 +632,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
             seen_pairs.add(pair_key)
             final_rows.append(r)
             
-    # sector_JP / sector_US へ一括上書き出力
+    # sector_JP / sector_US へ一括上書き出力（正規日本語社名）
     output_values = [SECTOR_JP_COLUMNS]
     for r in final_rows:
         output_values.append([
@@ -640,7 +647,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     
     return sync_results
 
-# ─── 🔌 互換性維持用のグローバル接続オブジェクト (gspread クライアント) ───
 try:
     conn = get_gspread_client()
 except Exception:

@@ -38,57 +38,21 @@ if CUSTOM_SECTOR_KEY not in st.session_state:
 
 
 # =====================================================================
-# 🏷️ 【東証全銘柄・日本語社名マスタ】JPX公式日本語名称を最優先取得
+# 🏷️ 【東証全銘柄・日本語社名マスタ】JPX公式およびシートから取得
 # =====================================================================
 @st.cache_data(ttl=86400)
 def get_all_stock_names_map(is_jp: bool = True) -> dict:
     """
-    JPX公式全銘柄リスト(data_j.xls)から全上場企業（プライム/スタンダード/グロース/ETF）の
-    正規「日本語銘柄名」を最優先で網羅取得するキャッシュ辞書。
+    全銘柄の日本語社名マップを確実に構築するキャッシュ関数。
+    1. スプレッドシート(sector_JP)の正規日本語社名
+    2. JPX公式マスタ(data_j.xls)の日本語社名
+    の双方から安全に名前を解決します。
     """
     name_map = {}
     if not is_jp:
         return name_map
 
-    # 1. 【最優先】JPX全銘柄Excelから日本語名称を網羅吸い上げ
-    try:
-        jpx_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
-        need_download = False
-        if not os.path.exists(jpx_path):
-            need_download = True
-        else:
-            # 7日以上古いファイルなら最新の上場情報を再取得
-            file_age_days = (time.time() - os.path.getmtime(jpx_path)) / 86400.0
-            if file_age_days > 7.0:
-                need_download = True
-
-        if need_download:
-            try:
-                import requests
-                headers = {"User-Agent": "Mozilla/5.0"}
-                resp = requests.get(settings.JPX_URL, headers=headers, timeout=12)
-                if resp.status_code == 200 and len(resp.content) > 10000:
-                    with open(jpx_path, "wb") as f:
-                        f.write(resp.content)
-            except Exception:
-                pass
-
-        if os.path.exists(jpx_path):
-            df_full = pd.read_excel(jpx_path)
-            # 1列目(B列): コード, 2列目(C列): 銘柄名（正規日本語）
-            if df_full.shape[1] >= 3:
-                for _, r in df_full.iterrows():
-                    code_raw = str(r.iloc[1]).strip()
-                    if code_raw.endswith(".0"):
-                        code_raw = code_raw[:-2]
-                    code_clean = code_raw.upper()
-                    name_raw = str(r.iloc[2]).strip()
-                    if code_clean and name_raw and code_clean not in ["CODE", "コード", "SYMBOL", "証券コード"]:
-                        name_map[code_clean] = name_raw
-    except Exception:
-        pass
-
-    # 2. 【フォールバック】JPXマスタに載っていない特殊ETF等の補完
+    # 1. sector_JP シートから社名を取得
     try:
         from data_access.sheets_api import get_sector_spreadsheet
         sh = get_sector_spreadsheet()
@@ -104,9 +68,42 @@ def get_all_stock_names_map(is_jp: bool = True) -> dict:
                         if len(row) > max(code_idx, memo_idx):
                             c = str(row[code_idx]).strip().split(".")[0].upper()
                             m = str(row[memo_idx]).strip()
-                            # JPXの日本語名がまだ入っていないコードのみ補完
-                            if c and m and c not in name_map:
+                            if c and m:
                                 name_map[c] = m
+    except Exception:
+        pass
+
+    # 2. JPX全銘柄マスタ(data_j.xls)から補完・上書き
+    try:
+        jpx_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
+        need_download = not os.path.exists(jpx_path)
+        if not need_download:
+            file_age_days = (time.time() - os.path.getmtime(jpx_path)) / 86400.0
+            if file_age_days > 7.0:
+                need_download = True
+
+        if need_download:
+            try:
+                import requests
+                headers = {"User-Agent": "Mozilla/5.0"}
+                resp = requests.get(settings.JPX_URL, headers=headers, timeout=10)
+                if resp.status_code == 200 and len(resp.content) > 10000:
+                    with open(jpx_path, "wb") as f:
+                        f.write(resp.content)
+            except Exception:
+                pass
+
+        if os.path.exists(jpx_path):
+            df_full = pd.read_excel(jpx_path)
+            if df_full.shape[1] >= 3:
+                for _, r in df_full.iterrows():
+                    code_raw = str(r.iloc[1]).strip()
+                    if code_raw.endswith(".0"):
+                        code_raw = code_raw[:-2]
+                    code_clean = code_raw.upper()
+                    name_raw = str(r.iloc[2]).strip()
+                    if code_clean and name_raw and code_clean not in ["CODE", "コード", "SYMBOL", "証券コード"]:
+                        name_map[code_clean] = name_raw
     except Exception:
         pass
 
@@ -188,21 +185,24 @@ def show_constituents_dialog(
                 s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
 
                 with st.container(border=True):
-                    # 💡 文字の下半分がチャートに隠れないよう、line-heightと余白(padding/margin)を確保
+                    # 💡 文字の下半分がチャートに隠れないよう、十分な縦幅・行間・下部余白を確保
                     hc1, hc2 = st.columns([3.8, 1.2])
                     hc1.markdown(
                         f"<div style='font-size:0.86rem; font-weight:600; color:{s_color}; line-height:1.5; "
-                        f"padding: 2px 0 6px 0; margin-bottom: 4px; white-space:nowrap; overflow:hidden; "
+                        f"min-height:24px; padding: 2px 0 6px 0; margin-bottom: 6px; white-space:nowrap; overflow:hidden; "
                         f"text-overflow:ellipsis;' title='{display_label}'>"
                         f"{s_badge} {display_label}</div>",
                         unsafe_allow_html=True
                     )
                     hc2.markdown(
                         f"<div style='font-size:0.83rem; text-align:right; color:{s_color}; font-weight:bold; "
-                        f"line-height:1.5; padding: 2px 0 6px 0; margin-bottom: 4px;'>"
+                        f"line-height:1.5; min-height:24px; padding: 2px 0 6px 0; margin-bottom: 6px;'>"
                         f"{s_mom:+.2f}%</div>",
                         unsafe_allow_html=True
                     )
+
+                    # 💡 チャートとの間に明示的なスペーサーを挟んで重なりを防止
+                    st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
 
                     # 💡 ローソク足ミニチャート（SMA75/SMA200、出来高付き）で描画
                     if not df_display.empty and len(df_display) >= 2:
@@ -227,7 +227,6 @@ def render_watchlist_editor_fragment():
     """ウォッチリストの登録・削除だけを行う独立フラグメント。上部チャートにリランを一切伝播させない。"""
     st.subheader("📌 ウォッチリスト登録・削除")
     
-    # 検索・追加フォーム
     search_query = st.text_input(
         "銘柄コード・名前で検索",
         placeholder="例: 7203 / トヨタ / 三菱",
@@ -438,7 +437,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
             }
             all_etf_codes = list(settings.TOPIX17_NAMES.keys())
 
-            # 表示/非表示トグル状態の初期化
             for _code in all_etf_codes:
                 if f"etf_visible_{_code}" not in st.session_state:
                     st.session_state[f"etf_visible_{_code}"] = True
@@ -451,7 +449,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
             def render_etf_card(code, name):
                 visible = st.session_state[f"etf_visible_{code}"]
                 
-                # 構成銘柄の特定
                 jp_sector_name = TOPIX17_TO_JP_SECTOR.get(code)
                 constituent_codes = settings.JP_SECTORS.get(jp_sector_name, []) if jp_sector_name else []
                 if not constituent_codes and jp_sector_name:
@@ -480,7 +477,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                         badge_e = "🟢" if etf_mom >= 0 else "🔴"
                         color_e = "#26a69a" if etf_mom >= 0 else "#ef5350"
 
-                        # 💡 テーマ名ボタン：クリックで構成銘柄のモーダルダイアログを展開
                         btn_label = f"{badge_e} {code} {name} ({etf_mom:+.2f}%) 🔍"
                         if hc1.button(btn_label, key=f"btn_dlg_etf_{code}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
                             show_constituents_dialog(
@@ -542,7 +538,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                                 badge_t = "🟢" if last_ret >= 0 else "🔴"
                                 color_t = "#26a69a" if last_ret >= 0 else "#ef5350"
 
-                                # 💡 テーマ名ボタン：クリックで構成銘柄のモーダルダイアログを展開
                                 btn_label = f"{badge_t} {t_name} ({last_ret:+.2f}%) 🔍"
                                 if hc1.button(btn_label, key=f"btn_dlg_theme_{t_name}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
                                     show_constituents_dialog(
@@ -625,7 +620,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                         hc1, hc2 = st.columns([3, 1])
                         wvf_badge = " 🔥" if wvf_active else ""
                         
-                        # 💡 米国株セクター名ボタン：クリックで構成銘柄のモーダルダイアログを展開
                         btn_label = f"{badge} {sname}{wvf_badge} 🔍"
                         if hc1.button(btn_label, key=f"btn_dlg_us_{sname}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
                             show_constituents_dialog(
