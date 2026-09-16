@@ -85,7 +85,7 @@ except KeyError as e:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # --- 各種外部URL・基本設定 ---
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-JPX_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+JPX_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx"
 TIMEFRAMES = ["1d", "60m", "5m", "1m"]
 
 # --- 株式分割スキャン：各時間足の遡り走査期間（営業日ベース） ---

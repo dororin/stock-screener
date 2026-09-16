@@ -380,7 +380,7 @@ TOPIX500_OUT_COLUMNS = ["銘柄コード", "銘柄名", "規模区分"]
 def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     """
     【ステップ1：クラウドマスタ完全同期】
-    JPX公式サイトからの取得成否を詳細にログ出力し、ETF構成銘柄および手動セクターをマージして保存します。
+    JPX公式サイト(data_j.xlsx)から上場企業マスタを取得し、ETF構成銘柄および手動セクターをマージして保存します。
     """
     sh = get_sector_spreadsheet()
     if sh is None:
@@ -443,7 +443,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
             
             df_jpx = None
             if status == 200 and content_len > 10000:
-                for eng in [None, "xlrd", "openpyxl"]:
+                for eng in ["openpyxl", None, "xlrd"]:
                     try:
                         df_jpx = pd.read_excel(io.BytesIO(resp.content), engine=eng)
                         if df_jpx is not None and not df_jpx.empty:
@@ -454,7 +454,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                         continue
                         
                 # ダウンロード成功した正常なファイルをキャッシュ保存
-                jpx_cache_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
+                jpx_cache_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xlsx")
                 try:
                     os.makedirs(os.path.dirname(jpx_cache_path), exist_ok=True)
                     with open(jpx_cache_path, "wb") as f:
@@ -549,7 +549,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     auto_rows = []
     downloaded_cache = {}
     
-    # ETF構成のダウンロード
     for target in etf_targets:
         etf_code = target["etf_code"]
         fund_val = target["fund_val"]
@@ -589,7 +588,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                         sub_consts[code] = name
                 elif policy in ["ALL", "NONE"]:
                     sub_consts[code] = name
-                else: # デフォルト TOPIX500
+                else:
                     if m_scale in ["TOPIX Core30", "TOPIX Large70", "TOPIX Mid400"]:
                         sub_consts[code] = name
                         

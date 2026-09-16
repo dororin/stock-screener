@@ -193,8 +193,8 @@ def _download_jpx_file(save_path: str) -> bool:
         return False
 
 def _read_excel_safely(file_path_or_bytes) -> pd.DataFrame:
-    """複数のエンジン（自動、xlrd、openpyxl）をフォールバック試行してExcelを確実に読み込みます。"""
-    for eng in [None, "xlrd", "openpyxl"]:
+    """複数のエンジン（openpyxl、xlrd、自動）をフォールバック試行してExcelを確実に読み込みます。"""
+    for eng in ["openpyxl", None, "xlrd"]:
         try:
             df = pd.read_excel(file_path_or_bytes, engine=eng)
             if df is not None and not df.empty:
@@ -216,7 +216,7 @@ def get_topix500_tickers() -> list:
         except Exception:
             pass
 
-    jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
+    jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xlsx")
     if not os.path.exists(jpx_save_path) or os.path.getsize(jpx_save_path) < 10000:
         _download_jpx_file(jpx_save_path)
 
@@ -238,14 +238,14 @@ def get_topix500_tickers() -> list:
     return []
 
 def get_jpx_scale_map() -> dict:
-    """JPXのキャッシュファイルから {銘柄コード: 規模区分} の辞書を構築します（詳細ログ付き）。"""
-    jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
+    """JPXのキャッシュファイルから {銘柄コード: 規模区分} の辞書を構築します。"""
+    jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xlsx")
     
     file_exists = os.path.exists(jpx_save_path)
     file_size = os.path.getsize(jpx_save_path) if file_exists else 0
     print(f"[DEBUG] [JPX_SCALE] キャッシュ確認: 存在={file_exists}, サイズ={file_size:,} bytes, パス={jpx_save_path}")
 
-    # ファイルが存在しない、または10KB未満（壊れたHTML）なら新規ダウンロード
+    # ファイルが存在しない、または10KB未満（壊れたHTML等）ならダウンロード
     if not file_exists or file_size < 10000:
         print("📥 JPX銘柄リストが存在しないか破損しているため、新規ダウンロードします...")
         success = _download_jpx_file(jpx_save_path)
