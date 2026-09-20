@@ -25,7 +25,10 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
 
     print(f"🔎 [{etf_code}] 構成銘柄データの取得を開始します (ファンド: {fund_provider or '自動判定'})")
 
-    # Global X (Solactive)
+    # =========================================================================
+    # 1. Global X (Solactive) 処理ブロック
+    #    ※コード順で出力されるため、「株数 × 株価」で評価額を求めて降順ソートします。
+    # =========================================================================
     if not provider or "global" in provider or "solactive" in provider:
         base_url = "https://legacy2.solactive.com/downloads/etfservices/tse-pcf/single/"
         solactive_url = f"{base_url}{etf_code}.csv"
@@ -53,10 +56,32 @@ def fetch_etf_constituents(etf_code: str, fund_provider: str = None) -> dict:
                     df.columns = [str(c).strip().lower() for c in df.columns]
                     code_col = next((col for col in df.columns if "code" in col or "ticker" in col), None)
                     name_col = next((col for col in df.columns if "name" in col), None)
+
+                    # 💡 グローバルX専用：株数 × 株価で評価額を計算し、組入比率降順に並び替え
+                    shares_col = next((col for col in df.columns if "shares" in col or "amount" in col), None)
+                    price_col = next((col for col in df.columns if "price" in col), None)
+
+                    if shares_col and price_col:
+                        shares_series = pd.to_numeric(
+                            df[shares_col].astype(str).str.replace(',', '').str.strip(),
+                            errors='coerce'
+                        ).fillna(0)
+                        price_series = pd.to_numeric(
+                            df[price_col].astype(str).str.replace(',', '').str.strip(),
+                            errors='coerce'
+                        ).fillna(0)
+
+                        df['_valuation'] = shares_series * price_series
+                        df = df.sort_values(by='_valuation', ascending=False).reset_index(drop=True)
+                        print(f"  -> 📊 [Global X] 組入金額（株数 × 株価）の大きい順に並び替え完了 (上位20銘柄に最適化)")
+
         except Exception as e:
             print(f"  -> ❌ Solactive取得失敗: {e}")
 
-    # NEXT FUNDS (野村アセット)
+    # =========================================================================
+    # 2. NEXT FUNDS (野村アセット) 処理ブロック
+    #    ※最初から純資産比率順（No.1〜）で並んでいるため、無駄なソート処理は挟みません。
+    # =========================================================================
     if (df is None or df.empty) and (not provider or "next" in provider or "nomura" in provider):
         try:
             nf_url = f"https://www.nomura-am.co.jp/fund/monthly_holdings/{etf_code}_brd_data.xlsx"
@@ -140,8 +165,6 @@ def get_download_symbol(ticker: str, is_jp: bool = True) -> str:
     if is_jp and not pure_ticker.endswith(".T") and pure_ticker.isdigit():
         return f"{pure_ticker}.T"
     return pure_ticker
-
-# core/collector.py
 
 def _download_jpx_file(save_path: str) -> bool:
     """JPX公式Excelをブラウザ偽装ヘッダー付きでダウンロードします（詳細デバッグログ付き）。"""
@@ -245,7 +268,6 @@ def get_jpx_scale_map() -> dict:
     file_size = os.path.getsize(jpx_save_path) if file_exists else 0
     print(f"[DEBUG] [JPX_SCALE] キャッシュ確認: 存在={file_exists}, サイズ={file_size:,} bytes, パス={jpx_save_path}")
 
-    # ファイルが存在しない、または10KB未満（壊れたHTML等）ならダウンロード
     if not file_exists or file_size < 10000:
         print("📥 JPX銘柄リストが存在しないか破損しているため、新規ダウンロードします...")
         success = _download_jpx_file(jpx_save_path)
@@ -321,50 +343,3 @@ def load_tickers_from_file(file_path: str) -> list:
         os.path.join("/content/drive/MyDrive/stock_data_hub", file_path),
         os.path.join(os.getcwd(), file_path)
     ]
-    actual_path = None
-    for p in possible_paths:
-        if os.path.exists(p):
-            actual_path = p
-            break
-    if not actual_path:
-        return []
-        
-    ext = os.path.splitext(actual_path)[1].lower()
-    try:
-        if ext == '.csv':
-            df = pd.read_csv(actual_path)
-        elif ext in ['.xls', '.xlsx']:
-            df = pd.read_excel(actual_path)
-        else:
-            return []
-            
-        if df.empty:
-            return []
-            
-        raw_tickers = []
-        ticker_col = None
-        target_keywords = ['コード', 'ticker', 'symbol', 'code', '銘柄コード']
-        for col in df.columns:
-            col_str = str(col).strip().lower()
-            if any(k in col_str for k in target_keywords):
-                ticker_col = col
-                break
-                
-        if ticker_col is not None:
-            raw_tickers = df[ticker_col].dropna().astype(str).tolist()
-        else:
-            raw_tickers = df.iloc[:, 0].dropna().astype(str).tolist()
-            first_col_name = str(df.columns[0]).strip().split('.')[0]
-            if first_col_name and not any(h in first_col_name.lower() for h in ['name', 'date', '日付', '市場', '価格', 'close']):
-                raw_tickers.insert(0, str(df.columns[0]))
-        
-        cleaned = []
-        for t in raw_tickers:
-            t_clean = t.strip().split('.')[0]
-            if t_clean and t_clean.isalnum():
-                cleaned.append(t_clean)
-        seen = set()
-        return [x for x in cleaned if not (x in seen or seen.add(x))]
-    except Exception as e:
-        print(f"❌ [load_tickers_from_file] 読み込み失敗: {e}")
-        return []
