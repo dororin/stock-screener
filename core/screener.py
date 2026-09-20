@@ -1,53 +1,81 @@
 # core/screener.py
 
+import io
+import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
+from config import settings
 
 @st.cache_data(ttl=86400)
 def get_jpx_list() -> pd.DataFrame:
-    """規模区分に基づくスクリーニング基礎銘柄マスタをJPXからDL取得します。"""
-    url = 'https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls'
-    try:
-        df = pd.read_excel(url)
-        df = df.iloc[:, [1, 2, 3, 9]]
-        target = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
-        df = df.loc[df["規模区分"].isin(target)].iloc[:, [0, 1]]
-        df.columns = ['symbol', 'name']
-        df['symbol'] = pd.to_numeric(df['symbol'], errors='coerce')
-        df = df.dropna(subset=['symbol'])
-        df['symbol'] = df['symbol'].astype(int)
-        return df
-    except Exception:
-        return pd.DataFrame()
+    """規模区分に基づくスクリーニング基礎銘柄マスタをJPXからDL取得します。失敗時は即座に例外を送出します。"""
+    url = getattr(settings, "JPX_URL", "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    
+    resp = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"JPX銘柄リストのダウンロードに失敗しました (HTTP {resp.status_code}): {url}")
+    
+    if len(resp.content) < 10000:
+        raise RuntimeError(f"JPXから取得したファイルサイズが不正です ({len(resp.content)} bytes): {url}")
+
+    df = pd.read_excel(io.BytesIO(resp.content))
+    if df.shape[1] < 10:
+        raise ValueError(f"JPX Excelデータの列数が不足しています (列数: {df.shape[1]} < 10)")
+
+    # 1: コード, 2: 銘柄名, 3: 市場・商品区分, 9: 規模区分
+    scale_col_name = df.columns[9]
+    target = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
+    
+    df_filtered = df[df[scale_col_name].isin(target)].iloc[:, [1, 2]].copy()
+    df_filtered.columns = ['symbol', 'name']
+    df_filtered['symbol'] = pd.to_numeric(df_filtered['symbol'], errors='coerce')
+    df_filtered = df_filtered.dropna(subset=['symbol'])
+    df_filtered['symbol'] = df_filtered['symbol'].astype(int).astype(str)
+    
+    return df_filtered.reset_index(drop=True)
+
 
 @st.cache_data(ttl=86400)
 def get_jpx_full_list() -> pd.DataFrame:
-    """ETFやCore/Large/Midすべてのティッカー情報が内包された完全マスタを取得します。"""
-    try:
-        url = 'https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls'
-        df_full = pd.read_excel(url)
-        df_scale = df_full.iloc[:, [1, 2, 9]].copy()
-        df_scale.columns = ['symbol', 'name', 'scale_type']
-        target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
-        topix = df_scale[df_scale['scale_type'].isin(target_scales)][['symbol', 'name']]
-        
-        df_market = df_full.iloc[:, [1, 2, 3]].copy()
-        df_market.columns = ['symbol', 'name', 'market']
-        etf = df_market[df_market['market'] == 'ETF・ETN'][['symbol', 'name']]
-        
-        combined = pd.concat([topix, etf]).drop_duplicates(subset=['symbol'])
-        combined['symbol'] = pd.to_numeric(combined['symbol'], errors='coerce')
-        combined = combined.dropna(subset=['symbol'])
-        combined['symbol'] = combined['symbol'].astype(int).astype(str)
-        return combined.reset_index(drop=True)
-    except Exception:
-        df = get_jpx_list()
-        if df.empty:
-            return pd.DataFrame(columns=['symbol', 'name'])
-        df = df.copy()
-        df['symbol'] = df['symbol'].astype(str)
-        return df
+    """ETFやCore/Large/Midすべてのティッカー情報が内包された完全マスタを取得します。失敗時は即座に例外を送出します。"""
+    url = getattr(settings, "JPX_URL", "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    
+    resp = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"JPX銘柄リストのダウンロードに失敗しました (HTTP {resp.status_code}): {url}")
+    
+    if len(resp.content) < 10000:
+        raise RuntimeError(f"JPXから取得したファイルサイズが不正です ({len(resp.content)} bytes): {url}")
+
+    df_full = pd.read_excel(io.BytesIO(resp.content))
+    if df_full.shape[1] < 10:
+        raise ValueError(f"JPX Excelデータの列数が不足しています (列数: {df_full.shape[1]} < 10)")
+
+    df_scale = df_full.iloc[:, [1, 2, 9]].copy()
+    df_scale.columns = ['symbol', 'name', 'scale_type']
+    target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
+    topix = df_scale[df_scale['scale_type'].isin(target_scales)][['symbol', 'name']]
+    
+    df_market = df_full.iloc[:, [1, 2, 3]].copy()
+    df_market.columns = ['symbol', 'name', 'market']
+    etf = df_market[df_market['market'] == 'ETF・ETN'][['symbol', 'name']]
+    
+    combined = pd.concat([topix, etf]).drop_duplicates(subset=['symbol'])
+    combined['symbol'] = pd.to_numeric(combined['symbol'], errors='coerce')
+    combined = combined.dropna(subset=['symbol'])
+    combined['symbol'] = combined['symbol'].astype(int).astype(str)
+    
+    return combined.reset_index(drop=True)
+
 
 def run_fast_screening(db_df: pd.DataFrame, log_accumulator: list = None) -> pd.DataFrame:
     """WVF（Williams Variable Accumulation）点灯＆200SMA上向き／上乗せ条件で高速スキャンを実行します。"""
@@ -60,6 +88,7 @@ def run_fast_screening(db_df: pd.DataFrame, log_accumulator: list = None) -> pd.
         log("❌ データベースが空のため、判定処理を中止します。")
         return pd.DataFrame()
     
+    # 読み込み失敗時は例外が発生し即座に停止します
     jpx_list = get_jpx_list()
     name_map = dict(zip(jpx_list['symbol'].astype(str), jpx_list['name']))
     
@@ -126,7 +155,6 @@ def run_fast_screening(db_df: pd.DataFrame, log_accumulator: list = None) -> pd.
                 })
                 log(f"✅ [{ticker}] {name_map.get(ticker, '-')} ➔ 点灯！条件クリア ({param_details})")
             else:
-                # なぜ引っかからなかったのか不一致の理由をログに出力
                 reasons = []
                 if not is_uptrend:
                     reasons.append(f"トレンド条件未達 (Close {latest['close']:.1f} <= SMA200 {latest['sma200']:.1f} かつ 200MA傾き率 {slope_rate:.6f} < -0.0001)")
