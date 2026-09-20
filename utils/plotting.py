@@ -1,3 +1,5 @@
+# utils/plotting.py
+
 import io
 import base64
 import pandas as pd
@@ -50,6 +52,42 @@ def _lwc_base_options(height: int = 160, right_offset: int = 5) -> dict:
         "handleScale": True,
     }
 
+def detect_price_format(prices, is_jp: bool = True) -> dict:
+    """
+    株価データ（OHLC等の有限数値）から適切な小数点桁数（precision）と
+    刻み幅（minMove）を動的に判定します。
+    """
+    if not is_jp:
+        return {"type": "price", "precision": 2, "minMove": 0.01}
+
+    if prices is None:
+        return {"type": "price", "precision": 0, "minMove": 1}
+
+    if isinstance(prices, pd.DataFrame):
+        target_cols = [c for c in ["open", "high", "low", "close"] if c in prices.columns]
+        vals = prices[target_cols].values.flatten() if target_cols else prices.values.flatten()
+    elif isinstance(prices, pd.Series):
+        vals = prices.values
+    elif isinstance(prices, (list, tuple, np.ndarray)):
+        vals = np.asarray(prices)
+    else:
+        return {"type": "price", "precision": 0, "minMove": 1}
+
+    vals = vals[~np.isnan(vals)]
+    if len(vals) == 0:
+        return {"type": "price", "precision": 0, "minMove": 1}
+
+    # 1. すべて整数か判定（大半の日本株：例 3400）
+    if np.all(np.isclose(vals, np.round(vals, 0), atol=1e-4)):
+        return {"type": "price", "precision": 0, "minMove": 1}
+
+    # 2. 小数点第1位で収まるか判定（NTT等の0.1円刻み銘柄：例 153.2）
+    if np.all(np.isclose(vals, np.round(vals, 1), atol=1e-4)):
+        return {"type": "price", "precision": 1, "minMove": 0.1}
+
+    # 3. それ以外（2桁小数のETF等）
+    return {"type": "price", "precision": 2, "minMove": 0.01}
+
 def build_lwc_rs_overlay_chart(sector_index_cache: dict, selected_sectors: list, height: int = 450) -> dict:
     """複数セクターの相対強度（RS）のLWC重ね合わせ比較チャート定義を生成します。"""
     if not sector_index_cache or not selected_sectors:
@@ -67,7 +105,6 @@ def build_lwc_rs_overlay_chart(sector_index_cache: dict, selected_sectors: list,
             continue
         
         times = _to_lwc_time(series.index)
-        # 100基準を0基準（騰落率%）にリベース
         line_data = [
             {"time": t, "value": round(float(v) - 100.0, 2)}
             for t, v in zip(times, series.values) if not pd.isna(v)
@@ -136,8 +173,8 @@ def render_lwc_rs_overlay(sector_index_cache: dict, selected_sectors: list, heig
     except Exception as e:
         st.caption(f"LWC重ね合わせ描画エラー: {e}")
 
-def build_lwc_candle_chart(df: pd.DataFrame, sma_fast: pd.Series = None, sma_slow: pd.Series = None, height: int = 200) -> dict:
-    """ローソク足＋移動平均2本＋出来高（色連動）の LWC 構成定義を生成します。"""
+def build_lwc_candle_chart(df: pd.DataFrame, sma_fast: pd.Series = None, sma_slow: pd.Series = None, height: int = 200, is_jp: bool = True, wvf_df: pd.DataFrame = None) -> dict:
+    """ローソク足＋移動平均2本＋出来高（WVFシグナルハイライト対応）の LWC 構成定義を生成します。"""
     if df is None or df.empty:
         return {}
 
@@ -148,6 +185,9 @@ def build_lwc_candle_chart(df: pd.DataFrame, sma_fast: pd.Series = None, sma_slo
         times = _to_lwc_time(df["date"])
     else:
         times = _to_lwc_time(df.index)
+
+    # 💡 右軸の小数点桁数を動的最適化
+    price_format = detect_price_format(df, is_jp=is_jp)
 
     candle_data = [
         {"time": t, "open": round(float(o), 2), "high": round(float(h), 2),
@@ -164,6 +204,7 @@ def build_lwc_candle_chart(df: pd.DataFrame, sma_fast: pd.Series = None, sma_slo
                 "upColor": "#26a69a", "downColor": "#ef5350",
                 "borderUpColor": "#26a69a", "borderDownColor": "#ef5350",
                 "wickUpColor": "#26a69a", "wickDownColor": "#ef5350",
+                "priceFormat": price_format,
             },
         }
     ]
@@ -185,14 +226,34 @@ def build_lwc_candle_chart(df: pd.DataFrame, sma_fast: pd.Series = None, sma_slo
         })
 
     if "volume" in df.columns:
+        # WVFシグナルマップの事前生成
+        wvf_map = {}
+        if wvf_df is not None and not wvf_df.empty:
+            w_df = wvf_df.copy()
+            w_times = _to_lwc_time(pd.to_datetime(w_df["date"])) if "date" in w_df.columns else _to_lwc_time(w_df.index)
+            for wt, (_, wr) in zip(w_times, w_df.iterrows()):
+                wvf_map[wt] = {
+                    "lime": bool(wr.get("is_lime", False)),
+                    "fuchsia": bool(wr.get("is_fuchsia", False)),
+                }
+
         vol_data = []
         for t, row in zip(times, df.itertuples()):
             o, c, v = row.open, row.close, row.volume
             if pd.isna(v):
                 continue
-            color = "rgba(38, 166, 154, 0.2)" if (pd.isna(o) or pd.isna(c) or c >= o) else "rgba(239, 83, 80, 0.2)"
+
+            # 💡 出来高バーのカラー決定（第1優先: Fuchsia, 第2優先: Lime, 平常時: 薄青/薄赤）
+            sig = wvf_map.get(t, {})
+            if sig.get("fuchsia"):
+                color = "rgba(233, 30, 99, 0.95)"   # 🌸 反発買いシグナル (Fuchsia / マゼンタピンク)
+            elif sig.get("lime"):
+                color = "rgba(0, 230, 118, 0.95)"   # 🟢 パニック売り点灯 (Lime / 発光グリーン)
+            else:
+                color = "rgba(38, 166, 154, 0.2)" if (pd.isna(o) or pd.isna(c) or c >= o) else "rgba(239, 83, 80, 0.2)"
+
             vol_data.append({"time": t, "value": float(v), "color": color})
-            
+
         series.append({
             "type": "Histogram",
             "data": vol_data,
@@ -206,10 +267,13 @@ def build_lwc_candle_chart(df: pd.DataFrame, sma_fast: pd.Series = None, sma_slo
 
     return {"chart": _lwc_base_options(height=height), "series": series}
 
-def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sma_slow: pd.Series = None, wvf_lit: pd.Series = None, volume_series = None, height: int = 160) -> dict:
-    """折れ線（セクター値）＋移動平均2本＋出来高（または4ステージ出来高）の LWC 構成定義を生成します。"""
+def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sma_slow: pd.Series = None, wvf_lit: pd.Series = None, volume_series = None, height: int = 160, is_jp: bool = True) -> dict:
+    """折れ線（セクター値）＋移動平均2本＋出来高の LWC 構成定義を生成します（右軸桁数自動最適化対応）。"""
     if price_series is None or price_series.empty:
         return {}
+
+    # 💡 右軸の小数点桁数を動的最適化
+    price_format = detect_price_format(price_series, is_jp=is_jp)
 
     times = _to_lwc_time(price_series.index)
     price_data = [
@@ -225,6 +289,7 @@ def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sm
                 "color": "#42a5f5", "lineWidth": 2,
                 "priceLineVisible": False, "lastValueVisible": True,
                 "crosshairMarkerVisible": True,
+                "priceFormat": price_format,
             },
         }
     ]
@@ -282,9 +347,9 @@ def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sm
 
     return {"chart": _lwc_base_options(height=height), "series": series}
 
-def render_lwc_sector_mini(price_series: pd.Series, sma_fast: pd.Series = None, sma_slow: pd.Series = None, wvf_lit: pd.Series = None, volume_series: pd.Series = None, key: str = "lwc", height: int = 160):
+def render_lwc_sector_mini(price_series: pd.Series, sma_fast: pd.Series = None, sma_slow: pd.Series = None, wvf_lit: pd.Series = None, volume_series: pd.Series = None, key: str = "lwc", height: int = 160, is_jp: bool = True):
     """セクター絶対値用のLWCミニチャートをレンダリングします。"""
-    chart_def = build_lwc_line_chart(price_series, sma_fast=sma_fast, sma_slow=sma_slow, wvf_lit=wvf_lit, volume_series=volume_series, height=height)
+    chart_def = build_lwc_line_chart(price_series, sma_fast=sma_fast, sma_slow=sma_slow, wvf_lit=wvf_lit, volume_series=volume_series, height=height, is_jp=is_jp)
     if not chart_def:
         st.caption("データなし")
         return
@@ -293,9 +358,9 @@ def render_lwc_sector_mini(price_series: pd.Series, sma_fast: pd.Series = None, 
     except Exception as e:
         st.caption(f"描画エラー: {e}")
 
-def render_lwc_candle_mini(df: pd.DataFrame, sma_fast: pd.Series = None, sma_slow: pd.Series = None, key: str = "lwc_candle", height: int = 200):
+def render_lwc_candle_mini(df: pd.DataFrame, sma_fast: pd.Series = None, sma_slow: pd.Series = None, key: str = "lwc_candle", height: int = 200, is_jp: bool = True, wvf_df: pd.DataFrame = None):
     """個別ローソク足用のLWCミニチャートをレンダリングします。"""
-    chart_def = build_lwc_candle_chart(df, sma_fast=sma_fast, sma_slow=sma_slow, height=height)
+    chart_def = build_lwc_candle_chart(df, sma_fast=sma_fast, sma_slow=sma_slow, height=height, is_jp=is_jp, wvf_df=wvf_df)
     if not chart_def:
         st.caption("データなし")
         return
@@ -303,7 +368,6 @@ def render_lwc_candle_mini(df: pd.DataFrame, sma_fast: pd.Series = None, sma_slo
         renderLightweightCharts([chart_def], key=key)
     except Exception as e:
         st.caption(f"描画エラー: {e}")
-
 
 # =====================================================================
 # 🕯️ mplfinance / matplotlib (完全遅延インポート設計)
@@ -312,7 +376,6 @@ def render_lwc_candle_mini(df: pd.DataFrame, sma_fast: pd.Series = None, sma_slo
 def generate_mini_chart_base64(df: pd.DataFrame) -> str:
     """PDF等に差し込む用のローソク足画像をBase64形式で出力。必要な時だけライブラリをロードします。"""
     try:
-        # 重い描画エンジンのインポートをこの内部に限定することで、通常のページロードをノーウェイト化
         import matplotlib.pyplot as plt
         import mplfinance as mpf
 

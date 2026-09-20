@@ -426,4 +426,55 @@ def get_benchmark_data_cached(ticker: str, period_days: int, interval: str, is_j
     if interval == "1d":
         return _get_benchmark_data_1d_cached(ticker, period_days, is_jp)
     else:
-        return _get_benchmark_data_intraday_cached(ticker, period_days, interval, is_jp)
+        return _get_benchmark_data_intraday_cached(ticker, period_days, interval, is_jp)
+
+# core/calculator.py の末尾などに追加
+
+def compute_wvf_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    WVF（Williams Vix Fix）およびPine Script（Chris Moody版）準拠の
+    ボトム判定シグナル（Lime / Fuchsia）と次回消灯目安値をインメモリ一括計算します。
+    """
+    if df is None or df.empty or len(df) < 15:
+        return df
+
+    df = df.copy()
+    if 'date' in df.columns:
+        df = df.sort_values('date').reset_index(drop=True)
+
+    # 1. 基本WVFおよびバンドの算出
+    highest_close = df['close'].rolling(window=11).max()
+    wvf = (highest_close - df['low']) / highest_close * 100.0
+    wvf_std = wvf.rolling(window=20).std(ddof=0)
+    wvf_mid = wvf.rolling(window=20).mean()
+    wvf_upper = wvf_mid + (2.0 * wvf_std)
+    range_high = wvf.rolling(window=100, min_periods=20).max() * 0.85
+
+    # 2. パニック点灯シグナル (Lime / alert1)
+    is_lime = ((wvf >= wvf_upper) | (wvf >= range_high)) & (wvf >= 5.0)
+
+    # 3. 厳選反発買いシグナル (Fuchsia / alert3)
+    # 前日点灯(Lime) -> 当日消灯
+    was_lime = is_lime.shift(1).fillna(False).astype(bool)
+    now_off = ~is_lime
+    # 反発プライスアクション: 安値切り上げ かつ 前日高値を上回る引け
+    prev_low = df['low'].shift(1)
+    prev_high = df['high'].shift(1)
+    up_reversal = (df['low'] > prev_low) & (df['close'] > prev_high)
+    is_fuchsia = was_lime & now_off & up_reversal
+
+    # 4. 次回消灯目安値（安値）（ext_price）
+    # 当日の安値がこの数値を上回っていれば（これ以上下がらなければ）翌日消灯すると逆算される価格
+    p_upper = highest_close * (1.0 - wvf_upper / 100.0)
+    p_range = highest_close * (1.0 - range_high / 100.0)
+    p_floor = highest_close * (1.0 - 5.0 / 100.0)
+    ext_price = np.minimum(np.maximum(p_upper, p_range), p_floor)
+
+    df['wvf'] = wvf
+    df['wvf_upper'] = wvf_upper
+    df['range_high'] = range_high
+    df['is_lime'] = is_lime
+    df['is_fuchsia'] = is_fuchsia
+    df['ext_price'] = ext_price
+
+    return df
