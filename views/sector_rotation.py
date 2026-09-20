@@ -1,10 +1,11 @@
-# sector_rotation.py
+# views/sector_rotation.py
 
 import os
 import time
 import re
 import streamlit as st
 import pandas as pd
+import numpy as np  # 💡 NameError解消のためインポート追加
 from datetime import datetime, timedelta
 
 from config import settings
@@ -22,7 +23,8 @@ from core.calculator import (
     get_theme_return_rate_cached,
     get_sector_absolute_data_cached,
     get_macro_cores_cached,
-    get_benchmark_data_cached
+    get_benchmark_data_cached,
+    compute_wvf_signals  # 💡 WVF計算関数
 )
 from utils.plotting import (
     render_lwc_rs_overlay,
@@ -126,8 +128,6 @@ def show_constituents_dialog(
     テーマ名クリック時に最前面にオーバーレイ展開する共通モーダルダイアログ。
     WVFシグナル（Lime/Fuchsia）出来高オーバーレイおよび消灯目安値を統合表示します。
     """
-    from core.calculator import compute_wvf_signals
-
     st.subheader(f"📊 {title}（構成: {len(constituent_codes)} 銘柄）")
     tf_display_name = "週足" if resample_weekly else ("日足" if interval == "1d" else interval)
     st.caption(f"足種: {tf_display_name} ｜ 表示期間: {period_days}日")
@@ -218,14 +218,14 @@ def show_constituents_dialog(
                         unsafe_allow_html=True
                     )
 
-                    # 💡 WVFステータスおよび消灯目安値バッジ（余白スペース）
+                    # 💡 WVFステータスおよび消灯目安値バッジ
                     st.markdown(
                         f"<div style='margin-top:2px; margin-bottom:4px; height:18px; line-height:18px; overflow:hidden;'>"
                         f"{wvf_badge_html}</div>",
                         unsafe_allow_html=True
                     )
 
-                    # ローソク足ミニチャート（WVFハイライト出来高 ＆ 小数点自動最適化右軸）
+                    # 💡 ローソク足ミニチャート（WVFハイライト出来高 ＆ 小数点自動最適化右軸）
                     if not df_display.empty and len(df_display) >= 2:
                         sma_fast = df_display.set_index("date")["sma75"]
                         sma_slow = df_display.set_index("date")["sma200"]
@@ -515,7 +515,7 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             render_lwc_sector_mini(
                                 etf_abs, sma_fast=etf_sma75, sma_slow=etf_sma200,
                                 wvf_lit=etf_wvf, volume_series=etf_vol,
-                                key=f"etf_abs_mini_{code}", height=150
+                                key=f"etf_abs_mini_{code}", height=150, is_jp=is_jp
                             )
                         else:
                             st.caption("データなし")
@@ -575,7 +575,7 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                                 render_lwc_sector_mini(
                                     ret_rate, sma_fast=sma75, sma_slow=sma200,
                                     wvf_lit=None, volume_series=total_val,
-                                    key=f"theme_ret_mini_{t_name}", height=150
+                                    key=f"theme_ret_mini_{t_name}", height=150, is_jp=is_jp
                                 )
                             else:
                                 st.caption("データなし")
@@ -659,7 +659,7 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             render_lwc_sector_mini(
                                 sec_abs, sma_fast=sma75, sma_slow=sma200,
                                 wvf_lit=is_wvf_lit, volume_series=trading_val,
-                                key=f"mini_chart_{sname}", height=150
+                                key=f"mini_chart_{sname}", height=150, is_jp=is_jp
                             )
                         else:
                             st.caption("データなし")
@@ -733,7 +733,7 @@ def render_watchlist_mini_charts_fragment(is_jp: bool):
                         render_lwc_sector_mini(
                             w_abs, sma_fast=w_sma75, sma_slow=w_sma200,
                             wvf_lit=w_wvf_lit, volume_series=w_trading_val,
-                            key=f"wl_chart_mini_{code}", height=150
+                            key=f"wl_chart_mini_{code}", height=150, is_jp=is_jp
                         )
                     else:
                         st.caption("データなし")
