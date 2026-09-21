@@ -5,7 +5,7 @@ import time
 import re
 import streamlit as st
 import pandas as pd
-import numpy as np  # 💡 NameError解消のためインポート追加
+import numpy as np
 from datetime import datetime, timedelta
 
 from config import settings
@@ -24,7 +24,7 @@ from core.calculator import (
     get_sector_absolute_data_cached,
     get_macro_cores_cached,
     get_benchmark_data_cached,
-    compute_wvf_signals  # 💡 WVF計算関数
+    compute_wvf_signals
 )
 from utils.plotting import (
     render_lwc_rs_overlay,
@@ -126,7 +126,7 @@ def show_constituents_dialog(
 ):
     """
     テーマ名クリック時に最前面にオーバーレイ展開する共通モーダルダイアログ。
-    WVFシグナル（Lime/Fuchsia）出来高オーバーレイおよび消灯目安値を統合表示します。
+    WVFシグナル、ボリンジャーバンド（±2σ, ±3σ）、200SMA、出来高およびTradingViewリンクを統合表示します。
     """
     st.subheader(f"📊 {title}（構成: {len(constituent_codes)} 銘柄）")
     tf_display_name = "週足" if resample_weekly else ("日足" if interval == "1d" else interval)
@@ -150,6 +150,12 @@ def show_constituents_dialog(
             stock_name = name_map.get(clean_code, "")
             display_label = f"{clean_code}　{stock_name}" if stock_name else clean_code
 
+            # 💡 TradingView リンクURLの構築
+            if is_jp:
+                tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{clean_code}"
+            else:
+                tv_url = f"https://jp.tradingview.com/chart/?symbol={clean_code}"
+
             with grid_cols[ci]:
                 df_stock = pd.DataFrame()
                 if not db_df.empty and "ticker" in db_df.columns:
@@ -160,9 +166,9 @@ def show_constituents_dialog(
                 s_mom = 0.0
                 df_display = pd.DataFrame()
                 wvf_badge_html = ""
+                bb_dict = None
 
                 if not df_stock.empty and len(df_stock) >= 2:
-                    # 💡 WVFシグナルおよび消灯目安値のインメモリ計算
                     df_stock = compute_wvf_signals(df_stock)
 
                     if resample_weekly:
@@ -172,8 +178,17 @@ def show_constituents_dialog(
                             "is_lime": "any", "is_fuchsia": "any", "ext_price": "last"
                         }).dropna().reset_index()
 
+                    # 💡 移動平均線（75SMA, 200SMA）
                     df_stock["sma75"] = df_stock["close"].rolling(window=75, min_periods=1).mean()
                     df_stock["sma200"] = df_stock["close"].rolling(window=200, min_periods=1).mean()
+
+                    # 💡 ボリンジャーバンド計算 (Pine Script準拠: 20期間, ±2σ, ±3σ)
+                    bb_mid = df_stock["close"].rolling(window=20, min_periods=1).mean()
+                    bb_std = df_stock["close"].rolling(window=20, min_periods=1).std(ddof=0)
+                    df_stock["bb_p2"] = bb_mid + (2.0 * bb_std)
+                    df_stock["bb_m2"] = bb_mid - (2.0 * bb_std)
+                    df_stock["bb_p3"] = bb_mid + (3.0 * bb_std)
+                    df_stock["bb_m3"] = bb_mid - (3.0 * bb_std)
 
                     recent_closes = df_stock["close"].tail(min(5, len(df_stock))).values
                     if len(recent_closes) >= 2 and recent_closes[0] > 0:
@@ -184,12 +199,10 @@ def show_constituents_dialog(
                     ext_price_val = latest_row.get("ext_price", np.nan)
                     ext_str = f"¥{ext_price_val:,.1f}" if pd.notna(ext_price_val) else "-"
 
-                    # 直近3本以内にFuchsia（反発買い）が出たか？
                     tail_3 = df_stock.tail(3)
                     has_recent_fuchsia = tail_3["is_fuchsia"].any() if "is_fuchsia" in tail_3.columns else False
 
                     if latest_row.get("is_lime", False):
-                        # 連続点灯日数のカウント
                         lime_streak = int((df_stock["is_lime"].iloc[::-1].cumprod()).sum())
                         wvf_badge_html = f"<span style='font-size:0.75rem; background:#00e676; color:#000; padding:1px 5px; border-radius:3px; font-weight:bold;'>🟢 点灯中({lime_streak}日目)</span> <span style='font-size:0.75rem; color:#b0bec5;'>目安: {ext_str}</span>"
                     elif has_recent_fuchsia:
@@ -199,16 +212,27 @@ def show_constituents_dialog(
 
                     df_display = df_stock[df_stock["date"] >= display_start].copy().reset_index(drop=True)
 
+                    if not df_display.empty:
+                        disp_indexed = df_display.set_index("date")
+                        bb_dict = {
+                            "p2": disp_indexed["bb_p2"],
+                            "m2": disp_indexed["bb_m2"],
+                            "p3": disp_indexed["bb_p3"],
+                            "m3": disp_indexed["bb_m3"]
+                        }
+
                 s_badge = "🟢" if s_mom >= 3.0 else "🔴" if s_mom <= -3.0 else "⚪"
                 s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
 
                 with st.container(border=True):
-                    # 銘柄名とモメンタム
+                    # 💡 銘柄名とモメンタム（TradingViewへの外部リンク付き）
                     hc1, hc2 = st.columns([3.8, 1.2])
                     hc1.markdown(
                         f"<div style='font-size:0.86rem; font-weight:600; color:{s_color}; line-height:1.4; "
-                        f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis;' title='{display_label}'>"
-                        f"{s_badge} {display_label}</div>",
+                        f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis;' title='TradingViewで開く: {display_label}'>"
+                        f"{s_badge} <a href='{tv_url}' target='_blank' rel='noopener noreferrer' "
+                        f"style='color:{s_color}; text-decoration:none; border-bottom:1px dotted {s_color};'>"
+                        f"{display_label}</a></div>",
                         unsafe_allow_html=True
                     )
                     hc2.markdown(
@@ -218,14 +242,14 @@ def show_constituents_dialog(
                         unsafe_allow_html=True
                     )
 
-                    # 💡 WVFステータスおよび消灯目安値バッジ
+                    # WVFステータスおよび消灯目安値バッジ
                     st.markdown(
                         f"<div style='margin-top:2px; margin-bottom:4px; height:18px; line-height:18px; overflow:hidden;'>"
                         f"{wvf_badge_html}</div>",
                         unsafe_allow_html=True
                     )
 
-                    # 💡 ローソク足ミニチャート（WVFハイライト出来高 ＆ 小数点自動最適化右軸）
+                    # 💡 ローソク足ミニチャート（BB半透明グレー, 200SMA紫, WVF出来高）
                     if not df_display.empty and len(df_display) >= 2:
                         sma_fast = df_display.set_index("date")["sma75"]
                         sma_slow = df_display.set_index("date")["sma200"]
@@ -234,9 +258,10 @@ def show_constituents_dialog(
                             sma_fast=sma_fast,
                             sma_slow=sma_slow,
                             key=f"dlg_candle_{title}_{clean_code}",
-                            height=150,
+                            height=170,
                             is_jp=is_jp,
-                            wvf_df=df_display
+                            wvf_df=df_display,
+                            bb_dict=bb_dict
                         )
                     else:
                         st.caption("データなし")

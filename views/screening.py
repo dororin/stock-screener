@@ -1,4 +1,4 @@
-# ──── screening.py のコード全体を以下に差し替え ────
+# views/screening.py
 
 import io
 import pandas as pd
@@ -67,7 +67,6 @@ def render_screener_controls_panel():
             with header_col:
                 st.markdown("**🚀 スクリーニング操作**")
             with refresh_col:
-                # 💡【修正案4】メモリキャッシュをクリアして再読込するボタン
                 if st.button("🔄 キャッシュ更新", help="メモリ上のキャッシュを消去して最新データを強制再取得します", use_container_width=True):
                     from data_access.local_db import clear_local_parquet_cache
                     clear_local_parquet_cache(interval="1d", is_jp=True)
@@ -137,8 +136,21 @@ def render_screened_stock_card(index_num: int, unique_key: str):
                     chart_df = pd.read_json(io.StringIO(_raw))
                     chart_df['date'] = pd.to_datetime(chart_df['date'])
                     chart_df = chart_df.sort_values('date').reset_index(drop=True)
-                    _sma_fast = chart_df.set_index('date')['sma50'] if 'sma50' in chart_df.columns else None
-                    _sma_slow = chart_df.set_index('date')['sma200'] if 'sma200' in chart_df.columns else None
+
+                    # 💡 ボリンジャーバンド計算 (Pine Script準拠: 20 SMA, ±2σ, ±3σ)
+                    bb_mid = chart_df['close'].rolling(window=20, min_periods=1).mean()
+                    bb_std = chart_df['close'].rolling(window=20, min_periods=1).std(ddof=0)
+                    disp_indexed = chart_df.set_index('date')
+                    bb_dict = {
+                        "p2": bb_mid + (2.0 * bb_std),
+                        "m2": bb_mid - (2.0 * bb_std),
+                        "p3": bb_mid + (3.0 * bb_std),
+                        "m3": bb_mid - (3.0 * bb_std)
+                    }
+
+                    _sma_fast = disp_indexed['sma50'] if 'sma50' in chart_df.columns else None
+                    # 💡 紫色の200MAとして描画
+                    _sma_slow = disp_indexed['sma200'] if 'sma200' in chart_df.columns else None
                     _lwc_key = f"sc_mini_cand_{r['コード']}_{unique_key}"
                     with i1:
                         render_lwc_candle_mini(
@@ -147,6 +159,7 @@ def render_screened_stock_card(index_num: int, unique_key: str):
                             sma_slow=_sma_slow,
                             key=_lwc_key,
                             height=180,
+                            bb_dict=bb_dict
                         )
             except Exception as _e:
                 i1.caption(f"⚠️ チャート描画エラー: {_e}")
@@ -171,7 +184,7 @@ def render_screened_stock_card(index_num: int, unique_key: str):
 # 1. 操作コントロールパネルフラグメントを実行
 render_screener_controls_panel()
 
-# ─── 🚀 【新規追加】実行後に勝手に消えない永続的な詳細ログコンソール ───
+# ─── 🚀 実行後に勝手に消えない永続的な詳細ログコンソール ───
 if st.session_state.screening_logs:
     st.write(" ")
     with st.expander("📋 WVF+Trend スクリーニング詳細実行ログ・コンソール", expanded=True):
@@ -179,7 +192,6 @@ if st.session_state.screening_logs:
             "システム内部で計算された全500銘柄のWVF値、アッパーバンド、トレンド判定の途中結果と、"
             "合致・スキップされた詳細な理由がすべて記録されています。特定のコード（例: `4631`）でブラウザ検索（Ctrl + F）してデバッグできます。"
         )
-        # テキストエリアではなくst.codeにより、スクロール可能な形で表示
         st.code("\n".join(st.session_state.screening_logs), language="text")
         
         if st.button("🗑️ ログ表示履歴をクリア", key="btn_clear_screening_logs_history", use_container_width=True):
