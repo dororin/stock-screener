@@ -137,7 +137,13 @@ def render_screened_stock_card(index_num: int, unique_key: str):
                     chart_df['date'] = pd.to_datetime(chart_df['date'])
                     chart_df = chart_df.sort_values('date').reset_index(drop=True)
 
-                    # 💡 ボリンジャーバンド計算 (Pine Script準拠: 20 SMA, ±2σ, ±3σ)
+                    # 💡 3本の移動平均線（25SMA赤, 75SMAオレンジ, 200SMA紫）
+                    chart_df['sma25'] = chart_df['close'].rolling(window=25, min_periods=1).mean()
+                    chart_df['sma75'] = chart_df['close'].rolling(window=75, min_periods=1).mean()
+                    if 'sma200' not in chart_df.columns:
+                        chart_df['sma200'] = chart_df['close'].rolling(window=200, min_periods=1).mean()
+
+                    # 💡 ボリンジャーバンド計算 (20 SMA, ±2σ, ±3σ)
                     bb_mid = chart_df['close'].rolling(window=20, min_periods=1).mean()
                     bb_std = chart_df['close'].rolling(window=20, min_periods=1).std(ddof=0)
                     disp_indexed = chart_df.set_index('date')
@@ -148,15 +154,17 @@ def render_screened_stock_card(index_num: int, unique_key: str):
                         "m3": bb_mid - (3.0 * bb_std)
                     }
 
-                    _sma_fast = disp_indexed['sma50'] if 'sma50' in chart_df.columns else None
-                    # 💡 紫色の200MAとして描画
-                    _sma_slow = disp_indexed['sma200'] if 'sma200' in chart_df.columns else None
+                    _sma25 = disp_indexed['sma25']
+                    _sma75 = disp_indexed['sma75']
+                    _sma200 = disp_indexed['sma200']
+
                     _lwc_key = f"sc_mini_cand_{r['コード']}_{unique_key}"
                     with i1:
                         render_lwc_candle_mini(
                             chart_df,
-                            sma_fast=_sma_fast,
-                            sma_slow=_sma_slow,
+                            sma25=_sma25,
+                            sma75=_sma75,
+                            sma200=_sma200,
                             key=_lwc_key,
                             height=180,
                             bb_dict=bb_dict

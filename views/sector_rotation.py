@@ -126,7 +126,7 @@ def show_constituents_dialog(
 ):
     """
     テーマ名クリック時に最前面にオーバーレイ展開する共通モーダルダイアログ。
-    WVFシグナル、ボリンジャーバンド（±2σ, ±3σ）、200SMA、出来高およびTradingViewリンクを統合表示します。
+    TradingView外部リンク、25/75/200SMA、最背面ボリンジャーバンド（±2σ, ±3σ）を統合表示します。
     """
     st.subheader(f"📊 {title}（構成: {len(constituent_codes)} 銘柄）")
     tf_display_name = "週足" if resample_weekly else ("日足" if interval == "1d" else interval)
@@ -150,7 +150,7 @@ def show_constituents_dialog(
             stock_name = name_map.get(clean_code, "")
             display_label = f"{clean_code}　{stock_name}" if stock_name else clean_code
 
-            # 💡 TradingView リンクURLの構築
+            # 💡 TradingView リンクURLの生成
             if is_jp:
                 tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{clean_code}"
             else:
@@ -178,11 +178,12 @@ def show_constituents_dialog(
                             "is_lime": "any", "is_fuchsia": "any", "ext_price": "last"
                         }).dropna().reset_index()
 
-                    # 💡 移動平均線（75SMA, 200SMA）
-                    df_stock["sma75"] = df_stock["close"].rolling(window=75, min_periods=1).mean()
+                    # 💡 3本の移動平均線（25SMA赤, 75SMAオレンジ, 200SMA紫）
+                    df_stock["sma25"]  = df_stock["close"].rolling(window=25, min_periods=1).mean()
+                    df_stock["sma75"]  = df_stock["close"].rolling(window=75, min_periods=1).mean()
                     df_stock["sma200"] = df_stock["close"].rolling(window=200, min_periods=1).mean()
 
-                    # 💡 ボリンジャーバンド計算 (Pine Script準拠: 20期間, ±2σ, ±3σ)
+                    # 💡 ボリンジャーバンド計算 (20期間, ±2σ, ±3σ)
                     bb_mid = df_stock["close"].rolling(window=20, min_periods=1).mean()
                     bb_std = df_stock["close"].rolling(window=20, min_periods=1).std(ddof=0)
                     df_stock["bb_p2"] = bb_mid + (2.0 * bb_std)
@@ -242,21 +243,22 @@ def show_constituents_dialog(
                         unsafe_allow_html=True
                     )
 
-                    # WVFステータスおよび消灯目安値バッジ
                     st.markdown(
                         f"<div style='margin-top:2px; margin-bottom:4px; height:18px; line-height:18px; overflow:hidden;'>"
                         f"{wvf_badge_html}</div>",
                         unsafe_allow_html=True
                     )
 
-                    # 💡 ローソク足ミニチャート（BB半透明グレー, 200SMA紫, WVF出来高）
+                    # 💡 ローソク足ミニチャート（25/75/200MA、最背面BB、ローソク足最前面、右軸ラベル非表示）
                     if not df_display.empty and len(df_display) >= 2:
-                        sma_fast = df_display.set_index("date")["sma75"]
-                        sma_slow = df_display.set_index("date")["sma200"]
+                        sma25_s = df_display.set_index("date")["sma25"]
+                        sma75_s = df_display.set_index("date")["sma75"]
+                        sma200_s = df_display.set_index("date")["sma200"]
                         render_lwc_candle_mini(
                             df_display,
-                            sma_fast=sma_fast,
-                            sma_slow=sma_slow,
+                            sma25=sma25_s,
+                            sma75=sma75_s,
+                            sma200=sma200_s,
                             key=f"dlg_candle_{title}_{clean_code}",
                             height=170,
                             is_jp=is_jp,

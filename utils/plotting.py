@@ -53,10 +53,7 @@ def _lwc_base_options(height: int = 160, right_offset: int = 5) -> dict:
     }
 
 def detect_price_format(prices, is_jp: bool = True) -> dict:
-    """
-    株価データ（OHLC等の有限数値）から適切な小数点桁数（precision）と
-    刻み幅（minMove）を動的に判定します。
-    """
+    """株価データから適切な小数点桁数と刻み幅を動的に判定します。"""
     if not is_jp:
         return {"type": "price", "precision": 2, "minMove": 0.01}
 
@@ -77,15 +74,11 @@ def detect_price_format(prices, is_jp: bool = True) -> dict:
     if len(vals) == 0:
         return {"type": "price", "precision": 0, "minMove": 1}
 
-    # 1. すべて整数か判定（大半の日本株：例 3400）
     if np.all(np.isclose(vals, np.round(vals, 0), atol=1e-4)):
         return {"type": "price", "precision": 0, "minMove": 1}
-
-    # 2. 小数点第1位で収まるか判定（NTT等の0.1円刻み銘柄：例 153.2）
     if np.all(np.isclose(vals, np.round(vals, 1), atol=1e-4)):
         return {"type": "price", "precision": 1, "minMove": 0.1}
 
-    # 3. それ以外（2桁小数のETF等）
     return {"type": "price", "precision": 2, "minMove": 0.01}
 
 def build_lwc_rs_overlay_chart(sector_index_cache: dict, selected_sectors: list, height: int = 450) -> dict:
@@ -175,14 +168,21 @@ def render_lwc_rs_overlay(sector_index_cache: dict, selected_sectors: list, heig
 
 def build_lwc_candle_chart(
     df: pd.DataFrame, 
-    sma_fast: pd.Series = None, 
-    sma_slow: pd.Series = None, 
+    sma25: pd.Series = None,
+    sma75: pd.Series = None, 
+    sma200: pd.Series = None,
+    sma_fast: pd.Series = None,  # 互換用
+    sma_slow: pd.Series = None,  # 互換用
     height: int = 200, 
     is_jp: bool = True, 
     wvf_df: pd.DataFrame = None,
     bb_dict: dict = None
 ) -> dict:
-    """ローソク足＋移動平均2本＋ボリンジャーバンド＋出来高（WVFシグナルハイライト対応）の LWC 構成定義を生成します。"""
+    """
+    ローソク足チャート定義を生成します。
+    💡 レイヤー順序: ボリンジャーバンド（最背面） ➔ 移動平均線 ➔ ローソク足（最前面） ➔ 出来高
+    💡 右軸ラベル（lastValueVisible / priceLineVisible / title）は完全に無効化。
+    """
     if df is None or df.empty:
         return {}
 
@@ -194,9 +194,111 @@ def build_lwc_candle_chart(
     else:
         times = _to_lwc_time(df.index)
 
-    # 右軸の小数点桁数を動的最適化
     price_format = detect_price_format(df, is_jp=is_jp)
 
+    # 互換性フォールバック
+    if sma75 is None and sma_fast is not None:
+        sma75 = sma_fast
+    if sma200 is None and sma_slow is not None:
+        sma200 = sma_slow
+
+    series = []
+
+    # =========================================================================
+    # 1. 【最背面レイヤー】ボリンジャーバンド (ミドル非表示, ±2σ/±3σ 半透明極薄グレー)
+    # =========================================================================
+    if bb_dict:
+        # ±3σ (最外殻: 極薄の透過グレー)
+        for key_name in ["p3", "m3"]:
+            s_band = bb_dict.get(key_name)
+            if s_band is not None and not s_band.dropna().empty:
+                b_times = _to_lwc_time(s_band.index)
+                series.append({
+                    "type": "Line",
+                    "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(b_times, s_band.values) if not pd.isna(v)],
+                    "options": {
+                        "color": "rgba(200, 200, 200, 0.08)", 
+                        "lineWidth": 1, 
+                        "title": "",  # 軸ラベル表示を抑止
+                        "priceLineVisible": False, 
+                        "lastValueVisible": False, 
+                        "crosshairMarkerVisible": False
+                    },
+                })
+
+        # ±2σ (半透明グレー)
+        for key_name in ["p2", "m2"]:
+            s_band = bb_dict.get(key_name)
+            if s_band is not None and not s_band.dropna().empty:
+                b_times = _to_lwc_time(s_band.index)
+                series.append({
+                    "type": "Line",
+                    "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(b_times, s_band.values) if not pd.isna(v)],
+                    "options": {
+                        "color": "rgba(200, 200, 200, 0.20)", 
+                        "lineWidth": 1, 
+                        "title": "",  # 軸ラベル表示を抑止
+                        "priceLineVisible": False, 
+                        "lastValueVisible": False, 
+                        "crosshairMarkerVisible": False
+                    },
+                })
+
+    # =========================================================================
+    # 2. 【中間レイヤー】移動平均線 (200SMA紫, 75SMAオレンジ, 25SMA赤 / 太さ1)
+    # =========================================================================
+    # 200SMA (紫)
+    if sma200 is not None and not sma200.dropna().empty:
+        st_times = _to_lwc_time(sma200.index)
+        series.append({
+            "type": "Line",
+            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma200.values) if not pd.isna(v)],
+            "options": {
+                "color": "#ab47bc", 
+                "lineWidth": 1, 
+                "title": "",  # 右軸ラベル非表示
+                "priceLineVisible": False, 
+                "lastValueVisible": False, 
+                "crosshairMarkerVisible": False
+            },
+        })
+
+    # 75SMA (オレンジ)
+    if sma75 is not None and not sma75.dropna().empty:
+        st_times = _to_lwc_time(sma75.index)
+        series.append({
+            "type": "Line",
+            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma75.values) if not pd.isna(v)],
+            "options": {
+                "color": "#ffa726", 
+                "lineWidth": 1, 
+                "title": "",  # 右軸ラベル非表示
+                "priceLineVisible": False, 
+                "lastValueVisible": False, 
+                "crosshairMarkerVisible": False
+            },
+        })
+
+    # 25SMA (赤)
+    if sma25 is not None and not sma25.dropna().empty:
+        st_times = _to_lwc_time(sma25.index)
+        series.append({
+            "type": "Line",
+            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma25.values) if not pd.isna(v)],
+            "options": {
+                "color": "#ef5350", 
+                "lineWidth": 1, 
+                "title": "",  # 右軸ラベル非表示
+                "priceLineVisible": False, 
+                "lastValueVisible": False, 
+                "crosshairMarkerVisible": False
+            },
+        })
+
+    # =========================================================================
+    # 3. 【最前面レイヤー】ローソク足 (Candlestick)
+    #    ※BBやMAの後に配置することで、ローソク足の実体やヒゲが手前にくっきり浮き出ます
+    # =========================================================================
     candle_data = [
         {"time": t, "open": round(float(o), 2), "high": round(float(h), 2),
          "low": round(float(l), 2), "close": round(float(c), 2)}
@@ -204,82 +306,19 @@ def build_lwc_candle_chart(
         if not any(pd.isna(v) for v in [o, h, l, c])
     ]
 
-    series = [
-        {
-            "type": "Candlestick",
-            "data": candle_data,
-            "options": {
-                "upColor": "#26a69a", "downColor": "#ef5350",
-                "borderUpColor": "#26a69a", "borderDownColor": "#ef5350",
-                "wickUpColor": "#26a69a", "wickDownColor": "#ef5350",
-                "priceFormat": price_format,
-            },
-        }
-    ]
+    series.append({
+        "type": "Candlestick",
+        "data": candle_data,
+        "options": {
+            "upColor": "#26a69a", "downColor": "#ef5350",
+            "borderUpColor": "#26a69a", "borderDownColor": "#ef5350",
+            "wickUpColor": "#26a69a", "wickDownColor": "#ef5350",
+            "priceFormat": price_format,
+        },
+    })
 
     # =========================================================================
-    # 💡 ボリンジャーバンド (Pine Script準拠: ミドル非表示, ±2σ 半透明グレー, ±3σ さらに薄いグレー)
-    # =========================================================================
-    if bb_dict:
-        # 1. BB ±3σ (最外殻: さらに薄い半透明グレー)
-        for key_name, band_title in [("p3", "+3σ"), ("m3", "-3σ")]:
-            s_band = bb_dict.get(key_name)
-            if s_band is not None and not s_band.dropna().empty:
-                b_times = _to_lwc_time(s_band.index)
-                series.append({
-                    "type": "Line",
-                    "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(b_times, s_band.values) if not pd.isna(v)],
-                    "options": {
-                        "color": "rgba(200, 200, 200, 0.15)", 
-                        "lineWidth": 1, 
-                        "title": band_title,
-                        "priceLineVisible": False, 
-                        "lastValueVisible": False, 
-                        "crosshairMarkerVisible": False
-                    },
-                })
-
-        # 2. BB ±2σ (半透明グレー)
-        for key_name, band_title in [("p2", "+2σ"), ("m2", "-2σ")]:
-            s_band = bb_dict.get(key_name)
-            if s_band is not None and not s_band.dropna().empty:
-                b_times = _to_lwc_time(s_band.index)
-                series.append({
-                    "type": "Line",
-                    "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(b_times, s_band.values) if not pd.isna(v)],
-                    "options": {
-                        "color": "rgba(200, 200, 200, 0.35)", 
-                        "lineWidth": 1, 
-                        "title": band_title,
-                        "priceLineVisible": False, 
-                        "lastValueVisible": False, 
-                        "crosshairMarkerVisible": False
-                    },
-                })
-        # ※ ミドルライン（20 SMA）はご要望通り描画シリーズに追加せず非表示とします。
-
-    # =========================================================================
-    # 💡 移動平均線
-    # =========================================================================
-    if sma_fast is not None and not sma_fast.dropna().empty:
-        sma_times = _to_lwc_time(sma_fast.index)
-        series.append({
-            "type": "Line",
-            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(sma_times, sma_fast.values) if not pd.isna(v)],
-            "options": {"color": "#FFA726", "lineWidth": 1, "title": "MA(Fast)", "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
-        })
-
-    # 💡 200MA：添付画像の配色に合わせたパープル（#ab47bc, 太さ2）
-    if sma_slow is not None and not sma_slow.dropna().empty:
-        sma_times = _to_lwc_time(sma_slow.index)
-        series.append({
-            "type": "Line",
-            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(sma_times, sma_slow.values) if not pd.isna(v)],
-            "options": {"color": "#ab47bc", "lineWidth": 2, "title": "200SMA", "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
-        })
-
-    # =========================================================================
-    # 出来高 (Histogram)
+    # 4. 【最下部オーバーレイ】出来高 (Histogram)
     # =========================================================================
     if "volume" in df.columns:
         wvf_map = {}
@@ -298,12 +337,11 @@ def build_lwc_candle_chart(
             if pd.isna(v):
                 continue
 
-            # 出来高バーのカラー決定（第1優先: Fuchsia, 第2優先: Lime, 平常時: 薄青/薄赤）
             sig = wvf_map.get(t, {})
             if sig.get("fuchsia"):
-                color = "rgba(233, 30, 99, 0.95)"   # 🌸 反発買いシグナル (Fuchsia / マゼンタピンク)
+                color = "rgba(233, 30, 99, 0.95)"   # 🌸 反発買いシグナル (Fuchsia)
             elif sig.get("lime"):
-                color = "rgba(0, 230, 118, 0.95)"   # 🟢 パニック売り点灯 (Lime / 発光グリーン)
+                color = "rgba(0, 230, 118, 0.95)"   # 🟢 パニック売り点灯 (Lime)
             else:
                 color = "rgba(38, 166, 154, 0.2)" if (pd.isna(o) or pd.isna(c) or c >= o) else "rgba(239, 83, 80, 0.2)"
 
@@ -323,7 +361,7 @@ def build_lwc_candle_chart(
     return {"chart": _lwc_base_options(height=height), "series": series}
 
 def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sma_slow: pd.Series = None, wvf_lit: pd.Series = None, volume_series = None, height: int = 160, is_jp: bool = True) -> dict:
-    """折れ線（セクター値）＋移動平均2本＋出来高の LWC 構成定義を生成します（右軸桁数自動最適化対応）。"""
+    """折れ線（セクター値）＋移動平均2本＋出来高の LWC 構成定義を生成します。"""
     if price_series is None or price_series.empty:
         return {}
 
@@ -361,10 +399,9 @@ def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sm
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st2, sma_slow.values) if not pd.isna(v)],
-            "options": {"color": "#ab47bc", "lineWidth": 2, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
+            "options": {"color": "#ab47bc", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
         })
 
-    # --- 出来高(Volume)オーバーレイ描画の分岐 ---
     if volume_series is not None:
         if isinstance(volume_series, list):
             series.append({
@@ -414,8 +451,11 @@ def render_lwc_sector_mini(price_series: pd.Series, sma_fast: pd.Series = None, 
 
 def render_lwc_candle_mini(
     df: pd.DataFrame, 
-    sma_fast: pd.Series = None, 
-    sma_slow: pd.Series = None, 
+    sma25: pd.Series = None,
+    sma75: pd.Series = None, 
+    sma200: pd.Series = None,
+    sma_fast: pd.Series = None,
+    sma_slow: pd.Series = None,
     key: str = "lwc_candle", 
     height: int = 200, 
     is_jp: bool = True, 
@@ -425,8 +465,11 @@ def render_lwc_candle_mini(
     """個別ローソク足用のLWCミニチャートをレンダリングします。"""
     chart_def = build_lwc_candle_chart(
         df, 
-        sma_fast=sma_fast, 
-        sma_slow=sma_slow, 
+        sma25=sma25,
+        sma75=sma75, 
+        sma200=sma200,
+        sma_fast=sma_fast,
+        sma_slow=sma_slow,
         height=height, 
         is_jp=is_jp, 
         wvf_df=wvf_df,
@@ -458,7 +501,7 @@ def generate_mini_chart_base64(df: pd.DataFrame) -> str:
         if 'sma50' in plot_df.columns: 
             add_plots.append(mpf.make_addplot(plot_df['sma50'], color='orange', width=0.7))
         if 'sma200' in plot_df.columns: 
-            add_plots.append(mpf.make_addplot(plot_df['sma200'], color='#ab47bc', width=1.0))
+            add_plots.append(mpf.make_addplot(plot_df['sma200'], color='#ab47bc', width=0.7))
             
         fig, axlist = mpf.plot(plot_df, type='candle', style=s, addplot=add_plots, figsize=(4, 2.5), tight_layout=True, returnfig=True, axisoff=True)
         fig.set_facecolor('#f0f2f6')
