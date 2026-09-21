@@ -249,7 +249,7 @@ def show_constituents_dialog(
                         unsafe_allow_html=True
                     )
 
-                    # 💡 ローソク足ミニチャート（25/75/200MA、最背面BB、ローソク足最前面、右軸ラベル非表示）
+                    # 💡 ローソク足ミニチャート（25/75/200MA、最背面BB、ローソク足最前面、破線非表示、.00解消）
                     if not df_display.empty and len(df_display) >= 2:
                         sma25_s = df_display.set_index("date")["sma25"]
                         sma75_s = df_display.set_index("date")["sma75"]
@@ -520,6 +520,9 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             etf_abs = pd.Series(dtype=float)
                             etf_sma75 = etf_sma200 = etf_wvf = etf_vol = pd.Series(dtype=float)
 
+                        # 💡 25MA を算出
+                        etf_sma25 = etf_abs.rolling(window=25, min_periods=1).mean() if not etf_abs.empty else pd.Series(dtype=float)
+
                         etf_mom = get_sector_momentum(
                             get_sector_index_cached(interval, (code,), period_days, resample_weekly, is_jp=is_jp),
                             days=min(5, period_days)
@@ -539,10 +542,17 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             )
 
                         if not etf_abs.empty:
+                            # 💡 25/75/200MA付きで描画
                             render_lwc_sector_mini(
-                                etf_abs, sma_fast=etf_sma75, sma_slow=etf_sma200,
-                                wvf_lit=etf_wvf, volume_series=etf_vol,
-                                key=f"etf_abs_mini_{code}", height=150, is_jp=is_jp
+                                etf_abs, 
+                                sma25=etf_sma25,
+                                sma75=etf_sma75, 
+                                sma200=etf_sma200,
+                                wvf_lit=etf_wvf, 
+                                volume_series=etf_vol,
+                                key=f"etf_abs_mini_{code}", 
+                                height=150, 
+                                is_jp=is_jp
                             )
                         else:
                             st.caption("データなし")
@@ -583,6 +593,9 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             ret_rate, sma75, sma200, total_val = get_theme_return_rate_cached(
                                 interval, tuple(tickers), period_days, resample_weekly, is_jp=is_jp
                             )
+                            # 💡 25MA を算出
+                            sma25 = ret_rate.rolling(window=25, min_periods=1).mean() if not ret_rate.empty else pd.Series(dtype=float)
+
                             if not ret_rate.empty:
                                 last_ret = ret_rate.iloc[-1]
                                 badge_t = "🟢" if last_ret >= 0 else "🔴"
@@ -599,10 +612,17 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                                         is_jp=is_jp
                                     )
 
+                                # 💡 25/75/200MA付きで描画
                                 render_lwc_sector_mini(
-                                    ret_rate, sma_fast=sma75, sma_slow=sma200,
-                                    wvf_lit=None, volume_series=total_val,
-                                    key=f"theme_ret_mini_{t_name}", height=150, is_jp=is_jp
+                                    ret_rate, 
+                                    sma25=sma25,
+                                    sma75=sma75, 
+                                    sma200=sma200,
+                                    wvf_lit=None, 
+                                    volume_series=total_val,
+                                    key=f"theme_ret_mini_{t_name}", 
+                                    height=150, 
+                                    is_jp=is_jp
                                 )
                             else:
                                 st.caption("データなし")
@@ -658,9 +678,10 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                     sec_abs, sma75, sma200, is_wvf_lit, trading_val = get_sector_absolute_data_cached(
                         interval, tuple(tickers), period_days, resample_weekly, is_jp=is_jp
                     )
+                    sec_sma25 = sec_abs.rolling(window=25, min_periods=1).mean() if not sec_abs.empty else pd.Series(dtype=float)
                     wvf_active = bool(is_wvf_lit.iloc[-1]) if (is_wvf_lit is not None and not is_wvf_lit.empty) else False
                 except Exception:
-                    sec_abs = sma75 = sma200 = pd.Series(dtype=float)
+                    sec_abs = sma75 = sma200 = sec_sma25 = pd.Series(dtype=float)
                     is_wvf_lit = pd.Series(dtype=bool)
                     trading_val = pd.Series(dtype=float)
                     wvf_active = False
@@ -684,9 +705,15 @@ def render_sector_mini_charts_fragment(is_jp: bool):
 
                         if not sec_abs.empty:
                             render_lwc_sector_mini(
-                                sec_abs, sma_fast=sma75, sma_slow=sma200,
-                                wvf_lit=is_wvf_lit, volume_series=trading_val,
-                                key=f"mini_chart_{sname}", height=150, is_jp=is_jp
+                                sec_abs, 
+                                sma25=sec_sma25,
+                                sma75=sma75, 
+                                sma200=sma200,
+                                wvf_lit=is_wvf_lit, 
+                                volume_series=trading_val,
+                                key=f"mini_chart_{sname}", 
+                                height=150, 
+                                is_jp=is_jp
                             )
                         else:
                             st.caption("データなし")
@@ -751,16 +778,23 @@ def render_watchlist_mini_charts_fragment(is_jp: bool):
                         w_abs, w_sma75, w_sma200, w_wvf_lit, w_trading_val = get_sector_absolute_data_cached(
                             interval, (code,), period_days, resample_weekly, is_jp=is_jp
                         )
+                        w_sma25 = w_abs.rolling(window=25, min_periods=1).mean() if not w_abs.empty else pd.Series(dtype=float)
                     except Exception:
-                        w_abs = w_sma75 = w_sma200 = pd.Series(dtype=float)
+                        w_abs = w_sma75 = w_sma200 = w_sma25 = pd.Series(dtype=float)
                         w_wvf_lit = pd.Series(dtype=bool)
                         w_trading_val = pd.Series(dtype=float)
 
                     if not w_abs.empty:
                         render_lwc_sector_mini(
-                            w_abs, sma_fast=w_sma75, sma_slow=w_sma200,
-                            wvf_lit=w_wvf_lit, volume_series=w_trading_val,
-                            key=f"wl_chart_mini_{code}", height=150, is_jp=is_jp
+                            w_abs, 
+                            sma25=w_sma25,
+                            sma75=w_sma75, 
+                            sma200=w_sma200,
+                            wvf_lit=w_wvf_lit, 
+                            volume_series=w_trading_val,
+                            key=f"wl_chart_mini_{code}", 
+                            height=150, 
+                            is_jp=is_jp
                         )
                     else:
                         st.caption("データなし")

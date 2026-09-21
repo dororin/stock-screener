@@ -181,7 +181,8 @@ def build_lwc_candle_chart(
     """
     ローソク足チャート定義を生成します。
     💡 レイヤー順序: ボリンジャーバンド（最背面） ➔ 移動平均線（0.5px相当・透過） ➔ ローソク足（最前面） ➔ 出来高
-    💡 右軸ラベル（lastValueVisible / priceLineVisible / title）は完全に無効化。
+    💡 現在値の水平破線は非表示、右軸ラベルは保持。
+    💡 全Lineシリーズに priceFormat を適用して .00 汚染を完全防止。
     """
     if df is None or df.empty:
         return {}
@@ -196,7 +197,6 @@ def build_lwc_candle_chart(
 
     price_format = detect_price_format(df, is_jp=is_jp)
 
-    # 互換性フォールバック
     if sma75 is None and sma_fast is not None:
         sma75 = sma_fast
     if sma200 is None and sma_slow is not None:
@@ -219,10 +219,11 @@ def build_lwc_candle_chart(
                     "options": {
                         "color": "rgba(200, 200, 200, 0.08)", 
                         "lineWidth": 1, 
-                        "title": "",  # 軸ラベル表示を抑止
+                        "title": "",
                         "priceLineVisible": False, 
                         "lastValueVisible": False, 
-                        "crosshairMarkerVisible": False
+                        "crosshairMarkerVisible": False,
+                        "priceFormat": price_format,  # 💡 軸汚染を防止
                     },
                 })
 
@@ -237,18 +238,16 @@ def build_lwc_candle_chart(
                     "options": {
                         "color": "rgba(200, 200, 200, 0.20)", 
                         "lineWidth": 1, 
-                        "title": "",  # 軸ラベル表示を抑止
+                        "title": "",
                         "priceLineVisible": False, 
                         "lastValueVisible": False, 
-                        "crosshairMarkerVisible": False
+                        "crosshairMarkerVisible": False,
+                        "priceFormat": price_format,  # 💡 軸汚染を防止
                     },
                 })
 
     # =========================================================================
-    # 2. 【中間レイヤー】移動平均線 (0.5px相当の透過テクニックを適用)
-    #    200MA(紫): rgba(171, 71, 188, 0.80)
-    #    75MA(オレンジ): rgba(255, 167, 38, 0.75)
-    #    25MA(赤): rgba(239, 83, 80, 0.75)
+    # 2. 【中間レイヤー】移動平均線 (0.5px相当の透過テクニック)
     # =========================================================================
     # 200SMA (紫・極細透過)
     if sma200 is not None and not sma200.dropna().empty:
@@ -259,10 +258,11 @@ def build_lwc_candle_chart(
             "options": {
                 "color": "rgba(171, 71, 188, 0.80)", 
                 "lineWidth": 1, 
-                "title": "",  # 右軸ラベル非表示
+                "title": "",
                 "priceLineVisible": False, 
                 "lastValueVisible": False, 
-                "crosshairMarkerVisible": False
+                "crosshairMarkerVisible": False,
+                "priceFormat": price_format,  # 💡 軸汚染を防止
             },
         })
 
@@ -275,10 +275,11 @@ def build_lwc_candle_chart(
             "options": {
                 "color": "rgba(255, 167, 38, 0.75)", 
                 "lineWidth": 1, 
-                "title": "",  # 右軸ラベル非表示
+                "title": "",
                 "priceLineVisible": False, 
                 "lastValueVisible": False, 
-                "crosshairMarkerVisible": False
+                "crosshairMarkerVisible": False,
+                "priceFormat": price_format,  # 💡 軸汚染を防止
             },
         })
 
@@ -291,10 +292,11 @@ def build_lwc_candle_chart(
             "options": {
                 "color": "rgba(239, 83, 80, 0.75)", 
                 "lineWidth": 1, 
-                "title": "",  # 右軸ラベル非表示
+                "title": "",
                 "priceLineVisible": False, 
                 "lastValueVisible": False, 
-                "crosshairMarkerVisible": False
+                "crosshairMarkerVisible": False,
+                "priceFormat": price_format,  # 💡 軸汚染を防止
             },
         })
 
@@ -316,6 +318,8 @@ def build_lwc_candle_chart(
             "borderUpColor": "#26a69a", "borderDownColor": "#ef5350",
             "wickUpColor": "#26a69a", "wickDownColor": "#ef5350",
             "priceFormat": price_format,
+            "priceLineVisible": False,  # 💡 現在値の水平破線を非表示
+            "lastValueVisible": True,   # 💡 右軸の現在値ラベルは表示維持
         },
     })
 
@@ -362,48 +366,108 @@ def build_lwc_candle_chart(
 
     return {"chart": _lwc_base_options(height=height), "series": series}
 
-def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sma_slow: pd.Series = None, wvf_lit: pd.Series = None, volume_series = None, height: int = 160, is_jp: bool = True) -> dict:
-    """折れ線（セクター値）＋移動平均2本＋出来高の LWC 構成定義を生成します。"""
+def build_lwc_line_chart(
+    price_series: pd.Series, 
+    sma25: pd.Series = None, 
+    sma75: pd.Series = None, 
+    sma200: pd.Series = None, 
+    sma_fast: pd.Series = None, 
+    sma_slow: pd.Series = None, 
+    wvf_lit: pd.Series = None, 
+    volume_series = None, 
+    height: int = 160, 
+    is_jp: bool = True
+) -> dict:
+    """
+    折れ線（セクター値）＋移動平均3本＋出来高の LWC 構成定義を生成します。
+    💡 セクターチャートにも 25/75/200MA の0.5px相当透過極細線を適用。
+    💡 水平破線は非表示、右軸ラベルは保持。
+    """
     if price_series is None or price_series.empty:
         return {}
 
     price_format = detect_price_format(price_series, is_jp=is_jp)
 
+    if sma75 is None and sma_fast is not None:
+        sma75 = sma_fast
+    if sma200 is None and sma_slow is not None:
+        sma200 = sma_slow
+
+    series = []
+
+    # =========================================================================
+    # 1. 【背面レイヤー】移動平均線3本 (200SMA紫, 75SMAオレンジ, 25SMA赤)
+    # =========================================================================
+    if sma200 is not None and not sma200.dropna().empty:
+        st_times = _to_lwc_time(sma200.index)
+        series.append({
+            "type": "Line",
+            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma200.values) if not pd.isna(v)],
+            "options": {
+                "color": "rgba(171, 71, 188, 0.80)", 
+                "lineWidth": 1, 
+                "priceLineVisible": False, 
+                "lastValueVisible": False, 
+                "crosshairMarkerVisible": False,
+                "priceFormat": price_format,
+            },
+        })
+
+    if sma75 is not None and not sma75.dropna().empty:
+        ft_times = _to_lwc_time(sma75.index)
+        series.append({
+            "type": "Line",
+            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(ft_times, sma75.values) if not pd.isna(v)],
+            "options": {
+                "color": "rgba(255, 167, 38, 0.75)", 
+                "lineWidth": 1, 
+                "priceLineVisible": False, 
+                "lastValueVisible": False, 
+                "crosshairMarkerVisible": False,
+                "priceFormat": price_format,
+            },
+        })
+
+    if sma25 is not None and not sma25.dropna().empty:
+        s25_times = _to_lwc_time(sma25.index)
+        series.append({
+            "type": "Line",
+            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(s25_times, sma25.values) if not pd.isna(v)],
+            "options": {
+                "color": "rgba(239, 83, 80, 0.75)", 
+                "lineWidth": 1, 
+                "priceLineVisible": False, 
+                "lastValueVisible": False, 
+                "crosshairMarkerVisible": False,
+                "priceFormat": price_format,
+            },
+        })
+
+    # =========================================================================
+    # 2. 【前面レイヤー】メイン折れ線（セクター値）
+    # =========================================================================
     times = _to_lwc_time(price_series.index)
     price_data = [
         {"time": t, "value": round(float(v), 2)}
         for t, v in zip(times, price_series.values) if not pd.isna(v)
     ]
 
-    series = [
-        {
-            "type": "Line",
-            "data": price_data,
-            "options": {
-                "color": "#42a5f5", "lineWidth": 2,
-                "priceLineVisible": False, "lastValueVisible": True,
-                "crosshairMarkerVisible": True,
-                "priceFormat": price_format,
-            },
-        }
-    ]
+    series.append({
+        "type": "Line",
+        "data": price_data,
+        "options": {
+            "color": "#42a5f5", 
+            "lineWidth": 2,
+            "priceLineVisible": False,  # 💡 現在値の水平破線を非表示
+            "lastValueVisible": True,   # 💡 右軸ラベルは表示
+            "crosshairMarkerVisible": True,
+            "priceFormat": price_format,
+        },
+    })
 
-    if sma_fast is not None and not sma_fast.dropna().empty:
-        ft = _to_lwc_time(sma_fast.index)
-        series.append({
-            "type": "Line",
-            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(ft, sma_fast.values) if not pd.isna(v)],
-            "options": {"color": "rgba(255, 167, 38, 0.75)", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
-        })
-
-    if sma_slow is not None and not sma_slow.dropna().empty:
-        st2 = _to_lwc_time(sma_slow.index)
-        series.append({
-            "type": "Line",
-            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st2, sma_slow.values) if not pd.isna(v)],
-            "options": {"color": "rgba(171, 71, 188, 0.80)", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
-        })
-
+    # =========================================================================
+    # 3. 【最下部オーバーレイ】出来高
+    # =========================================================================
     if volume_series is not None:
         if isinstance(volume_series, list):
             series.append({
@@ -440,9 +504,32 @@ def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sm
 
     return {"chart": _lwc_base_options(height=height), "series": series}
 
-def render_lwc_sector_mini(price_series: pd.Series, sma_fast: pd.Series = None, sma_slow: pd.Series = None, wvf_lit: pd.Series = None, volume_series: pd.Series = None, key: str = "lwc", height: int = 160, is_jp: bool = True):
+def render_lwc_sector_mini(
+    price_series: pd.Series, 
+    sma25: pd.Series = None,
+    sma75: pd.Series = None, 
+    sma200: pd.Series = None, 
+    sma_fast: pd.Series = None, 
+    sma_slow: pd.Series = None, 
+    wvf_lit: pd.Series = None, 
+    volume_series: pd.Series = None, 
+    key: str = "lwc", 
+    height: int = 160, 
+    is_jp: bool = True
+):
     """セクター絶対値用のLWCミニチャートをレンダリングします。"""
-    chart_def = build_lwc_line_chart(price_series, sma_fast=sma_fast, sma_slow=sma_slow, wvf_lit=wvf_lit, volume_series=volume_series, height=height, is_jp=is_jp)
+    chart_def = build_lwc_line_chart(
+        price_series, 
+        sma25=sma25,
+        sma75=sma75, 
+        sma200=sma200, 
+        sma_fast=sma_fast, 
+        sma_slow=sma_slow, 
+        wvf_lit=wvf_lit, 
+        volume_series=volume_series, 
+        height=height, 
+        is_jp=is_jp
+    )
     if not chart_def:
         st.caption("データなし")
         return
@@ -469,12 +556,12 @@ def render_lwc_candle_mini(
         df, 
         sma25=sma25,
         sma75=sma75, 
-        sma200=sma200,
-        sma_fast=sma_fast,
-        sma_slow=sma_slow,
+        sma200=sma200, 
+        sma_fast=sma_fast, 
+        sma_slow=sma_slow, 
         height=height, 
         is_jp=is_jp, 
-        wvf_df=wvf_df,
+        wvf_df=wvf_df, 
         bb_dict=bb_dict
     )
     if not chart_def:
