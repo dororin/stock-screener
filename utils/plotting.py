@@ -180,7 +180,7 @@ def build_lwc_candle_chart(
 ) -> dict:
     """
     ローソク足チャート定義を生成します。
-    💡 レイヤー順序: ボリンジャーバンド（最背面） ➔ 移動平均線 ➔ ローソク足（最前面） ➔ 出来高
+    💡 レイヤー順序: ボリンジャーバンド（最背面） ➔ 移動平均線（0.5px相当・透過） ➔ ローソク足（最前面） ➔ 出来高
     💡 右軸ラベル（lastValueVisible / priceLineVisible / title）は完全に無効化。
     """
     if df is None or df.empty:
@@ -245,16 +245,19 @@ def build_lwc_candle_chart(
                 })
 
     # =========================================================================
-    # 2. 【中間レイヤー】移動平均線 (200SMA紫, 75SMAオレンジ, 25SMA赤 / 太さ1)
+    # 2. 【中間レイヤー】移動平均線 (0.5px相当の透過テクニックを適用)
+    #    200MA(紫): rgba(171, 71, 188, 0.80)
+    #    75MA(オレンジ): rgba(255, 167, 38, 0.75)
+    #    25MA(赤): rgba(239, 83, 80, 0.75)
     # =========================================================================
-    # 200SMA (紫)
+    # 200SMA (紫・極細透過)
     if sma200 is not None and not sma200.dropna().empty:
         st_times = _to_lwc_time(sma200.index)
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma200.values) if not pd.isna(v)],
             "options": {
-                "color": "#ab47bc", 
+                "color": "rgba(171, 71, 188, 0.80)", 
                 "lineWidth": 1, 
                 "title": "",  # 右軸ラベル非表示
                 "priceLineVisible": False, 
@@ -263,14 +266,14 @@ def build_lwc_candle_chart(
             },
         })
 
-    # 75SMA (オレンジ)
+    # 75SMA (オレンジ・極細透過)
     if sma75 is not None and not sma75.dropna().empty:
         st_times = _to_lwc_time(sma75.index)
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma75.values) if not pd.isna(v)],
             "options": {
-                "color": "#ffa726", 
+                "color": "rgba(255, 167, 38, 0.75)", 
                 "lineWidth": 1, 
                 "title": "",  # 右軸ラベル非表示
                 "priceLineVisible": False, 
@@ -279,14 +282,14 @@ def build_lwc_candle_chart(
             },
         })
 
-    # 25SMA (赤)
+    # 25SMA (赤・極細透過)
     if sma25 is not None and not sma25.dropna().empty:
         st_times = _to_lwc_time(sma25.index)
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma25.values) if not pd.isna(v)],
             "options": {
-                "color": "#ef5350", 
+                "color": "rgba(239, 83, 80, 0.75)", 
                 "lineWidth": 1, 
                 "title": "",  # 右軸ラベル非表示
                 "priceLineVisible": False, 
@@ -297,7 +300,6 @@ def build_lwc_candle_chart(
 
     # =========================================================================
     # 3. 【最前面レイヤー】ローソク足 (Candlestick)
-    #    ※BBやMAの後に配置することで、ローソク足の実体やヒゲが手前にくっきり浮き出ます
     # =========================================================================
     candle_data = [
         {"time": t, "open": round(float(o), 2), "high": round(float(h), 2),
@@ -339,9 +341,9 @@ def build_lwc_candle_chart(
 
             sig = wvf_map.get(t, {})
             if sig.get("fuchsia"):
-                color = "rgba(233, 30, 99, 0.95)"   # 🌸 反発買いシグナル (Fuchsia)
+                color = "rgba(233, 30, 99, 0.95)"   # 🌸 反発買いシグナル
             elif sig.get("lime"):
-                color = "rgba(0, 230, 118, 0.95)"   # 🟢 パニック売り点灯 (Lime)
+                color = "rgba(0, 230, 118, 0.95)"   # 🟢 パニック売り点灯
             else:
                 color = "rgba(38, 166, 154, 0.2)" if (pd.isna(o) or pd.isna(c) or c >= o) else "rgba(239, 83, 80, 0.2)"
 
@@ -352,7 +354,7 @@ def build_lwc_candle_chart(
             "data": vol_data,
             "options": {
                 "priceFormat": {"type": "volume"},
-                "priceScaleId": "",  # overlayPriceScalesにマッピング
+                "priceScaleId": "",
                 "priceLineVisible": False,
                 "lastValueVisible": False,
             }
@@ -391,7 +393,7 @@ def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sm
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(ft, sma_fast.values) if not pd.isna(v)],
-            "options": {"color": "#FFA726", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
+            "options": {"color": "rgba(255, 167, 38, 0.75)", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
         })
 
     if sma_slow is not None and not sma_slow.dropna().empty:
@@ -399,7 +401,7 @@ def build_lwc_line_chart(price_series: pd.Series, sma_fast: pd.Series = None, sm
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st2, sma_slow.values) if not pd.isna(v)],
-            "options": {"color": "#ab47bc", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
+            "options": {"color": "rgba(171, 71, 188, 0.80)", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False},
         })
 
     if volume_series is not None:
@@ -488,7 +490,7 @@ def render_lwc_candle_mini(
 # =====================================================================
 
 def generate_mini_chart_base64(df: pd.DataFrame) -> str:
-    """PDF等に差し込む用のローソク足画像をBase64形式で出力。必要な時だけライブラリをロードします。"""
+    """PDF等に差し込む用のローソク足画像をBase64形式で出力。"""
     try:
         import matplotlib.pyplot as plt
         import mplfinance as mpf
