@@ -112,12 +112,11 @@ def collect_and_save_holdings(excel=None, log_func=None) -> bool:
                 for test_v in [val_c2, val_c3]:
                     if test_v is not None:
                         s = str(test_v).strip()
-                        # プレースホルダー（-------等）やエラーコード以外の有効値を検出
                         if s != "" and not s.startswith("-214") and not s.startswith("#") and not set(s) <= {"-"}:
                             has_data = True
                             break
                 if has_data:
-                    time.sleep(0.5)  # 展開安定化のためわずかに待機
+                    time.sleep(0.5)
                     break
             except Exception:
                 pass
@@ -139,13 +138,12 @@ def collect_and_save_holdings(excel=None, log_func=None) -> bool:
             _log("  ⚠️ 吸い上げデータが空でした。")
             return False
 
-        # 2次元タプルを行リストへ変換
         all_rows = [list(r) for r in matrix if r is not None]
         if not all_rows:
             _log("  ⚠️ 行データが取得できませんでした。")
             return False
 
-        # 💡 ヘッダー行の自動判定とカラム位置のマッピング
+        # 💡 ヘッダー行の厳密な自動判定（「保有数量」と「発注数量」を明確に区別）
         header_row_idx = -1
         col_indices = {}
         for r_idx, r in enumerate(all_rows[:5]):
@@ -154,18 +152,28 @@ def collect_and_save_holdings(excel=None, log_func=None) -> bool:
                 header_row_idx = r_idx
                 for c_idx, c_val in enumerate(r):
                     c_str = str(c_val).strip()
-                    if "コード" in c_str: col_indices["code"] = c_idx
-                    elif "名称" in c_str or "銘柄名" in c_str: col_indices["name"] = c_idx
-                    elif "口座" in c_str: col_indices["account"] = c_idx
-                    elif "保有数量" in c_str or "数量" in c_str: col_indices["qty"] = c_idx
-                    elif "取得" in c_str: col_indices["buy_price"] = c_idx
-                    elif "時価" in c_str and "評価" not in c_str: col_indices["cur_price"] = c_idx
-                    elif "時価評価額" in c_str or "評価額" in c_str: col_indices["eval_val"] = c_idx
-                    elif "評価損益額" in c_str: col_indices["profit_val"] = c_idx
-                    elif "評価損益率" in c_str: col_indices["profit_pct"] = c_idx
+                    if "銘柄コード" in c_str or c_str == "コード":
+                        col_indices["code"] = c_idx
+                    elif "銘柄名称" in c_str or "銘柄名" in c_str:
+                        col_indices["name"] = c_idx
+                    elif "口座" in c_str:
+                        col_indices["account"] = c_idx
+                    elif "保有数量" in c_str:  # 💡 発注数量を取り違えないように「保有数量」でピンポイント指定
+                        col_indices["qty"] = c_idx
+                    elif "取得" in c_str:
+                        col_indices["buy_price"] = c_idx
+                    elif c_str == "時価":  # 💡 JAX/JNX/評価額を取り違えないよう完全一致
+                        col_indices["cur_price"] = c_idx
+                    elif "時価評価額" in c_str or c_str == "評価額":
+                        col_indices["eval_val"] = c_idx
+                    elif "評価損益額" in c_str or c_str == "評価損益":
+                        col_indices["profit_val"] = c_idx
+                    elif "評価損益率" in c_str:
+                        col_indices["profit_pct"] = c_idx
                 break
 
-        # ヘッダー行が見つからなかった場合のフォールバック（公式18列の既定順序）
+        # 公式18列の既定配置（ヘッダー行が検出されない場合のフォールバック）
+        # 0:コード, 1:名称, 2:口座区分, 3:保有数量, 4:発注数量, 5:平均取得価額, 6:時価, 9:時価評価額, 10:評価損益額, 11:評価損益率
         c_code = col_indices.get("code", 0)
         c_name = col_indices.get("name", 1)
         c_account = col_indices.get("account", 2)
@@ -177,6 +185,7 @@ def collect_and_save_holdings(excel=None, log_func=None) -> bool:
         c_profit_pct = col_indices.get("profit_pct", 11)
 
         start_row = (header_row_idx + 1) if header_row_idx != -1 else 1
+        _log(f"  🔎 ヘッダー行={header_row_idx} (データ開始行: {start_row}), コード列={c_code}, 株数列={c_qty}, 取得単価列={c_buy_price}")
 
         clean_rows = []
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -199,7 +208,7 @@ def collect_and_save_holdings(excel=None, log_func=None) -> bool:
                 continue
             code_str = str(raw_code).strip().split(".")[0].replace(" ", "").replace("　", "").upper()
 
-            # プレースホルダー（-----等）やヘッダー行の除外
+            # プレースホルダー（-----等）やヘッダー文字の除外
             if not code_str or code_str.startswith("-") or code_str.startswith("#") or "コード" in code_str:
                 continue
 
@@ -239,6 +248,9 @@ def collect_and_save_holdings(excel=None, log_func=None) -> bool:
             return True
 
         _log(f"  ✅ 抽出成功: 計 {len(df_holdings)} ポジション。Google Sheetsへ保存中...")
+        for _, r in df_holdings.iterrows():
+            _log(f"     • [{r['銘柄コード']}] {r['銘柄名']} | {r['口座区分']} {r['保有数量']}株 @ ¥{r['取得単価']:,.1f} (評価: ¥{r['時価評価額']:,.0f})")
+
         saved = save_holdings_to_sheets(df_holdings)
         if saved:
             _log("  🎉 保有株データのスプレッドシート保存が完了しました！")
