@@ -261,6 +261,57 @@ def save_watchlist_to_sheets(watchlist: dict):
     except Exception:
         pass
 
+# =====================================================================
+# 💼 【新規追加】保有銘柄データ（my_holdings）の読み書き
+# =====================================================================
+HOLDINGS_COLUMNS = ["銘柄コード", "銘柄名", "口座区分", "保有数量", "取得単価", "現在値", "時価評価額", "評価損益額", "評価損益率", "更新日時"]
+
+def save_holdings_to_sheets(df: pd.DataFrame) -> bool:
+    """楽天RSSで取得した保有ポジション一覧をスプレッドシートの HOLDINGS_SHEET_NAME へ全件保存します。"""
+    sh = get_sector_spreadsheet()
+    if sh is None:
+        return False
+    try:
+        sheet_name = getattr(settings, "HOLDINGS_SHEET_NAME", "my_holdings")
+        try:
+            ws = sh.worksheet(sheet_name)
+        except Exception:
+            ws = sh.add_worksheet(title=sheet_name, rows=500, cols=len(HOLDINGS_COLUMNS))
+
+        save_df = df.copy()
+        for col in HOLDINGS_COLUMNS:
+            if col not in save_df.columns:
+                save_df[col] = ""
+        save_df = save_df[HOLDINGS_COLUMNS]
+        save_df = save_df.fillna("")
+
+        rows = [HOLDINGS_COLUMNS] + save_df.values.tolist()
+        ws.clear()
+        ws.update(values=rows, range_name="A1")
+        return True
+    except Exception as e:
+        print(f"❌ [sheets_api] 保有銘柄シートへの書き込みに失敗しました: {e}")
+        return False
+
+def load_holdings_from_sheets() -> pd.DataFrame:
+    """スプレッドシートから保有ポジション一覧を取得します。"""
+    sh = get_sector_spreadsheet()
+    if sh is None:
+        return pd.DataFrame()
+    try:
+        sheet_name = getattr(settings, "HOLDINGS_SHEET_NAME", "my_holdings")
+        ws = sh.worksheet(sheet_name)
+        records = ws.get_all_records()
+        if not records:
+            return pd.DataFrame()
+        df = pd.DataFrame(records)
+        if "銘柄コード" in df.columns:
+            df["銘柄コード"] = df["銘柄コード"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        return df
+    except Exception as e:
+        print(f"❌ [sheets_api] 保有銘柄シートのロードに失敗しました: {e}")
+        return pd.DataFrame()
+
 REPAIR_LOG_COLUMNS = ["executed_at", "ticker", "market", "cliff_date", "interval", "before_close", "after_close", "multiplier", "memo"]
 
 def save_repair_log_to_sheets(log_rows: list) -> bool:
@@ -371,17 +422,11 @@ def save_extra_tickers_to_sheets(df: pd.DataFrame):
     except Exception:
         pass
 
-
-# --- 🚀 フィルタポリシー＆マージ対応型 統合マスタ同期システム ---
 ETF_MASTER_COLUMNS = ["ETFコード", "セクター名", "フィルターポリシー", "ファンド"]
 SECTOR_JP_COLUMNS = ["セクター名", "銘柄コード", "備考", "ETFコード"]
 TOPIX500_OUT_COLUMNS = ["銘柄コード", "銘柄名", "規模区分"]
 
 def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
-    """
-    【ステップ1：クラウドマスタ完全同期】
-    JPX公式サイト(data_j.xlsx)から上場企業マスタを取得し、ETF構成銘柄および手動セクターをマージして保存します。
-    """
     sh = get_sector_spreadsheet()
     if sh is None:
         return {"error": "スプレッドシートを開けませんでした。"}
@@ -422,7 +467,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
 
     sync_results = {}
 
-    # ────── 1. 【JPX公式マスタ取得】東証全銘柄の「日本語社名」マップを構築 ──────
     jpx_name_map = {}
     if is_jp:
         import requests
@@ -453,7 +497,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                         print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] pd.read_excel 失敗 (エンジン: {eng or 'default'}): {e_engine}")
                         continue
                         
-                # ダウンロード成功した正常なファイルをキャッシュ保存
                 jpx_cache_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xlsx")
                 try:
                     os.makedirs(os.path.dirname(jpx_cache_path), exist_ok=True)
@@ -480,7 +523,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
 
                 print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ✅ JPX日本語社名マスタ構築完了: {len(jpx_name_map):,} 銘柄")
 
-                # TOPIX500シートの更新
                 df_scale = df_jpx.iloc[:, [1, 2, 9]].copy()
                 df_scale.columns = ['symbol', 'name', 'scale_type']
                 target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
@@ -514,7 +556,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
             print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ❌ JPX自動取得例外: {e}\n{traceback.format_exc()}")
             sync_results["TOPIX500 (JPX)"] = f"❌ JPX自動取得中にエラー: {e}"
 
-    # ────── 2. ETF構成銘柄および手動セクターのマージ処理 ──────
     master_values = ws_master.get_all_values()
     if not master_values or len(master_values) < 2:
         return {"info": "etf_master シートが空のため、セクター自動同期はスキップされました。"}

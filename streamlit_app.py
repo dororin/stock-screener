@@ -22,16 +22,15 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- 各画面（st.Page）の定義 ---
-# views/ ディレクトリ配下に作成される個別のファイルを読み込みます [1]
 screening_page = st.Page("views/screening.py", title="スクリーニング", icon="🔍", default=True)
+holdings_page = st.Page("views/holdings.py", title="所持中株", icon="💼")  # 💡 保有株画面を追加
 market_page = st.Page("views/market_info.py", title="マーケット情報", icon="📈")
 sector_page = st.Page("views/sector_rotation.py", title="セクターローテーション", icon="🔄")
 maintenance_page = st.Page("views/maintenance.py", title="データ管理・保守", icon="🗄️")
 
 # --- ナビゲーションの構成 ---
-# 左サイドバーのメニュー構造を整理して配置します [1]
 pg = st.navigation({
-    "分析機能": [screening_page, market_page, sector_page],
+    "分析機能": [screening_page, holdings_page, market_page, sector_page],
     "管理": [maintenance_page]
 })
 

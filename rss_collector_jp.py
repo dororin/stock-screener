@@ -1,7 +1,10 @@
+# rss_collector_jp.py
+
 import os
 import sys
 import time
 import gc
+import argparse
 import traceback
 from datetime import datetime
 import pandas as pd
@@ -29,13 +32,14 @@ from data_access.sheets_api import (
     get_sector_spreadsheet,
     load_extra_tickers_from_sheets,
     load_sector_master_from_sheets,
+    load_holdings_from_sheets,
+    save_holdings_to_sheets,
     upload_sync_log_to_drive
 )
 
 # ─── データ収集の設定パラメータ ───
 TIMEFRAMES = ["1d", "60m", "5m", "1m"]
 
-# 楽天RSSの取得制限本数（初回ダウンロード時のフォールバック用物理最大値）
 DEFAULT_BARS_LIMIT = {
     "1d": 2500,       # 最大10年
     "60m": 2900,      # 最大2年
@@ -43,7 +47,6 @@ DEFAULT_BARS_LIMIT = {
     "1m": 2300        # 最大9日間
 }
 
-# 楽天RSSのタイムフレーム指定コードへのマッピング
 RSS_INTERVAL_MAP = {
     "1d": "D",
     "60m": "60M",
@@ -62,8 +65,6 @@ def execute_com_safely(func, *args, max_retries=5, delay=1.0):
         except pywintypes.com_error as e:
             last_ex = e
             hresult = e.hresult
-            # -2147418111: RPC_E_CALL_REJECTED (呼び出し先が拒否)
-            # -2147352567: DISP_E_EXCEPTION (内部例外 / ビジー)
             if hresult in [-2147418111, -2147352567]:
                 print(f"    ⚠️ [COMビジー検出] リトライ #{attempt}/{max_retries}. {delay}秒待機後に再試行します。")
                 time.sleep(delay)
@@ -89,21 +90,8 @@ def wait_for_excel_ready(excel, timeout=5.0):
     return False
 
 
-def get_column_letter(col_idx: int) -> str:
-    """列インデックス（1, 11, 21...）をExcelの列文字（A, K, U...）に変換します。"""
-    temp = col_idx
-    letter = ""
-    while temp > 0:
-        modulo = (temp - 1) % 26
-        letter = chr(65 + modulo) + letter
-        temp = (temp - modulo) // 26
-    return letter
-
-
 def find_last_row_by_reading(ws, col_idx: int, max_search_row: int) -> int:
-    """指定列のデータをメモリに一括で読み込み、Python側で有効な最下部行を判定します。
-    ExcelのEnd属性に起因するCOMバインディングエラーを安全に回避します。
-    """
+    """指定列のデータをメモリに一括で読み込み、有効な最下部行を判定します。"""
     try:
         def read_col():
             return ws.Range(ws.Cells(1, col_idx), ws.Cells(max_search_row, col_idx)).Value
@@ -111,12 +99,10 @@ def find_last_row_by_reading(ws, col_idx: int, max_search_row: int) -> int:
         if not vals or not isinstance(vals, tuple):
             return 1
         
-        # 下から遡って有効な値（Noneや空文字、Excelのエラー値等以外）を探す
         for r_idx in range(len(vals) - 1, -1, -1):
             val = vals[r_idx][0]
             if val is not None:
                 val_str = str(val).strip()
-                # 空文字やExcelセルエラーコード（-214... または #）を除外
                 if val_str != "" and not val_str.startswith("-214") and not val_str.startswith("#"):
                     return r_idx + 1
     except Exception:
@@ -153,6 +139,15 @@ def load_all_collection_tickers_from_sheets() -> list:
     except Exception as e:
         print(f"  ⚠️ topix500シートの読み込みスキップ: {e}")
 
+    # 💡 保有銘柄シート（my_holdings）の銘柄コードも監視対象へ合流（チャート確実描画用）
+    try:
+        holdings_df = load_holdings_from_sheets()
+        if not holdings_df.empty and "銘柄コード" in holdings_df.columns:
+            for t in holdings_df["銘柄コード"].dropna():
+                tickers.add(str(t).strip())
+    except Exception as e:
+        print(f"  ⚠️ my_holdingsシートの読み込みスキップ: {e}")
+
     cleaned_list = sorted(list(tickers))
     print(f"  ✅ 監視ティッカーの統合マージ完了。総計: {len(cleaned_list)} 銘柄")
     return cleaned_list
@@ -162,20 +157,17 @@ def load_all_collection_tickers_from_sheets() -> list:
 def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: dict, tickers: list, excel, wb, log_func) -> int:
     default_limit = DEFAULT_BARS_LIMIT[interval]
     
-    # 台帳に過去の同期履歴が全くない（初回ダウンロード時）場合はフォールバック
     if not last_updates_map:
         log_func(f"  💡 過去の同期履歴がないため、デフォルト最大値（{default_limit}本）を要求します。")
         return default_limit
 
     try:
         valid_dates = []
-        active_tickers = set(tickers)  # 現在のアクティブな銘柄リストをセット化
+        active_tickers = set(tickers)
         
         for t, d_str in last_updates_map.items():
-            # リストから削除されたゴースト銘柄は無視する
             if t not in active_tickers:
                 continue
-                
             try:
                 valid_dates.append(pd.to_datetime(d_str))
             except Exception:
@@ -185,11 +177,9 @@ def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: d
             log_func(f"  💡 有効な更新日時が存在しないため、デフォルト最大値（{default_limit}本）を要求します。")
             return default_limit
             
-        # 安全側に倒すため、全銘柄の中で最も古い最終更新日時を基準点とする
         last_dt = min(valid_dates)
         log_func(f"  🔎 基準とする前回同期日時: {last_dt.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # 実測テスト用の一時シートを作成
         def add_sheet():
             return wb.Sheets.Add()
         ws = execute_com_safely(add_sheet)
@@ -197,7 +187,6 @@ def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: d
         rss_code = RSS_INTERVAL_MAP[interval]
         formula = f'=RssChart(,"1306","{rss_code}",{default_limit})'
         
-        # セルへの数式書き込みと強制計算
         def write_test_formula():
             ws.Cells(1, 1).Value = formula
         execute_com_safely(write_test_formula)
@@ -206,7 +195,6 @@ def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: d
             excel.Calculate()
         execute_com_safely(force_calculate)
         
-        # 展開監視ループ（最大30秒）
         start_time = time.time()
         all_loaded = False
         last_row_limit = 1
@@ -216,9 +204,8 @@ def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: d
             
             if last_row_limit >= 3:
                 try:
-                    # 最初の確定データ行に正しい数値が展開されたか確認
                     val_date = ws.Cells(3, 4).Value
-                    val_close = ws.Cells(3, 9).Value # I列終値
+                    val_close = ws.Cells(3, 9).Value
                     if val_date is not None and val_close is not None:
                         all_loaded = True
                         break
@@ -236,7 +223,6 @@ def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: d
                 pass
             return default_limit
             
-        # 展開された日付データを一括抽出
         try:
             def read_dates():
                 return ws.Range(ws.Cells(1, 4), ws.Cells(last_row_limit, 4)).Value
@@ -252,7 +238,6 @@ def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: d
                 pass
             return default_limit
             
-        # 一時シートの安全削除
         try:
             def delete_sheet():
                 ws.Delete()
@@ -262,7 +247,6 @@ def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: d
         except Exception:
             pass
 
-        # 基準日時（last_dt）より新しい実際の確定バー数をカウント
         actual_needed_bars = 0
         for dt_val in dates_list:
             try:
@@ -274,7 +258,6 @@ def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: d
                 
         log_func(f"  📈 前回同期以降に発生した実際のバー数（実測）: {actual_needed_bars} 本")
         
-        # 1営業日分の最大確定本数（上書きマージン）の決定
         overlap_margins = {
             "1d": 1,
             "60m": 5,
@@ -283,7 +266,6 @@ def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: d
         }
         margin = overlap_margins.get(interval, 5)
         
-        # 安全バッファ補正（1.2倍）
         limit_bars = int((actual_needed_bars + margin) * 1.2)
         limit_bars = min(max(limit_bars, 10), 3000)
         
@@ -296,17 +278,13 @@ def measure_actual_needed_bars_with_benchmark(interval: str, last_updates_map: d
 
 
 def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, log_func, excel, wb) -> pd.DataFrame:
-    """
-    1バッチ内の数式を一括で書き込み、Ready監視を行いながら、
-    安全にデータ吸い出しを行います。エラーが発生した場合は一括ロールバックのため例外を投げます。
-    """
+    """1バッチ内の数式を一括で書き込み、Ready監視を行いながら安全にデータ吸い出しを行います。"""
     rss_code = RSS_INTERVAL_MAP[interval]
     batch_size = 50
-    timeout = 120.0  # 通信ラグ対策としてタイムアウトを120秒（2分）に延長
+    timeout = 120.0
     
     log_func(f"📡 [RSS] 【{interval}】のデータ取得を開始します... (要求バー数: {limit_bars}本 / バッチサイズ: {batch_size})")
 
-    # 数値に変換できるか検証するヘルパー
     def is_valid_numeric(val):
         if val is None:
             return False
@@ -330,46 +308,35 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
 
         ws = None
         try:
-            # バッチ専用のテンポラリワークシートを安全に追加
             def add_sheet():
                 return wb.Sheets.Add()
             ws = execute_com_safely(add_sheet)
             
-            # ① Python上で数式行の2次元配列をビルド（1パス化）
             N = len(chunk)
             formulas_row = [["" for _ in range(N * col_step)]]
             for i, ticker in enumerate(chunk):
                 col_idx = i * col_step
                 formulas_row[0][col_idx] = f'=RssChart(,"{ticker}","{rss_code}",{limit_bars})'
                 
-            # ② COM通信 1パスで数式を一斉書き込み
             def write_formulas():
                 ws.Range(ws.Cells(1, 1), ws.Cells(1, N * col_step)).Value = formulas_row
             execute_com_safely(write_formulas)
 
-            # Excelの強制再計算を実行
             def force_calculate():
                 excel.Calculate()
             execute_com_safely(force_calculate)
 
-            # ③ 配列数式の展開状況を監視（COM防護・5.0秒スリープ）
             start_time = time.time()
-            loop_cnt = 0
             while True:
-                loop_cnt += 1
                 all_loaded = True
                 elapsed = time.time() - start_time
-
-                # 代表日付列（D列：4列目）の最終行判定
                 last_row_limit = find_last_row_by_reading(ws, 4, limit_bars + 50)
-
                 unloaded_tickers = []
 
                 if last_row_limit < 3:
                     all_loaded = False
                     unloaded_tickers = list(chunk)
                 else:
-                    # バッチ内の全領域を1回で一括取得
                     def get_range_values():
                         return ws.Range(ws.Cells(1, 1), ws.Cells(last_row_limit, N * col_step)).Value
                     all_matrix = execute_com_safely(get_range_values)
@@ -378,16 +345,13 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
                         all_loaded = False
                         unloaded_tickers = list(chunk)
                     else:
-                        # メモリ上の2次元タプルを走査して数値検証
                         for i, ticker in enumerate(chunk):
                             col_idx = i * col_step
-                            open_idx = col_idx + 5   # F列 (始値)
-                            close_idx = col_idx + 8  # I列 (終値)
-                            
+                            open_idx = col_idx + 5
+                            close_idx = col_idx + 8
                             val_open = None
                             val_close = None
                             
-                            # 下から上へ逆順ループ
                             for r_idx in range(len(all_matrix) - 1, 1, -1):
                                 row_data = all_matrix[r_idx]
                                 temp_open = row_data[open_idx] if open_idx < len(row_data) else None
@@ -406,12 +370,10 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
                     log_func(f"    🎉 [完了] バッチ {batch_num} 内の全銘柄のロード完了が確認されました。")
                     break
                 
-                # 診断用：ロードが完了していない特定の銘柄リストを出力
                 if unloaded_tickers:
                     log_func(f"      ⏳ ロード未完了（待機中）: 残り {len(unloaded_tickers)} / {len(chunk)} 銘柄 {unloaded_tickers[:10]}...")
 
                 if elapsed > timeout:
-                    # タイムアウトした場合は一括ロールバックのため例外をスロー
                     raise TimeoutError(
                         f"バッチ {batch_num} のデータ展開が制限時間（{timeout}秒）内に完了しませんでした。\n"
                         f"未展開またはエラーの可能性がある銘柄リスト: {unloaded_tickers}"
@@ -419,12 +381,9 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
                     
                 time.sleep(5.0)
 
-            # ④ データのメモリ一括吸い上げ
             log_func("    📥 メモリ吸い上げ処理を開始します...")
             for i, ticker in enumerate(chunk):
                 col_idx = i * col_step + 1
-                
-                # 各ティッカーの日付列（col_idx + 3）の最終行判定
                 last_row = find_last_row_by_reading(ws, col_idx + 3, limit_bars + 50)
                 
                 if last_row < 2:
@@ -459,7 +418,6 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
                         for col in ["open", "high", "low", "close", "volume"]:
                             df_extracted[col] = pd.to_numeric(df_extracted[col], errors="coerce")
                             
-                        before_cnt = len(df_extracted)
                         df_extracted = df_extracted.dropna(subset=["date", "close"])
                         after_cnt = len(df_extracted)
                         
@@ -477,7 +435,6 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
             raise e_batch
             
         finally:
-            # ⑤ 安全なトピック解除 ＆ ワークシートの即時物理削除（Ready同期待き付き）
             if ws is not None:
                 try:
                     log_func("    🧹 楽天RSSのバックグラウンド通信を安全に登録解除中...")
@@ -495,11 +452,10 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
                     execute_com_safely(delete_sheet)
                     log_func("    🧹 バッチ用のテンポラリワークシートを物理削除しました。")
                     
-                    # Excelの非同期メモリ整理完了を待機
                     wait_for_excel_ready(excel)
                     time.sleep(1.0)
                 except Exception as e_close:
-                    log_func(f"    ⚠️ シート削除時にエラー検知（無視して継続します）: {e_close}")
+                    log_func(f"    ⚠️ シート削除時にエラー検知: {e_close}")
             
             ws = None
             gc.collect()
@@ -511,9 +467,174 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
     return combined_df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 
+# =====================================================================
+# 💼 【新規実装】保有銘柄（=RssPositionList()）の一括同期ロジック
+# =====================================================================
+def collect_and_save_holdings(excel=None, log_func=None) -> bool:
+    """
+    楽天RSSの公式保有銘柄展開関数 =RssPositionList() を利用して
+    Excel上にポジション一覧を展開させ、Google Sheets (my_holdings) に保存します。
+    """
+    def _log(msg):
+        if log_func:
+            log_func(msg)
+        else:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [HOLDINGS] {msg}")
+
+    _log("💼 楽天RSSから保有現物証券（PositionList）の取得を開始します...")
+    
+    need_close_excel = False
+    wb = None
+    ws = None
+
+    try:
+        if excel is None:
+            need_close_excel = True
+            excel = win32com.client.GetActiveObject("Excel.Application")
+            excel.DisplayAlerts = False
+
+        def create_wb():
+            return excel.Workbooks.Add()
+        wb = execute_com_safely(create_wb)
+
+        def add_sheet():
+            return wb.Sheets.Add()
+        ws = execute_com_safely(add_sheet)
+
+        _log("  📡 セル A1 に =RssPositionList() を書き込み中...")
+        def write_formula():
+            ws.Cells(1, 1).Value = "=RssPositionList()"
+        execute_com_safely(write_formula)
+
+        def force_calculate():
+            excel.Calculate()
+        execute_com_safely(force_calculate)
+
+        # 展開待機（最大15秒）
+        start_time = time.time()
+        has_data = False
+        while time.time() - start_time < 15.0:
+            time.sleep(1.0)
+            try:
+                val_header = ws.Cells(1, 1).Value
+                val_code = ws.Cells(2, 1).Value
+                if val_header is not None and val_code is not None:
+                    code_str = str(val_code).strip()
+                    if code_str != "" and not code_str.startswith("-214") and not code_str.startswith("#"):
+                        has_data = True
+                        break
+            except Exception:
+                pass
+
+        used_range = ws.UsedRange
+        max_row = used_range.Rows.Count
+        max_col = used_range.Columns.Count
+
+        if max_row < 2 or not has_data:
+            _log("  ℹ️ 現在、楽天証券口座内に保有している現物証券データはありません。")
+            return True
+
+        _log(f"  📊 展開を検知しました（行数: {max_row}, 列数: {max_col}）。メモリ吸い上げ中...")
+        def read_matrix():
+            return ws.Range(ws.Cells(1, 1), ws.Cells(max_row, max_col)).Value
+        matrix = execute_com_safely(read_matrix)
+
+        if not matrix or not isinstance(matrix, tuple):
+            _log("  ⚠️ 吸い上げデータが空でした。")
+            return False
+
+        headers = [str(c).strip() for c in matrix[0] if c is not None]
+        data_rows = matrix[1:]
+
+        df_raw = pd.DataFrame(list(data_rows), columns=headers[:len(data_rows[0])])
+        clean_rows = []
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for _, r in df_raw.iterrows():
+            code_raw = str(r.iloc[0]).strip().split(".")[0].upper()
+            if not code_raw or not code_raw.isalnum() or len(code_raw) > 5:
+                continue
+
+            name_val = str(r.iloc[1]).strip() if len(r) > 1 else ""
+            account_val = str(r.iloc[2]).strip() if len(r) > 2 else "特定"
+            
+            qty_val = pd.to_numeric(str(r.iloc[3]).replace(",", "").strip(), errors="coerce") if len(r) > 3 else 0
+            buy_price_val = pd.to_numeric(str(r.iloc[5]).replace(",", "").strip(), errors="coerce") if len(r) > 5 else 0.0
+            cur_price_val = pd.to_numeric(str(r.iloc[6]).replace(",", "").strip(), errors="coerce") if len(r) > 6 else 0.0
+            eval_val = pd.to_numeric(str(r.iloc[9]).replace(",", "").strip(), errors="coerce") if len(r) > 9 else 0.0
+            profit_val = pd.to_numeric(str(r.iloc[10]).replace(",", "").strip(), errors="coerce") if len(r) > 10 else 0.0
+            profit_pct = pd.to_numeric(str(r.iloc[11]).replace(",", "").replace("%", "").strip(), errors="coerce") if len(r) > 11 else 0.0
+
+            if pd.isna(qty_val) or qty_val <= 0:
+                continue
+
+            clean_rows.append({
+                "銘柄コード": code_raw,
+                "銘柄名": name_val,
+                "口座区分": account_val,
+                "保有数量": int(qty_val),
+                "取得単価": float(buy_price_val) if pd.notna(buy_price_val) else 0.0,
+                "現在値": float(cur_price_val) if pd.notna(cur_price_val) else 0.0,
+                "時価評価額": float(eval_val) if pd.notna(eval_val) else 0.0,
+                "評価損益額": float(profit_val) if pd.notna(profit_val) else 0.0,
+                "評価損益率": float(profit_pct) if pd.notna(profit_pct) else 0.0,
+                "更新日時": now_str
+            })
+
+        df_holdings = pd.DataFrame(clean_rows)
+        if df_holdings.empty:
+            _log("  ℹ️ 有効な保有株データは0件でした。")
+            return True
+
+        _log(f"  ✅ 抽出成功: 計 {len(df_holdings)} ポジション。Google Sheetsへ保存中...")
+        saved = save_holdings_to_sheets(df_holdings)
+        if saved:
+            _log("  🎉 保有株データのスプレッドシート保存が完了しました！")
+            return True
+        else:
+            _log("  ❌ スプレッドシート保存に失敗しました。")
+            return False
+
+    except Exception as e:
+        _log(f"  ❌ 保有株同期中にエラーが発生しました: {e}")
+        return False
+
+    finally:
+        if ws is not None:
+            try:
+                def clear_contents():
+                    ws.Cells.ClearContents()
+                execute_com_safely(clear_contents)
+            except Exception:
+                pass
+        if wb is not None:
+            try:
+                def close_wb():
+                    wb.Close(SaveChanges=False)
+                execute_com_safely(close_wb)
+            except Exception:
+                pass
+        wb = None
+        if need_close_excel:
+            excel = None
+        gc.collect()
+
+
 def main():
+    # 💡 コマンドライン引数の判定 (--holdings-only / -H)
+    parser = argparse.ArgumentParser(description="楽天RSS 日本株データ同期エンジン")
+    parser.add_argument(
+        "--holdings-only", "-H", 
+        action="store_true", 
+        help="株価収集をスキップし、保有銘柄（my_holdings）のみを高速取得・同期します"
+    )
+    args = parser.parse_args()
+
     print("=====================================================================")
-    print("🚀 楽天RSS・日本株 差分専用データ同期エンジン 起動")
+    if args.holdings_only:
+        print("💼 楽天RSS 保有株専用同期モード 起動")
+    else:
+        print("🚀 楽天RSS・日本株 全体同期エンジン 起動（株価収集 ＋ 保有株自動同期）")
     print(f"🕒 実行開始日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=====================================================================")
     
@@ -523,62 +644,66 @@ def main():
         print(line)
         logs_accumulator.append(line)
 
+    # ── 【個別モード】保有株のみ実行 ──
+    if args.holdings_only:
+        try:
+            excel = None
+            try:
+                excel = win32com.client.GetActiveObject("Excel.Application")
+                excel.DisplayAlerts = False
+            except Exception:
+                excel = win32com.client.GetObject(Class="Excel.Application")
+                excel.DisplayAlerts = False
+
+            success = collect_and_save_holdings(excel=excel, log_func=log)
+            if success:
+                log("🎉 保有株の個別同期が完了しました。")
+            else:
+                log("❌ 保有株の同期に失敗しました。")
+        except Exception as ex:
+            log(f"🚨 エラー: {ex}")
+            sys.exit(1)
+        return
+
+    # ── 【通常モード】株価データ収集 ＋ 最後に保有株収集 ──
     try:
         tickers = load_all_collection_tickers_from_sheets()
         if not tickers:
             log("❌ 収集対象の銘柄が1件も存在しないため、終了します。")
             return
 
+        excel = None
+        wb = None
+        try:
+            excel = win32com.client.GetActiveObject("Excel.Application")
+            excel.DisplayAlerts = False
+        except Exception:
+            try:
+                excel = win32com.client.GetObject(Class="Excel.Application")
+                excel.DisplayAlerts = False
+            except Exception as e:
+                raise RuntimeError("ExcelのCOM接続に失敗しました。MarketSpeed II および Excel を起動して接続をONにしてください。") from e
+
+        try:
+            excel.Calculation = -4105
+        except Exception:
+            pass
+
+        def create_wb():
+            return excel.Workbooks.Add()
+        wb = execute_com_safely(create_wb)
+
+        # 1. 各時間足の株価データを順次収集
         for interval in TIMEFRAMES:
             log(f"⏱️ 【{interval}】のデータ収集を開始します...")
             
-            # 1. 独立台帳（Ledger）をロード
             ledger = load_price_db_ledger(interval, is_jp=True, is_raw=False)
             last_updates_map = ledger.get("last_updates_map", {}) if ledger else {}
 
-            # 2. 起動済みExcelへの接続
-            excel = None
-            wb = None
-            try:
-                excel = win32com.client.GetActiveObject("Excel.Application")
-                excel.DisplayAlerts = False
-            except Exception:
-                try:
-                    excel = win32com.client.GetObject(Class="Excel.Application")
-                    excel.DisplayAlerts = False
-                except Exception as e:
-                    raise RuntimeError("ExcelのCOM接続に失敗しました。MarketSpeed2およびExcelを手動で立ち上げて接続をONにしてください。") from e
-
-            # Excel自動計算設定
-            try:
-                excel.Calculation = -4105  # xlCalculationAutomatic
-            except Exception:
-                pass
-
-            # 一時ブックの作成
-            def create_wb():
-                return excel.Workbooks.Add()
-            wb = execute_com_safely(create_wb)
-
-            # 3. 基準銘柄(1306)による実測型の動的バー数算出 (tickersを渡してフィルタリングさせる)
             log("📡 基準銘柄(1306)を用いた動的な必要バー数の算出を開始します...")
             limit_bars = measure_actual_needed_bars_with_benchmark(interval, last_updates_map, tickers, excel, wb, log)
 
-            # 4. 楽天RSSから一括ダウンロード（途中でエラーが出た場合は上位に例外を投げる）
             df_new = collect_data_via_excel_rss(tickers, interval, limit_bars, log, excel, wb)
-            
-            # セッション終了後に一時ブックをクローズ
-            if wb is not None:
-                try:
-                    def close_wb():
-                        wb.Close(SaveChanges=False)
-                    execute_com_safely(close_wb)
-                except Exception:
-                    pass
-
-            wb = None
-            excel = None
-            gc.collect()
 
             if df_new.empty:
                 log(f"  📥 【{interval}】 新規取得・差分データはありませんでした。")
@@ -586,7 +711,6 @@ def main():
                 
             log(f"  📥 【{interval}】 ダウンロード成功。新規差分データ: {len(df_new):,} 行")
 
-            # 5. 全件が完全に成功した段階でのみ一括書き込み（途中経過の保存はしない）
             log(f"  🛠️ 【{interval}】 差分ParquetファイルをGoogleドライブへ保存中...")
             success, msg = save_price_db(df_new, interval, is_jp=True, is_raw=False)
             if success:
@@ -594,33 +718,43 @@ def main():
             else:
                 raise IOError(f"Googleドライブへの一括保存に失敗しました: {msg}")
 
-        # 全て正常終了時、SUCCESSログを転送
-        log("📤 すべての時間足の処理が正常終了しました。同期完了ログをGoogleドライブへ同期アップロード中...")
+        # 2. 一時ブックのクローズ
+        if wb is not None:
+            try:
+                def close_wb():
+                    wb.Close(SaveChanges=False)
+                execute_com_safely(close_wb)
+            except Exception:
+                pass
+        wb = None
+
+        # 3. 💡 株価収集完了後、既存のExcel接続を再利用して保有株を一括同期！
+        log("\n💼 続いて、保有銘柄（my_holdings）の自動同期を実行します...")
+        collect_and_save_holdings(excel=excel, log_func=log)
+
+        excel = None
+        gc.collect()
+
+        # 4. 全て正常終了時、SUCCESSログを転送
+        log("📤 すべての処理が正常終了しました。同期完了ログをGoogleドライブへアップロード中...")
         log_filename = upload_sync_log_to_drive(logs_accumulator, is_jp=True, prefix="jp_rss_diff_sync_SUCCESS")
         if log_filename:
             print(f"  ✅ 正常完了ログファイル '{log_filename}' をGoogleドライブに正常転送しました。")
 
     except Exception as ex:
-        # 例外トラップ、詳細なエラー情報とスタックトレースの転送
         log("\n🚨 【致命的エラー】同期処理中に回復不能なエラーを検知したため、処理を強制終了しました。")
         log(f"  💥 エラー内容: {ex}")
-        log("  📋 発生時の詳細なスタックトレース（Traceback）を記録します:")
-        
         tb_str = traceback.format_exc()
         for line in tb_str.splitlines():
             log(f"    {line}")
             
-        log("\n📤 異常終了に伴い、エラー詳細ログファイルをGoogleドライブへ強制アップロード中...")
         try:
             log_filename = upload_sync_log_to_drive(logs_accumulator, is_jp=True, prefix="jp_rss_diff_sync_ERROR")
             if log_filename:
                 print(f"  ✅ エラー詳細ログファイル '{log_filename}' をGoogleドライブに強制転送完了しました。")
-        except Exception as e_log:
-            print(f"  ⚠️ クラウドへのエラーログ強制アップロード中に例外を検知しました: {e_log}")
+        except Exception:
+            pass
             
-        print("\n=====================================================================")
-        print("❌ 同期処理が異常終了しました。Googleドライブのエラーログを確認してください。")
-        print("=====================================================================")
         sys.exit(1)
 
 
