@@ -37,7 +37,7 @@ def render_holdings_controls(df_holdings: pd.DataFrame):
                 updated_at = df_holdings["更新日時"].dropna().iloc[0] if "更新日時" in df_holdings.columns and not df_holdings["更新日時"].empty else "-"
                 m4.metric("最終同期日時", str(updated_at)[:16])
             else:
-                st.info("保有証券データが登録されていません。ローカル環境で `python rss_collector_jp.py --holdings-only` を実行して同期してください。")
+                st.info("保有証券データが登録されていません。ローカル環境で `python sync_holdings_jp.py` を実行して同期してください。")
 
         with col_c2:
             st.markdown("**🔄 画面更新**")

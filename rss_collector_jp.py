@@ -4,7 +4,6 @@ import os
 import sys
 import time
 import gc
-import argparse
 import traceback
 from datetime import datetime
 import pandas as pd
@@ -33,9 +32,10 @@ from data_access.sheets_api import (
     load_extra_tickers_from_sheets,
     load_sector_master_from_sheets,
     load_holdings_from_sheets,
-    save_holdings_to_sheets,
     upload_sync_log_to_drive
 )
+# 💡 分離した保有株収集コア関数をインポート
+from sync_holdings_jp import collect_and_save_holdings
 
 # ─── データ収集の設定パラメータ ───
 TIMEFRAMES = ["1d", "60m", "5m", "1m"]
@@ -139,7 +139,7 @@ def load_all_collection_tickers_from_sheets() -> list:
     except Exception as e:
         print(f"  ⚠️ topix500シートの読み込みスキップ: {e}")
 
-    # 💡 保有銘柄シート（my_holdings）の銘柄コードも監視対象へ合流（チャート確実描画用）
+    # 保有銘柄シート（my_holdings）の銘柄コードも監視対象へ合流（チャート確実描画用）
     try:
         holdings_df = load_holdings_from_sheets()
         if not holdings_df.empty and "銘柄コード" in holdings_df.columns:
@@ -467,174 +467,9 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
     return combined_df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 
-# =====================================================================
-# 💼 【新規実装】保有銘柄（=RssPositionList()）の一括同期ロジック
-# =====================================================================
-def collect_and_save_holdings(excel=None, log_func=None) -> bool:
-    """
-    楽天RSSの公式保有銘柄展開関数 =RssPositionList() を利用して
-    Excel上にポジション一覧を展開させ、Google Sheets (my_holdings) に保存します。
-    """
-    def _log(msg):
-        if log_func:
-            log_func(msg)
-        else:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [HOLDINGS] {msg}")
-
-    _log("💼 楽天RSSから保有現物証券（PositionList）の取得を開始します...")
-    
-    need_close_excel = False
-    wb = None
-    ws = None
-
-    try:
-        if excel is None:
-            need_close_excel = True
-            excel = win32com.client.GetActiveObject("Excel.Application")
-            excel.DisplayAlerts = False
-
-        def create_wb():
-            return excel.Workbooks.Add()
-        wb = execute_com_safely(create_wb)
-
-        def add_sheet():
-            return wb.Sheets.Add()
-        ws = execute_com_safely(add_sheet)
-
-        _log("  📡 セル A1 に =RssPositionList() を書き込み中...")
-        def write_formula():
-            ws.Cells(1, 1).Value = "=RssPositionList()"
-        execute_com_safely(write_formula)
-
-        def force_calculate():
-            excel.Calculate()
-        execute_com_safely(force_calculate)
-
-        # 展開待機（最大15秒）
-        start_time = time.time()
-        has_data = False
-        while time.time() - start_time < 15.0:
-            time.sleep(1.0)
-            try:
-                val_header = ws.Cells(1, 1).Value
-                val_code = ws.Cells(2, 1).Value
-                if val_header is not None and val_code is not None:
-                    code_str = str(val_code).strip()
-                    if code_str != "" and not code_str.startswith("-214") and not code_str.startswith("#"):
-                        has_data = True
-                        break
-            except Exception:
-                pass
-
-        used_range = ws.UsedRange
-        max_row = used_range.Rows.Count
-        max_col = used_range.Columns.Count
-
-        if max_row < 2 or not has_data:
-            _log("  ℹ️ 現在、楽天証券口座内に保有している現物証券データはありません。")
-            return True
-
-        _log(f"  📊 展開を検知しました（行数: {max_row}, 列数: {max_col}）。メモリ吸い上げ中...")
-        def read_matrix():
-            return ws.Range(ws.Cells(1, 1), ws.Cells(max_row, max_col)).Value
-        matrix = execute_com_safely(read_matrix)
-
-        if not matrix or not isinstance(matrix, tuple):
-            _log("  ⚠️ 吸い上げデータが空でした。")
-            return False
-
-        headers = [str(c).strip() for c in matrix[0] if c is not None]
-        data_rows = matrix[1:]
-
-        df_raw = pd.DataFrame(list(data_rows), columns=headers[:len(data_rows[0])])
-        clean_rows = []
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        for _, r in df_raw.iterrows():
-            code_raw = str(r.iloc[0]).strip().split(".")[0].upper()
-            if not code_raw or not code_raw.isalnum() or len(code_raw) > 5:
-                continue
-
-            name_val = str(r.iloc[1]).strip() if len(r) > 1 else ""
-            account_val = str(r.iloc[2]).strip() if len(r) > 2 else "特定"
-            
-            qty_val = pd.to_numeric(str(r.iloc[3]).replace(",", "").strip(), errors="coerce") if len(r) > 3 else 0
-            buy_price_val = pd.to_numeric(str(r.iloc[5]).replace(",", "").strip(), errors="coerce") if len(r) > 5 else 0.0
-            cur_price_val = pd.to_numeric(str(r.iloc[6]).replace(",", "").strip(), errors="coerce") if len(r) > 6 else 0.0
-            eval_val = pd.to_numeric(str(r.iloc[9]).replace(",", "").strip(), errors="coerce") if len(r) > 9 else 0.0
-            profit_val = pd.to_numeric(str(r.iloc[10]).replace(",", "").strip(), errors="coerce") if len(r) > 10 else 0.0
-            profit_pct = pd.to_numeric(str(r.iloc[11]).replace(",", "").replace("%", "").strip(), errors="coerce") if len(r) > 11 else 0.0
-
-            if pd.isna(qty_val) or qty_val <= 0:
-                continue
-
-            clean_rows.append({
-                "銘柄コード": code_raw,
-                "銘柄名": name_val,
-                "口座区分": account_val,
-                "保有数量": int(qty_val),
-                "取得単価": float(buy_price_val) if pd.notna(buy_price_val) else 0.0,
-                "現在値": float(cur_price_val) if pd.notna(cur_price_val) else 0.0,
-                "時価評価額": float(eval_val) if pd.notna(eval_val) else 0.0,
-                "評価損益額": float(profit_val) if pd.notna(profit_val) else 0.0,
-                "評価損益率": float(profit_pct) if pd.notna(profit_pct) else 0.0,
-                "更新日時": now_str
-            })
-
-        df_holdings = pd.DataFrame(clean_rows)
-        if df_holdings.empty:
-            _log("  ℹ️ 有効な保有株データは0件でした。")
-            return True
-
-        _log(f"  ✅ 抽出成功: 計 {len(df_holdings)} ポジション。Google Sheetsへ保存中...")
-        saved = save_holdings_to_sheets(df_holdings)
-        if saved:
-            _log("  🎉 保有株データのスプレッドシート保存が完了しました！")
-            return True
-        else:
-            _log("  ❌ スプレッドシート保存に失敗しました。")
-            return False
-
-    except Exception as e:
-        _log(f"  ❌ 保有株同期中にエラーが発生しました: {e}")
-        return False
-
-    finally:
-        if ws is not None:
-            try:
-                def clear_contents():
-                    ws.Cells.ClearContents()
-                execute_com_safely(clear_contents)
-            except Exception:
-                pass
-        if wb is not None:
-            try:
-                def close_wb():
-                    wb.Close(SaveChanges=False)
-                execute_com_safely(close_wb)
-            except Exception:
-                pass
-        wb = None
-        if need_close_excel:
-            excel = None
-        gc.collect()
-
-
 def main():
-    # 💡 コマンドライン引数の判定 (--holdings-only / -H)
-    parser = argparse.ArgumentParser(description="楽天RSS 日本株データ同期エンジン")
-    parser.add_argument(
-        "--holdings-only", "-H", 
-        action="store_true", 
-        help="株価収集をスキップし、保有銘柄（my_holdings）のみを高速取得・同期します"
-    )
-    args = parser.parse_args()
-
     print("=====================================================================")
-    if args.holdings_only:
-        print("💼 楽天RSS 保有株専用同期モード 起動")
-    else:
-        print("🚀 楽天RSS・日本株 全体同期エンジン 起動（株価収集 ＋ 保有株自動同期）")
+    print("🚀 楽天RSS・日本株 全体同期エンジン 起動（株価収集 ＋ 保有株自動同期）")
     print(f"🕒 実行開始日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=====================================================================")
     
@@ -644,28 +479,6 @@ def main():
         print(line)
         logs_accumulator.append(line)
 
-    # ── 【個別モード】保有株のみ実行 ──
-    if args.holdings_only:
-        try:
-            excel = None
-            try:
-                excel = win32com.client.GetActiveObject("Excel.Application")
-                excel.DisplayAlerts = False
-            except Exception:
-                excel = win32com.client.GetObject(Class="Excel.Application")
-                excel.DisplayAlerts = False
-
-            success = collect_and_save_holdings(excel=excel, log_func=log)
-            if success:
-                log("🎉 保有株の個別同期が完了しました。")
-            else:
-                log("❌ 保有株の同期に失敗しました。")
-        except Exception as ex:
-            log(f"🚨 エラー: {ex}")
-            sys.exit(1)
-        return
-
-    # ── 【通常モード】株価データ収集 ＋ 最後に保有株収集 ──
     try:
         tickers = load_all_collection_tickers_from_sheets()
         if not tickers:
