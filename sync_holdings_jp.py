@@ -71,7 +71,6 @@ def collect_and_save_holdings(excel=None, log_func=None) -> bool:
     ws = None
 
     try:
-        # Excelインスタンスが渡されていない場合は自前で接続
         if excel is None:
             need_close_excel = True
             try:
@@ -101,19 +100,25 @@ def collect_and_save_holdings(excel=None, log_func=None) -> bool:
             excel.Calculate()
         execute_com_safely(force_calculate)
 
-        # 展開待機（最大15秒）
+        # 展開待機（最大20秒）
         start_time = time.time()
         has_data = False
-        while time.time() - start_time < 15.0:
+        while time.time() - start_time < 20.0:
             time.sleep(1.0)
             try:
                 val_header = ws.Cells(1, 1).Value
-                val_code = ws.Cells(2, 1).Value
-                if val_header is not None and val_code is not None:
-                    code_str = str(val_code).strip()
-                    if code_str != "" and not code_str.startswith("-214") and not code_str.startswith("#"):
-                        has_data = True
-                        break
+                val_c2 = ws.Cells(2, 1).Value
+                val_c3 = ws.Cells(3, 1).Value
+                for test_v in [val_c2, val_c3]:
+                    if test_v is not None:
+                        s = str(test_v).strip()
+                        # プレースホルダー（-------等）やエラーコード以外の有効値を検出
+                        if s != "" and not s.startswith("-214") and not s.startswith("#") and not set(s) <= {"-"}:
+                            has_data = True
+                            break
+                if has_data:
+                    time.sleep(0.5)  # 展開安定化のためわずかに待機
+                    break
             except Exception:
                 pass
 
@@ -134,41 +139,97 @@ def collect_and_save_holdings(excel=None, log_func=None) -> bool:
             _log("  ⚠️ 吸い上げデータが空でした。")
             return False
 
-        headers = [str(c).strip() for c in matrix[0] if c is not None]
-        data_rows = matrix[1:]
+        # 2次元タプルを行リストへ変換
+        all_rows = [list(r) for r in matrix if r is not None]
+        if not all_rows:
+            _log("  ⚠️ 行データが取得できませんでした。")
+            return False
 
-        df_raw = pd.DataFrame(list(data_rows), columns=headers[:len(data_rows[0])])
+        # 💡 ヘッダー行の自動判定とカラム位置のマッピング
+        header_row_idx = -1
+        col_indices = {}
+        for r_idx, r in enumerate(all_rows[:5]):
+            r_strs = [str(c).strip() for c in r if c is not None]
+            if any("コード" in s for s in r_strs) and any("数量" in s or "口座" in s or "名称" in s for s in r_strs):
+                header_row_idx = r_idx
+                for c_idx, c_val in enumerate(r):
+                    c_str = str(c_val).strip()
+                    if "コード" in c_str: col_indices["code"] = c_idx
+                    elif "名称" in c_str or "銘柄名" in c_str: col_indices["name"] = c_idx
+                    elif "口座" in c_str: col_indices["account"] = c_idx
+                    elif "保有数量" in c_str or "数量" in c_str: col_indices["qty"] = c_idx
+                    elif "取得" in c_str: col_indices["buy_price"] = c_idx
+                    elif "時価" in c_str and "評価" not in c_str: col_indices["cur_price"] = c_idx
+                    elif "時価評価額" in c_str or "評価額" in c_str: col_indices["eval_val"] = c_idx
+                    elif "評価損益額" in c_str: col_indices["profit_val"] = c_idx
+                    elif "評価損益率" in c_str: col_indices["profit_pct"] = c_idx
+                break
+
+        # ヘッダー行が見つからなかった場合のフォールバック（公式18列の既定順序）
+        c_code = col_indices.get("code", 0)
+        c_name = col_indices.get("name", 1)
+        c_account = col_indices.get("account", 2)
+        c_qty = col_indices.get("qty", 3)
+        c_buy_price = col_indices.get("buy_price", 5)
+        c_cur_price = col_indices.get("cur_price", 6)
+        c_eval_val = col_indices.get("eval_val", 9)
+        c_profit_val = col_indices.get("profit_val", 10)
+        c_profit_pct = col_indices.get("profit_pct", 11)
+
+        start_row = (header_row_idx + 1) if header_row_idx != -1 else 1
+
         clean_rows = []
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        for _, r in df_raw.iterrows():
-            code_raw = str(r.iloc[0]).strip().split(".")[0].upper()
-            if not code_raw or not code_raw.isalnum() or len(code_raw) > 5:
+        def to_num(val, default=0.0):
+            if val is None:
+                return default
+            s = str(val).replace(",", "").replace("%", "").replace("¥", "").strip()
+            try:
+                return float(s)
+            except ValueError:
+                return default
+
+        for r in all_rows[start_row:]:
+            if len(r) <= max(c_code, c_qty):
                 continue
 
-            name_val = str(r.iloc[1]).strip() if len(r) > 1 else ""
-            account_val = str(r.iloc[2]).strip() if len(r) > 2 else "特定"
-            
-            qty_val = pd.to_numeric(str(r.iloc[3]).replace(",", "").strip(), errors="coerce") if len(r) > 3 else 0
-            buy_price_val = pd.to_numeric(str(r.iloc[5]).replace(",", "").strip(), errors="coerce") if len(r) > 5 else 0.0
-            cur_price_val = pd.to_numeric(str(r.iloc[6]).replace(",", "").strip(), errors="coerce") if len(r) > 6 else 0.0
-            eval_val = pd.to_numeric(str(r.iloc[9]).replace(",", "").strip(), errors="coerce") if len(r) > 9 else 0.0
-            profit_val = pd.to_numeric(str(r.iloc[10]).replace(",", "").strip(), errors="coerce") if len(r) > 10 else 0.0
-            profit_pct = pd.to_numeric(str(r.iloc[11]).replace(",", "").replace("%", "").strip(), errors="coerce") if len(r) > 11 else 0.0
+            raw_code = r[c_code]
+            if raw_code is None:
+                continue
+            code_str = str(raw_code).strip().split(".")[0].replace(" ", "").replace("　", "").upper()
 
-            if pd.isna(qty_val) or qty_val <= 0:
+            # プレースホルダー（-----等）やヘッダー行の除外
+            if not code_str or code_str.startswith("-") or code_str.startswith("#") or "コード" in code_str:
+                continue
+
+            # 証券コード判定（3〜6文字の英数字）
+            if not (code_str.isalnum() and 3 <= len(code_str) <= 6):
+                continue
+
+            name_val = str(r[c_name]).strip() if (len(r) > c_name and r[c_name] is not None) else ""
+            account_val = str(r[c_account]).strip() if (len(r) > c_account and r[c_account] is not None) else "特定"
+            
+            qty_val = int(to_num(r[c_qty] if len(r) > c_qty else None, 0))
+            buy_price_val = to_num(r[c_buy_price] if len(r) > c_buy_price else None, 0.0)
+            cur_price_val = to_num(r[c_cur_price] if len(r) > c_cur_price else None, 0.0)
+            eval_val = to_num(r[c_eval_val] if len(r) > c_eval_val else None, 0.0)
+            profit_val = to_num(r[c_profit_val] if len(r) > c_profit_val else None, 0.0)
+            profit_pct = to_num(r[c_profit_pct] if len(r) > c_profit_pct else None, 0.0)
+
+            if qty_val <= 0:
                 continue
 
             clean_rows.append({
-                "銘柄コード": code_raw,
+                "銘柄コード": code_str,
                 "銘柄名": name_val,
                 "口座区分": account_val,
-                "保有数量": int(qty_val),
-                "取得単価": float(buy_price_val) if pd.notna(buy_price_val) else 0.0,
-                "現在値": float(cur_price_val) if pd.notna(cur_price_val) else 0.0,
-                "時価評価額": float(eval_val) if pd.notna(eval_val) else 0.0,
-                "評価損益額": float(profit_val) if pd.notna(profit_val) else 0.0,
-                "評価損益率": float(profit_pct) if pd.notna(profit_pct) else 0.0,
+                "保有数量": qty_val,
+                "取得単価": buy_price_val,
+                "現在値": cur_price_val,
+                "時価評価額": eval_val,
+                "評価損益額": profit_val,
+                "評価損益率": profit_pct,
                 "更新日時": now_str
             })
 
