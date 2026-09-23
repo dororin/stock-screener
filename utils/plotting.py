@@ -187,6 +187,16 @@ def build_lwc_candle_chart(
     else:
         times = _to_lwc_time(df.index)
 
+    # 💡 安全対策：Seriesが日付インデックスを持たない（連番0,1,2...）場合でもローソク足のtimesにフォールバック
+    def _safe_get_times(s: pd.Series) -> list:
+        if s is None or s.empty:
+            return []
+        if isinstance(s.index, pd.DatetimeIndex) or (len(s.index) > 0 and hasattr(s.index[0], 'strftime')):
+            return _to_lwc_time(s.index)
+        if len(s) == len(times):
+            return times
+        return _to_lwc_time(s.index)
+
     price_format = detect_price_format(df, is_jp=is_jp)
 
     if sma75 is None and sma_fast is not None:
@@ -201,7 +211,7 @@ def build_lwc_candle_chart(
         for key_name in ["p3", "m3"]:
             s_band = bb_dict.get(key_name)
             if s_band is not None and not s_band.dropna().empty:
-                b_times = _to_lwc_time(s_band.index)
+                b_times = _safe_get_times(s_band)
                 series.append({
                     "type": "Line",
                     "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(b_times, s_band.values) if not pd.isna(v)],
@@ -219,7 +229,7 @@ def build_lwc_candle_chart(
         for key_name in ["p2", "m2"]:
             s_band = bb_dict.get(key_name)
             if s_band is not None and not s_band.dropna().empty:
-                b_times = _to_lwc_time(s_band.index)
+                b_times = _safe_get_times(s_band)
                 series.append({
                     "type": "Line",
                     "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(b_times, s_band.values) if not pd.isna(v)],
@@ -236,7 +246,7 @@ def build_lwc_candle_chart(
 
     # 2. 移動平均線
     if sma200 is not None and not sma200.dropna().empty:
-        st_times = _to_lwc_time(sma200.index)
+        st_times = _safe_get_times(sma200)
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma200.values) if not pd.isna(v)],
@@ -252,7 +262,7 @@ def build_lwc_candle_chart(
         })
 
     if sma75 is not None and not sma75.dropna().empty:
-        st_times = _to_lwc_time(sma75.index)
+        st_times = _safe_get_times(sma75)
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma75.values) if not pd.isna(v)],
@@ -268,7 +278,7 @@ def build_lwc_candle_chart(
         })
 
     if sma25 is not None and not sma25.dropna().empty:
-        st_times = _to_lwc_time(sma25.index)
+        st_times = _safe_get_times(sma25)
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma25.values) if not pd.isna(v)],
@@ -304,7 +314,7 @@ def build_lwc_candle_chart(
         },
     })
 
-    # 4. 出来高（※パシック点灯の緑のみハイライト。反発消灯・通常消灯の赤ライトアップはOFF）
+    # 4. 出来高
     if "volume" in df.columns:
         wvf_map = {}
         if wvf_df is not None and not wvf_df.empty:
@@ -325,7 +335,6 @@ def build_lwc_candle_chart(
             if sig.get("lime"):
                 color = "rgba(0, 230, 118, 0.95)"   # 🟢 パニック点灯中のみ緑ライトアップ
             else:
-                # 反発消灯および通常消灯はハイライトせず通常の出来高色
                 color = "rgba(38, 166, 154, 0.2)" if (pd.isna(o) or pd.isna(c) or c >= o) else "rgba(239, 83, 80, 0.2)"
 
             vol_data.append({"time": t, "value": float(v), "color": color})
@@ -365,10 +374,21 @@ def build_lwc_line_chart(
     if sma200 is None and sma_slow is not None:
         sma200 = sma_slow
 
+    times = _to_lwc_time(price_series.index)
+
+    def _safe_get_times(s: pd.Series) -> list:
+        if s is None or s.empty:
+            return []
+        if isinstance(s.index, pd.DatetimeIndex) or (len(s.index) > 0 and hasattr(s.index[0], 'strftime')):
+            return _to_lwc_time(s.index)
+        if len(s) == len(times):
+            return times
+        return _to_lwc_time(s.index)
+
     series = []
 
     if sma200 is not None and not sma200.dropna().empty:
-        st_times = _to_lwc_time(sma200.index)
+        st_times = _safe_get_times(sma200)
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma200.values) if not pd.isna(v)],
@@ -383,7 +403,7 @@ def build_lwc_line_chart(
         })
 
     if sma75 is not None and not sma75.dropna().empty:
-        ft_times = _to_lwc_time(sma75.index)
+        ft_times = _safe_get_times(sma75)
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(ft_times, sma75.values) if not pd.isna(v)],
@@ -398,7 +418,7 @@ def build_lwc_line_chart(
         })
 
     if sma25 is not None and not sma25.dropna().empty:
-        s25_times = _to_lwc_time(sma25.index)
+        s25_times = _safe_get_times(sma25)
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(s25_times, sma25.values) if not pd.isna(v)],
@@ -412,7 +432,6 @@ def build_lwc_line_chart(
             },
         })
 
-    times = _to_lwc_time(price_series.index)
     price_data = [
         {"time": t, "value": round(float(v), 2)}
         for t, v in zip(times, price_series.values) if not pd.isna(v)
@@ -444,7 +463,7 @@ def build_lwc_line_chart(
                 }
             })
         elif isinstance(volume_series, pd.Series) and not volume_series.empty:
-            vol_times = _to_lwc_time(volume_series.index)
+            vol_times = _safe_get_times(volume_series)
             price_diff = price_series.diff()
             
             vol_data = []

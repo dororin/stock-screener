@@ -143,15 +143,21 @@ def render_screened_stock_card(index_num: int, unique_key: str):
                     if 'sma200' not in chart_df.columns:
                         chart_df['sma200'] = chart_df['close'].rolling(window=200, min_periods=1).mean()
 
-                    # 💡 ボリンジャーバンド計算 (20 SMA, ±2σ, ±3σ)
+                    # 💡 ボリンジャーバンド計算 (20 SMA, ±2σ, ±3σ) をchart_dfに確実に付与
                     bb_mid = chart_df['close'].rolling(window=20, min_periods=1).mean()
                     bb_std = chart_df['close'].rolling(window=20, min_periods=1).std(ddof=0)
+                    chart_df['bb_p2'] = bb_mid + (2.0 * bb_std)
+                    chart_df['bb_m2'] = bb_mid - (2.0 * bb_std)
+                    chart_df['bb_p3'] = bb_mid + (3.0 * bb_std)
+                    chart_df['bb_m3'] = bb_mid - (3.0 * bb_std)
+
+                    # 日付インデックスで抽出
                     disp_indexed = chart_df.set_index('date')
                     bb_dict = {
-                        "p2": bb_mid + (2.0 * bb_std),
-                        "m2": bb_mid - (2.0 * bb_std),
-                        "p3": bb_mid + (3.0 * bb_std),
-                        "m3": bb_mid - (3.0 * bb_std)
+                        "p2": disp_indexed['bb_p2'],
+                        "m2": disp_indexed['bb_m2'],
+                        "p3": disp_indexed['bb_p3'],
+                        "m3": disp_indexed['bb_m3']
                     }
 
                     _sma25 = disp_indexed['sma25']
