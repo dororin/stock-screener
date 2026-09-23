@@ -78,21 +78,21 @@ def get_jpx_full_list() -> pd.DataFrame:
 
 
 def run_fast_screening(db_df: pd.DataFrame, log_accumulator: list = None) -> pd.DataFrame:
-    """WVF（Williams Variable Accumulation）点灯＆200SMA上向き／上乗せ条件で高速スキャンを実行します。"""
+    """WVF点灯＆200SMA上向き／上乗せ条件でスキャンを実行します（失敗・合致サマリーのみ出力）。"""
     def log(msg):
         if log_accumulator is not None:
             log_accumulator.append(msg)
         print(f"[SCREENER] {msg}")
 
     if db_df.empty:
-        log("❌ データベースが空のため、判定処理を中止します。")
+        log("❌ データベースが空のため、判定処理を中止しました。")
         return pd.DataFrame()
     
-    # 読み込み失敗時は例外が発生し即座に停止します
     jpx_list = get_jpx_list()
     name_map = dict(zip(jpx_list['symbol'].astype(str), jpx_list['name']))
     
     results = []
+    error_count = 0
     tickers = db_df['ticker'].unique()
     db_df = db_df.sort_values(["ticker", "date"])
     
@@ -100,22 +100,16 @@ def run_fast_screening(db_df: pd.DataFrame, log_accumulator: list = None) -> pd.
     status_text = st.empty()
     total = len(tickers)
     
-    log(f"🔎 判定プロセスを開始します。総判定対象: {total} 銘柄")
-    
     for idx, ticker in enumerate(tickers):
-        if idx % 20 == 0:
+        if idx % 25 == 0:
             progress_bar.progress((idx + 1) / total)
             status_text.text(f"判定中: {ticker} ({idx+1}/{total})")
             
         try:
             df = db_df[db_df['ticker'] == ticker].copy()
-            
-            # 【検証】データ件数のチェック
             if len(df) < 220:
-                log(f"⏭️ [{ticker}] スキップ：時系列データが不足しています（実績: {len(df)} 件 / 最小必要数: 220 件）")
                 continue
 
-            # 💡 共通WVF計算関数（core.calculator）を利用
             from core.calculator import compute_wvf_signals
             df = compute_wvf_signals(df)
             
@@ -130,44 +124,35 @@ def run_fast_screening(db_df: pd.DataFrame, log_accumulator: list = None) -> pd.
             is_uptrend = (latest['close'] > latest['sma200']) or (slope_rate >= -0.0001)
             is_wvf_lit = bool(latest.get('is_lime', False))
             
-            # 各銘柄の直近判定パラメータをテキスト化
-            param_details = (
-                f"Close={latest['close']:.1f}, SMA200={latest['sma200']:.1f}, "
-                f"WVF={latest['wvf']:.2f}%, Upper={latest['wvf_upper']:.2f}%, RangeHigh={latest['range_high']:.2f}%, "
-                f"SlopeRate={slope_rate:.6f}"
-            )
-            
             if is_uptrend and is_wvf_lit:
                 ext_price = latest.get('ext_price', 0.0)
+                lime_streak = int((df["is_lime"].iloc[::-1].cumprod()).sum())
+
                 results.append({
-                    'チャート': df.tail(60)[['date','open','high','low','close','sma50','sma200','volume']].to_json(orient='records', date_format='iso'),
+                    'チャート': df.tail(60)[['date','open','high','low','close','sma50','sma200','volume','is_lime']].to_json(orient='records', date_format='iso'),
                     'シグナル日': latest["date"].strftime('%Y-%m-%d'),
                     'コード': ticker,
                     '銘柄': name_map.get(ticker, "-"),
                     '現在値': round(latest['close'], 1),
-                    '消灯目安(安値)': round(ext_price, 1) if pd.notna(ext_price) else 0.0,
-                    'SMA200': round(latest['sma200'], 1),
-                    '乖離率(%)': round((latest['close'] - latest['sma200']) / latest['sma200'] * 100, 2),
-                    '200MA傾き率': round(slope_rate, 6),
-                    'WVF': round(latest['wvf'], 2),
-                    'WVF Upper': round(latest['wvf_upper'], 2),
+                    '消灯目安': round(ext_price, 1) if pd.notna(ext_price) else 0.0,
+                    '点灯日数': lime_streak,
+                    'is_lime': is_wvf_lit,
+                    'is_fuchsia': bool(latest.get('is_fuchsia', False)),
+                    'is_normal_off': bool(latest.get('is_normal_off', False)),
                     'お気に入り': False
                 })
-                log(f"✅ [{ticker}] {name_map.get(ticker, '-')} ➔ 点灯！条件クリア ({param_details})")
-            else:
-                reasons = []
-                if not is_uptrend:
-                    reasons.append(f"トレンド条件未達 (Close {latest['close']:.1f} <= SMA200 {latest['sma200']:.1f} かつ 200MA傾き率 {slope_rate:.6f} < -0.0001)")
-                if not is_wvf_lit:
-                    reasons.append(f"WVF未点灯 (WVF {latest['wvf']:.2f}% が Upper {latest['wvf_upper']:.2f}% または 5.0% を下回る)")
-                
-                log(f"⏭️ [{ticker}] {name_map.get(ticker, '-')} ➔ スキップ ({param_details}) 理由: {' / '.join(reasons)}")
                 
         except Exception as e:
-            log(f"❌ [{ticker}] 判定処理中に例外エラーが発生しました: {e}")
+            error_count += 1
+            log(f"❌ [{ticker}] {name_map.get(ticker, '')} 判定エラー: {e}")
             continue
             
     progress_bar.empty()
     status_text.empty()
-    log(f"🎉 判定処理が完了しました。合致数: {len(results)} 件")
+
+    if error_count == 0:
+        log(f"🎉 判定処理が完了しました。合致数: {len(results)} 件（エラーなし）")
+    else:
+        log(f"🎉 判定処理が完了しました。合致数: {len(results)} 件（エラー発生: {error_count} 件）")
+
     return pd.DataFrame(results)
