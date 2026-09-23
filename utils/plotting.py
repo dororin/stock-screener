@@ -8,7 +8,7 @@ import streamlit as st
 from streamlit_lightweight_charts import renderLightweightCharts
 
 # =====================================================================
-# 📊 Lightweight Charts (LWC) 用ヘルパー (極めて軽量・高速)
+# 📊 Lightweight Charts (LWC) 用ヘルパー
 # =====================================================================
 
 def _to_lwc_time(dt_index) -> list:
@@ -33,12 +33,12 @@ def _lwc_base_options(height: int = 160, right_offset: int = 5) -> dict:
             "borderColor": "rgba(128,128,128,0.3)", 
             "scaleMargins": {
                 "top": 0.08, 
-                "bottom": 0.25  # 出来高オーバーレイ用の余白を確保
+                "bottom": 0.25
             }
         },
         "overlayPriceScales": {
             "scaleMargins": {
-                "top": 0.75,   # 出来高を最下部25%に固定
+                "top": 0.75,
                 "bottom": 0,
             }
         },
@@ -82,7 +82,6 @@ def detect_price_format(prices, is_jp: bool = True) -> dict:
     return {"type": "price", "precision": 2, "minMove": 0.01}
 
 def build_lwc_rs_overlay_chart(sector_index_cache: dict, selected_sectors: list, height: int = 450) -> dict:
-    """複数セクターの相対強度（RS）のLWC重ね合わせ比較チャート定義を生成します。"""
     if not sector_index_cache or not selected_sectors:
         return {}
 
@@ -129,7 +128,6 @@ def build_lwc_rs_overlay_chart(sector_index_cache: dict, selected_sectors: list,
     return {"chart": chart_options, "series": series_list}
 
 def render_lwc_rs_overlay(sector_index_cache: dict, selected_sectors: list, height: int = 450, key: str = "rs_overlay"):
-    """セクターRSの重ね合わせ LWC をカラー凡例付きでレンダリングします。"""
     if not sector_index_cache or not selected_sectors:
         st.info("セクターを1つ以上選択すると、RS重ね合わせチャートが表示されます。")
         return
@@ -171,19 +169,13 @@ def build_lwc_candle_chart(
     sma25: pd.Series = None,
     sma75: pd.Series = None, 
     sma200: pd.Series = None,
-    sma_fast: pd.Series = None,  # 互換用
-    sma_slow: pd.Series = None,  # 互換用
+    sma_fast: pd.Series = None,
+    sma_slow: pd.Series = None,
     height: int = 200, 
     is_jp: bool = True, 
     wvf_df: pd.DataFrame = None,
     bb_dict: dict = None
 ) -> dict:
-    """
-    ローソク足チャート定義を生成します。
-    💡 レイヤー順序: ボリンジャーバンド（最背面） ➔ 移動平均線（0.5px相当・透過） ➔ ローソク足（最前面） ➔ 出来高
-    💡 現在値の水平破線は非表示、右軸ラベルは保持。
-    💡 全Lineシリーズに priceFormat を適用して .00 汚染を完全防止。
-    """
     if df is None or df.empty:
         return {}
 
@@ -204,11 +196,8 @@ def build_lwc_candle_chart(
 
     series = []
 
-    # =========================================================================
-    # 1. 【最背面レイヤー】ボリンジャーバンド (ミドル非表示, ±2σ/±3σ 半透明極薄グレー)
-    # =========================================================================
+    # 1. ボリンジャーバンド
     if bb_dict:
-        # ±3σ (最外殻: 極薄の透過グレー)
         for key_name in ["p3", "m3"]:
             s_band = bb_dict.get(key_name)
             if s_band is not None and not s_band.dropna().empty:
@@ -223,11 +212,10 @@ def build_lwc_candle_chart(
                         "priceLineVisible": False, 
                         "lastValueVisible": False, 
                         "crosshairMarkerVisible": False,
-                        "priceFormat": price_format,  # 💡 軸汚染を防止
+                        "priceFormat": price_format,
                     },
                 })
 
-        # ±2σ (半透明グレー)
         for key_name in ["p2", "m2"]:
             s_band = bb_dict.get(key_name)
             if s_band is not None and not s_band.dropna().empty:
@@ -242,14 +230,11 @@ def build_lwc_candle_chart(
                         "priceLineVisible": False, 
                         "lastValueVisible": False, 
                         "crosshairMarkerVisible": False,
-                        "priceFormat": price_format,  # 💡 軸汚染を防止
+                        "priceFormat": price_format,
                     },
                 })
 
-    # =========================================================================
-    # 2. 【中間レイヤー】移動平均線 (0.5px相当の透過テクニック)
-    # =========================================================================
-    # 200SMA (紫・極細透過)
+    # 2. 移動平均線
     if sma200 is not None and not sma200.dropna().empty:
         st_times = _to_lwc_time(sma200.index)
         series.append({
@@ -262,11 +247,10 @@ def build_lwc_candle_chart(
                 "priceLineVisible": False, 
                 "lastValueVisible": False, 
                 "crosshairMarkerVisible": False,
-                "priceFormat": price_format,  # 💡 軸汚染を防止
+                "priceFormat": price_format,
             },
         })
 
-    # 75SMA (オレンジ・極細透過)
     if sma75 is not None and not sma75.dropna().empty:
         st_times = _to_lwc_time(sma75.index)
         series.append({
@@ -279,11 +263,10 @@ def build_lwc_candle_chart(
                 "priceLineVisible": False, 
                 "lastValueVisible": False, 
                 "crosshairMarkerVisible": False,
-                "priceFormat": price_format,  # 💡 軸汚染を防止
+                "priceFormat": price_format,
             },
         })
 
-    # 25SMA (赤・極細透過)
     if sma25 is not None and not sma25.dropna().empty:
         st_times = _to_lwc_time(sma25.index)
         series.append({
@@ -296,13 +279,11 @@ def build_lwc_candle_chart(
                 "priceLineVisible": False, 
                 "lastValueVisible": False, 
                 "crosshairMarkerVisible": False,
-                "priceFormat": price_format,  # 💡 軸汚染を防止
+                "priceFormat": price_format,
             },
         })
 
-    # =========================================================================
-    # 3. 【最前面レイヤー】ローソク足 (Candlestick)
-    # =========================================================================
+    # 3. ローソク足
     candle_data = [
         {"time": t, "open": round(float(o), 2), "high": round(float(h), 2),
          "low": round(float(l), 2), "close": round(float(c), 2)}
@@ -318,14 +299,12 @@ def build_lwc_candle_chart(
             "borderUpColor": "#26a69a", "borderDownColor": "#ef5350",
             "wickUpColor": "#26a69a", "wickDownColor": "#ef5350",
             "priceFormat": price_format,
-            "priceLineVisible": False,  # 💡 現在値の水平破線を非表示
-            "lastValueVisible": True,   # 💡 右軸の現在値ラベルは表示維持
+            "priceLineVisible": False,
+            "lastValueVisible": True,
         },
     })
 
-    # =========================================================================
-    # 4. 【最下部オーバーレイ】出来高 (Histogram)
-    # =========================================================================
+    # 4. 出来高（※パシック点灯の緑のみハイライト。反発消灯・通常消灯の赤ライトアップはOFF）
     if "volume" in df.columns:
         wvf_map = {}
         if wvf_df is not None and not wvf_df.empty:
@@ -333,8 +312,7 @@ def build_lwc_candle_chart(
             w_times = _to_lwc_time(pd.to_datetime(w_df["date"])) if "date" in w_df.columns else _to_lwc_time(w_df.index)
             for wt, (_, wr) in zip(w_times, w_df.iterrows()):
                 wvf_map[wt] = {
-                    "lime": bool(wr.get("is_lime", False)),
-                    "fuchsia": bool(wr.get("is_fuchsia", False)),
+                    "lime": bool(wr.get("is_lime", False))
                 }
 
         vol_data = []
@@ -344,11 +322,10 @@ def build_lwc_candle_chart(
                 continue
 
             sig = wvf_map.get(t, {})
-            if sig.get("fuchsia"):
-                color = "rgba(233, 30, 99, 0.95)"   # 🌸 反発買いシグナル
-            elif sig.get("lime"):
-                color = "rgba(0, 230, 118, 0.95)"   # 🟢 パニック売り点灯
+            if sig.get("lime"):
+                color = "rgba(0, 230, 118, 0.95)"   # 🟢 パニック点灯中のみ緑ライトアップ
             else:
+                # 反発消灯および通常消灯はハイライトせず通常の出来高色
                 color = "rgba(38, 166, 154, 0.2)" if (pd.isna(o) or pd.isna(c) or c >= o) else "rgba(239, 83, 80, 0.2)"
 
             vol_data.append({"time": t, "value": float(v), "color": color})
@@ -378,11 +355,6 @@ def build_lwc_line_chart(
     height: int = 160, 
     is_jp: bool = True
 ) -> dict:
-    """
-    折れ線（セクター値）＋移動平均3本＋出来高の LWC 構成定義を生成します。
-    💡 セクターチャートにも 25/75/200MA の0.5px相当透過極細線を適用。
-    💡 水平破線は非表示、右軸ラベルは保持。
-    """
     if price_series is None or price_series.empty:
         return {}
 
@@ -395,9 +367,6 @@ def build_lwc_line_chart(
 
     series = []
 
-    # =========================================================================
-    # 1. 【背面レイヤー】移動平均線3本 (200SMA紫, 75SMAオレンジ, 25SMA赤)
-    # =========================================================================
     if sma200 is not None and not sma200.dropna().empty:
         st_times = _to_lwc_time(sma200.index)
         series.append({
@@ -443,9 +412,6 @@ def build_lwc_line_chart(
             },
         })
 
-    # =========================================================================
-    # 2. 【前面レイヤー】メイン折れ線（セクター値）
-    # =========================================================================
     times = _to_lwc_time(price_series.index)
     price_data = [
         {"time": t, "value": round(float(v), 2)}
@@ -458,16 +424,13 @@ def build_lwc_line_chart(
         "options": {
             "color": "#42a5f5", 
             "lineWidth": 2,
-            "priceLineVisible": False,  # 💡 現在値の水平破線を非表示
-            "lastValueVisible": True,   # 💡 右軸ラベルは表示
+            "priceLineVisible": False,
+            "lastValueVisible": True,
             "crosshairMarkerVisible": True,
             "priceFormat": price_format,
         },
     })
 
-    # =========================================================================
-    # 3. 【最下部オーバーレイ】出来高
-    # =========================================================================
     if volume_series is not None:
         if isinstance(volume_series, list):
             series.append({
@@ -517,7 +480,6 @@ def render_lwc_sector_mini(
     height: int = 160, 
     is_jp: bool = True
 ):
-    """セクター絶対値用のLWCミニチャートをレンダリングします。"""
     chart_def = build_lwc_line_chart(
         price_series, 
         sma25=sma25,
@@ -542,7 +504,7 @@ def render_lwc_candle_mini(
     df: pd.DataFrame, 
     sma25: pd.Series = None,
     sma75: pd.Series = None, 
-    sma200: pd.Series = None,
+    sma200: pd.Series = None, 
     sma_fast: pd.Series = None,
     sma_slow: pd.Series = None,
     key: str = "lwc_candle", 
@@ -551,7 +513,6 @@ def render_lwc_candle_mini(
     wvf_df: pd.DataFrame = None,
     bb_dict: dict = None
 ):
-    """個別ローソク足用のLWCミニチャートをレンダリングします。"""
     chart_def = build_lwc_candle_chart(
         df, 
         sma25=sma25,
@@ -572,12 +533,7 @@ def render_lwc_candle_mini(
     except Exception as e:
         st.caption(f"描画エラー: {e}")
 
-# =====================================================================
-# 🕯️ mplfinance / matplotlib (完全遅延インポート設計)
-# =====================================================================
-
 def generate_mini_chart_base64(df: pd.DataFrame) -> str:
-    """PDF等に差し込む用のローソク足画像をBase64形式で出力。"""
     try:
         import matplotlib.pyplot as plt
         import mplfinance as mpf

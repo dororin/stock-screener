@@ -1,7 +1,7 @@
 # core/calculator.py
 import pandas as pd
 import numpy as np
-import streamlit as st  # キャッシュ処理 st.cache_data のためにインポート
+import streamlit as st
 from datetime import datetime, timedelta
 from config import settings
 from data_access.local_db import load_price_db, get_price_data_cached
@@ -10,8 +10,7 @@ from data_access.local_db import load_price_db, get_price_data_cached
 def fetch_proxy_market_value(proxy_ticker: str, start_date: datetime, end_date: datetime, db_df: pd.DataFrame = None) -> pd.Series:
     """
     市場全体の総売買代金の代理（プロキシ）として、1306 や SPY の
-    時系列データを取得します。db_dfが渡された場合はそのロード済みメモリデータを再利用し、
-    渡されない場合はレイヤー1キャッシュから取得します。
+    時系列データを取得します。
     """
     try:
         pure_ticker = str(proxy_ticker).strip().upper()
@@ -39,12 +38,10 @@ def fetch_proxy_market_value(proxy_ticker: str, start_date: datetime, end_date: 
         df_ticker["date"] = pd.to_datetime(df_ticker["date"]).dt.tz_localize(None)
         df_ticker = df_ticker.set_index("date").sort_index()
         
-        # 期間スライス
         df_sliced = df_ticker.loc[start_date:end_date]
         if df_sliced.empty:
             return pd.Series(dtype=float)
             
-        # 売買代金（価格 * 出来高）の算出
         return df_sliced["close"] * df_sliced["volume"]
     except Exception:
         return pd.Series(dtype=float)
@@ -109,7 +106,6 @@ def _compute_benchmark_data_internal(ticker: str, period_days: int, interval: st
                     close = ticker_db.set_index("date")["close"]
                     ret = close.pct_change()
                     
-                    # 急落異常値のクリップ処理
                     anomaly_mask = ret <= -0.40
                     if anomaly_mask.any():
                         for idx_loc in ret[anomaly_mask].index:
@@ -182,7 +178,6 @@ def compute_sector_absolute_data(db_df: pd.DataFrame, tickers: list, period_days
     return sector_abs, sma75, sma200, is_wvf_lit, trading_val
 
 def compute_macro_cores_from_db(db_df: pd.DataFrame, period_days: int, resample_weekly: bool = False) -> dict:
-    """TOPIX-17業種データから、5大コアセクターの累積騰落指標を数学的に合成算出します。"""
     all_etfs = [t for etfs in settings.TOPIX17_ETF_MAPPING.values() for t in etfs]
     etf_df = pd.DataFrame()
     if not db_df.empty:
@@ -223,9 +218,6 @@ def compute_theme_equal_weighted_return_rate(
     resample_weekly: bool,
     is_jp: bool = True
 ) -> tuple:
-    """
-    指定された構成銘柄（等金額投資）の、基準日からのリターン率（％）を計算します。
-    """
     if db_df.empty or not tickers:
         return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), []
         
@@ -306,13 +298,13 @@ def compute_theme_equal_weighted_return_rate(
             continue
         
         if vdr >= 1.5 and vs >= vs_ma:
-            color = "rgba(239, 83, 80, 0.85)"      # ステージA: 赤
+            color = "rgba(239, 83, 80, 0.85)"
         elif vdr < 1.5 and vs >= vs_ma:
-            color = "rgba(38, 166, 154, 0.60)"     # ステージB: 緑
+            color = "rgba(38, 166, 154, 0.60)"
         elif vdr < 1.5 and vs < vs_ma:
-            color = "rgba(128, 128, 128, 0.25)"    # ステージC: 灰
+            color = "rgba(128, 128, 128, 0.25)"
         else:
-            color = "rgba(255, 167, 38, 0.50)"     # ステージD: 黄
+            color = "rgba(255, 167, 38, 0.50)"
 
         lwc_volume_data.append({
             "time": str(dt)[:10],
@@ -322,9 +314,8 @@ def compute_theme_equal_weighted_return_rate(
 
     return return_rate_series, sma75, sma200, lwc_volume_data
 
-
 # =====================================================================
-# ⚡ レイヤー2：料理（計算）キャッシュ設計
+# ⚡ レイヤー2 キャッシュ
 # =====================================================================
 
 @st.cache_data(ttl=3600)
@@ -340,14 +331,12 @@ def _get_sector_index_intraday_cached(interval: str, tickers_tuple: tuple, perio
     return compute_sector_index_from_df(db_df, list(tickers_tuple), period_days, resample_weekly)
 
 def get_sector_index_cached(interval: str, tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool = True) -> pd.Series:
-    """レイヤー2：セクターインデックス算出キャッシュ"""
     if not isinstance(tickers_tuple, tuple):
         tickers_tuple = tuple(tickers_tuple)
     if interval == "1d":
         return _get_sector_index_1d_cached(tickers_tuple, period_days, resample_weekly, is_jp)
     else:
         return _get_sector_index_intraday_cached(interval, tickers_tuple, period_days, resample_weekly, is_jp)
-
 
 @st.cache_data(ttl=3600)
 def _get_theme_return_rate_1d_cached(tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool) -> tuple:
@@ -362,14 +351,12 @@ def _get_theme_return_rate_intraday_cached(interval: str, tickers_tuple: tuple, 
     return compute_theme_equal_weighted_return_rate(db_df, list(tickers_tuple), period_days, resample_weekly, is_jp=is_jp)
 
 def get_theme_return_rate_cached(interval: str, tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool = True) -> tuple:
-    """レイヤー2：テーマ規格化リターン率算出キャッシュ"""
     if not isinstance(tickers_tuple, tuple):
         tickers_tuple = tuple(tickers_tuple)
     if interval == "1d":
         return _get_theme_return_rate_1d_cached(tickers_tuple, period_days, resample_weekly, is_jp)
     else:
         return _get_theme_return_rate_intraday_cached(interval, tickers_tuple, period_days, resample_weekly, is_jp)
-
 
 @st.cache_data(ttl=3600)
 def _get_sector_absolute_data_1d_cached(tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool) -> tuple:
@@ -384,14 +371,12 @@ def _get_sector_absolute_data_intraday_cached(interval: str, tickers_tuple: tupl
     return compute_sector_absolute_data(db_df, list(tickers_tuple), period_days, resample_weekly, interval=interval, is_jp=is_jp)
 
 def get_sector_absolute_data_cached(interval: str, tickers_tuple: tuple, period_days: int, resample_weekly: bool, is_jp: bool = True) -> tuple:
-    """レイヤー2：セクター絶対価格データ算出キャッシュ"""
     if not isinstance(tickers_tuple, tuple):
         tickers_tuple = tuple(tickers_tuple)
     if interval == "1d":
         return _get_sector_absolute_data_1d_cached(tickers_tuple, period_days, resample_weekly, is_jp)
     else:
         return _get_sector_absolute_data_intraday_cached(interval, tickers_tuple, period_days, resample_weekly, is_jp)
-
 
 @st.cache_data(ttl=3600)
 def _get_macro_cores_1d_cached(period_days: int, resample_weekly: bool, is_jp: bool) -> dict:
@@ -406,12 +391,10 @@ def _get_macro_cores_intraday_cached(interval: str, period_days: int, resample_w
     return compute_macro_cores_from_db(db_df, period_days, resample_weekly)
 
 def get_macro_cores_cached(interval: str, period_days: int, resample_weekly: bool, is_jp: bool = True) -> dict:
-    """レイヤー2：5大マクロコア算出キャッシュ"""
     if interval == "1d":
         return _get_macro_cores_1d_cached(period_days, resample_weekly, is_jp)
     else:
         return _get_macro_cores_intraday_cached(interval, period_days, resample_weekly, is_jp)
-
 
 @st.cache_data(ttl=3600)
 def _get_benchmark_data_1d_cached(ticker: str, period_days: int, is_jp: bool) -> pd.Series:
@@ -422,18 +405,19 @@ def _get_benchmark_data_intraday_cached(ticker: str, period_days: int, interval:
     return _compute_benchmark_data_internal(ticker, period_days, interval, is_jp)
 
 def get_benchmark_data_cached(ticker: str, period_days: int, interval: str, is_jp: bool = True) -> pd.Series:
-    """レイヤー2：ベンチマークデータ算出キャッシュ"""
     if interval == "1d":
         return _get_benchmark_data_1d_cached(ticker, period_days, is_jp)
     else:
         return _get_benchmark_data_intraday_cached(ticker, period_days, interval, is_jp)
 
-# core/calculator.py の末尾などに追加
 
+# =====================================================================
+# 💡 WVFシグナル計算ロジック（反発消灯・通常消灯対応）
+# =====================================================================
 def compute_wvf_signals(df: pd.DataFrame) -> pd.DataFrame:
     """
-    WVF（Williams Vix Fix）およびPine Script（Chris Moody版）準拠の
-    ボトム判定シグナル（Lime / Fuchsia）と次回消灯目安値をインメモリ一括計算します。
+    WVF（Williams Vix Fix）およびChris Moody版準拠の
+    ボトム判定シグナル（Lime / 反発消灯 / 通常消灯）と次回消灯目安値をインメモリ計算します。
     """
     if df is None or df.empty or len(df) < 15:
         return df
@@ -453,18 +437,22 @@ def compute_wvf_signals(df: pd.DataFrame) -> pd.DataFrame:
     # 2. パニック点灯シグナル (Lime / alert1)
     is_lime = ((wvf >= wvf_upper) | (wvf >= range_high)) & (wvf >= 5.0)
 
-    # 3. 厳選反発買いシグナル (Fuchsia / alert3)
-    # 前日点灯(Lime) -> 当日消灯
+    # 3. 前日点灯・当日消灯の判定
     was_lime = is_lime.shift(1).fillna(False).astype(bool)
     now_off = ~is_lime
+
     # 反発プライスアクション: 安値切り上げ かつ 前日高値を上回る引け
     prev_low = df['low'].shift(1)
     prev_high = df['high'].shift(1)
     up_reversal = (df['low'] > prev_low) & (df['close'] > prev_high)
+
+    # 🌸 反発消灯シグナル: 前日点灯 ➔ 当日消灯 ＆ 反発プライスアクション成立
     is_fuchsia = was_lime & now_off & up_reversal
 
+    # ⚪ 通常消灯シグナル: 前日点灯 ➔ 当日消灯 ＆ 反発プライスアクション未成立
+    is_normal_off = was_lime & now_off & (~up_reversal)
+
     # 4. 次回消灯目安値（安値）（ext_price）
-    # 当日の安値がこの数値を上回っていれば（これ以上下がらなければ）翌日消灯すると逆算される価格
     p_upper = highest_close * (1.0 - wvf_upper / 100.0)
     p_range = highest_close * (1.0 - range_high / 100.0)
     p_floor = highest_close * (1.0 - 5.0 / 100.0)
@@ -475,6 +463,7 @@ def compute_wvf_signals(df: pd.DataFrame) -> pd.DataFrame:
     df['range_high'] = range_high
     df['is_lime'] = is_lime
     df['is_fuchsia'] = is_fuchsia
+    df['is_normal_off'] = is_normal_off
     df['ext_price'] = ext_price
 
     return df

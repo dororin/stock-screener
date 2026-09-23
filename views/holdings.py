@@ -47,16 +47,10 @@ def render_holdings_controls(df_holdings: pd.DataFrame):
 
 
 # =====================================================================
-# 📌 【フラグメント2】個別保有銘柄カード（銘柄単位集約 ＆ 口座別バッジ）
+# 📌 【フラグメント2】個別保有銘柄カード
 # =====================================================================
 @st.fragment
 def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFrame, db_df: pd.DataFrame):
-    """
-    1銘柄分の集約カード。
-    - チャートは1つ（買値水平線はなし）
-    - トータル保有数・加重平均取得単価
-    - 口座別（NISA、特定など）の小分けバッジを整然と表示
-    """
     total_qty = int(group_df["保有数量"].sum())
     total_eval = float(group_df["時価評価額"].sum())
     total_profit = float(group_df["評価損益額"].sum())
@@ -64,15 +58,12 @@ def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFra
     avg_buy_price = (total_cost / total_qty) if total_qty > 0 else 0.0
     profit_pct = (total_profit / total_cost * 100.0) if total_cost > 0 else 0.0
 
-    # 💡 口座別の小分けバッジ文字列を作成
-    # 例: 「NISA: 100株 (買¥2,000)」「特定: 200株 (買¥2,600)」
     badges_html_list = []
     for _, sub in group_df.iterrows():
         acc = str(sub.get("口座区分", "特定")).strip()
         q = int(sub.get("保有数量", 0))
         b = float(sub.get("取得単価", 0.0))
 
-        # 口座区分に応じたバッジ色分け（NISA=深緑、特定=深青）
         if "NISA" in acc.upper():
             b_bg = "#1b5e20"
             b_border = "#2e7d32"
@@ -107,7 +98,7 @@ def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFra
         latest_row = df_stock.iloc[-1]
         latest_close = latest_row["close"]
 
-        # 移動平均線（25SMA, 75SMA, 200SMA）
+        # 移動平均線
         df_stock["sma25"] = df_stock["close"].rolling(window=25, min_periods=1).mean()
         df_stock["sma75"] = df_stock["close"].rolling(window=75, min_periods=1).mean()
         df_stock["sma200"] = df_stock["close"].rolling(window=200, min_periods=1).mean()
@@ -120,7 +111,6 @@ def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFra
         df_stock["bb_p3"] = bb_mid + (3.0 * bb_std)
         df_stock["bb_m3"] = bb_mid - (3.0 * bb_std)
 
-        # 直近180日にトリミング
         chart_display = df_stock.tail(180).copy().reset_index(drop=True)
         disp_indexed = chart_display.set_index("date")
         bb_dict = {
@@ -130,24 +120,36 @@ def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFra
             "m3": disp_indexed["bb_m3"]
         }
 
-        # WVF状態判定
+        # 💡 WVFシグナル状態判定（最新日のみ反応、消灯目安は最新日点灯時のみ表示）
         ext_price_val = latest_row.get("ext_price", np.nan)
         ext_str = f"¥{ext_price_val:,.1f}" if pd.notna(ext_price_val) else "-"
-        tail_3 = df_stock.tail(3)
-        has_recent_fuchsia = tail_3["is_fuchsia"].any() if "is_fuchsia" in tail_3.columns else False
 
         if latest_row.get("is_lime", False):
             lime_streak = int((df_stock["is_lime"].iloc[::-1].cumprod()).sum())
-            wvf_badge_html = f"<span style='font-size:0.75rem; background:#00e676; color:#000; padding:1px 5px; border-radius:3px; font-weight:bold;'>🟢 パニック点灯中 ({lime_streak}日目)</span> <span style='font-size:0.75rem; color:#b0bec5;'>目安: {ext_str}</span>"
-        elif has_recent_fuchsia:
-            wvf_badge_html = f"<span style='font-size:0.75rem; background:#e91e63; color:#fff; padding:1px 5px; border-radius:3px; font-weight:bold;'>🌸 反発買いシグナル</span>"
+            wvf_badge_html = (
+                f"<span style='font-size:0.75rem; background:#00e676; color:#000; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
+                f"🟢 パニック点灯中 ({lime_streak}日目)</span> "
+                f"<span style='font-size:0.75rem; color:#b0bec5;'>翌日消灯目安: {ext_str}</span>"
+            )
+        elif latest_row.get("is_fuchsia", False):
+            # 最新1日のみ反応する反発消灯シグナル
+            wvf_badge_html = (
+                f"<span style='font-size:0.75rem; background:#37474f; color:#ffffff; border:1px solid #78909c; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
+                f"⚪ 反発消灯</span>"
+            )
+        elif latest_row.get("is_normal_off", False):
+            # 最新1日のみ反応する通常消灯シグナル
+            wvf_badge_html = (
+                f"<span style='font-size:0.75rem; background:#37474f; color:#ffffff; border:1px solid #78909c; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
+                f"⚪ 消灯</span>"
+            )
         else:
-            wvf_badge_html = f"<span style='font-size:0.75rem; color:#78909c;'>消灯目安: {ext_str}</span>"
+            # 平常時は消灯目安もバッジも一切非表示
+            wvf_badge_html = ""
 
     tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{ticker}"
 
     with st.container(border=True):
-        # 銘柄名ヘッダーと外部リンク
         head_col1, head_col2 = st.columns([3, 2])
         head_col1.markdown(f"#### [{ticker}]({tv_url}) {stock_name}")
         head_col2.markdown(
@@ -177,7 +179,7 @@ def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFra
             else:
                 st.caption("チャートデータ準備中（ローカルDBから取得できませんでした）")
 
-        # 集約メトリクス＆口座別小分けバッジ（右側）
+        # 集約メトリクス＆口座別内訳（右側）
         with c_right:
             m1, m2 = st.columns(2)
             m1.metric("現在値", f"¥{latest_close:,.1f}")
@@ -197,22 +199,18 @@ def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFra
 # =====================================================================
 holdings_raw_df = load_holdings_from_sheets()
 
-# 1. サマリーバーの描画
 render_holdings_controls(holdings_raw_df)
 
 if not holdings_raw_df.empty:
-    # 2. ローカルParquet DBから全保有銘柄の日足データを一度だけロード
     holding_tickers = holdings_raw_df["銘柄コード"].unique().tolist()
     db_df = get_price_data_cached("1d", limit_days=365, is_jp=True)
 
-    # 3. 銘柄コード単位にグループ化して集約
     grouped = holdings_raw_df.groupby("銘柄コード")
     unique_tickers = list(grouped.groups.keys())
 
     st.write("---")
     st.markdown(f"### 📋 保有銘柄一覧（{len(unique_tickers)} 銘柄）")
 
-    # 2列グリッドで並べて表示
     for i in range(0, len(unique_tickers), 2):
         cols = st.columns(2)
         for j in range(2):

@@ -34,27 +34,19 @@ from utils.plotting import (
 
 CUSTOM_SECTOR_KEY = "custom_sector_tickers"
 
-# セッション状態にウォッチリストがなければSheetsから読み込み
 if CUSTOM_SECTOR_KEY not in st.session_state:
     st.session_state[CUSTOM_SECTOR_KEY] = load_watchlist_from_sheets()
 
 
 # =====================================================================
-# 🏷️ 【東証全銘柄・日本語社名マスタ】JPX公式およびシートから取得
+# 🏷️ 【東証全銘柄・日本語社名マスタ】
 # =====================================================================
 @st.cache_data(ttl=86400)
 def get_all_stock_names_map(is_jp: bool = True) -> dict:
-    """
-    全銘柄の日本語社名マップを確実に構築するキャッシュ関数。
-    1. スプレッドシート(sector_JP)の正規日本語社名
-    2. JPX公式マスタ(data_j.xls)の日本語社名
-    の双方から安全に名前を解決します。
-    """
     name_map = {}
     if not is_jp:
         return name_map
 
-    # 1. sector_JP シートから社名を取得
     try:
         from data_access.sheets_api import get_sector_spreadsheet
         sh = get_sector_spreadsheet()
@@ -75,7 +67,6 @@ def get_all_stock_names_map(is_jp: bool = True) -> dict:
     except Exception:
         pass
 
-    # 2. JPX全銘柄マスタ(data_j.xls)から補完・上書き
     try:
         jpx_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
         need_download = not os.path.exists(jpx_path)
@@ -124,10 +115,6 @@ def show_constituents_dialog(
     resample_weekly: bool,
     is_jp: bool = True
 ):
-    """
-    テーマ名クリック時に最前面にオーバーレイ展開する共通モーダルダイアログ。
-    TradingView外部リンク、25/75/200SMA、最背面ボリンジャーバンド（±2σ, ±3σ）を統合表示します。
-    """
     st.subheader(f"📊 {title}（構成: {len(constituent_codes)} 銘柄）")
     tf_display_name = "週足" if resample_weekly else ("日足" if interval == "1d" else interval)
     st.caption(f"足種: {tf_display_name} ｜ 表示期間: {period_days}日")
@@ -150,7 +137,6 @@ def show_constituents_dialog(
             stock_name = name_map.get(clean_code, "")
             display_label = f"{clean_code}　{stock_name}" if stock_name else clean_code
 
-            # 💡 TradingView リンクURLの生成
             if is_jp:
                 tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{clean_code}"
             else:
@@ -175,15 +161,13 @@ def show_constituents_dialog(
                         df_stock = df_stock.set_index("date").resample("W-FRI").agg({
                             "open": "first", "high": "max", "low": "min",
                             "close": "last", "volume": "sum", "ticker": "last",
-                            "is_lime": "any", "is_fuchsia": "any", "ext_price": "last"
+                            "is_lime": "any", "is_fuchsia": "any", "is_normal_off": "any", "ext_price": "last"
                         }).dropna().reset_index()
 
-                    # 💡 3本の移動平均線（25SMA赤, 75SMAオレンジ, 200SMA紫）
                     df_stock["sma25"]  = df_stock["close"].rolling(window=25, min_periods=1).mean()
                     df_stock["sma75"]  = df_stock["close"].rolling(window=75, min_periods=1).mean()
                     df_stock["sma200"] = df_stock["close"].rolling(window=200, min_periods=1).mean()
 
-                    # 💡 ボリンジャーバンド計算 (20期間, ±2σ, ±3σ)
                     bb_mid = df_stock["close"].rolling(window=20, min_periods=1).mean()
                     bb_std = df_stock["close"].rolling(window=20, min_periods=1).std(ddof=0)
                     df_stock["bb_p2"] = bb_mid + (2.0 * bb_std)
@@ -195,21 +179,33 @@ def show_constituents_dialog(
                     if len(recent_closes) >= 2 and recent_closes[0] > 0:
                         s_mom = float((recent_closes[-1] / recent_closes[0] - 1) * 100)
 
-                    # 直近シグナルステータスおよび消灯目安値の判定
+                    # 💡 WVFシグナル状態判定（最新日のみ反応、消灯目安は最新日点灯時のみ表示）
                     latest_row = df_stock.iloc[-1]
                     ext_price_val = latest_row.get("ext_price", np.nan)
                     ext_str = f"¥{ext_price_val:,.1f}" if pd.notna(ext_price_val) else "-"
 
-                    tail_3 = df_stock.tail(3)
-                    has_recent_fuchsia = tail_3["is_fuchsia"].any() if "is_fuchsia" in tail_3.columns else False
-
                     if latest_row.get("is_lime", False):
                         lime_streak = int((df_stock["is_lime"].iloc[::-1].cumprod()).sum())
-                        wvf_badge_html = f"<span style='font-size:0.75rem; background:#00e676; color:#000; padding:1px 5px; border-radius:3px; font-weight:bold;'>🟢 点灯中({lime_streak}日目)</span> <span style='font-size:0.75rem; color:#b0bec5;'>目安: {ext_str}</span>"
-                    elif has_recent_fuchsia:
-                        wvf_badge_html = f"<span style='font-size:0.75rem; background:#e91e63; color:#fff; padding:1px 5px; border-radius:3px; font-weight:bold;'>🌸 反発買いシグナル</span> <span style='font-size:0.75rem; color:#b0bec5;'>消灯済</span>"
+                        wvf_badge_html = (
+                            f"<span style='font-size:0.75rem; background:#00e676; color:#000; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
+                            f"🟢 点灯中({lime_streak}日目)</span> "
+                            f"<span style='font-size:0.75rem; color:#b0bec5;'>翌日消灯目安: {ext_str}</span>"
+                        )
+                    elif latest_row.get("is_fuchsia", False):
+                        # 最新1日のみ反応する反発消灯シグナル
+                        wvf_badge_html = (
+                            f"<span style='font-size:0.75rem; background:#37474f; color:#ffffff; border:1px solid #78909c; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
+                            f"⚪ 反発消灯</span>"
+                        )
+                    elif latest_row.get("is_normal_off", False):
+                        # 最新1日のみ反応する通常消灯シグナル
+                        wvf_badge_html = (
+                            f"<span style='font-size:0.75rem; background:#37474f; color:#ffffff; border:1px solid #78909c; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
+                            f"⚪ 消灯</span>"
+                        )
                     else:
-                        wvf_badge_html = f"<span style='font-size:0.75rem; color:#78909c;'>消灯目安: {ext_str}</span>"
+                        # 平常時は消灯目安もバッジも非表示
+                        wvf_badge_html = ""
 
                     df_display = df_stock[df_stock["date"] >= display_start].copy().reset_index(drop=True)
 
@@ -226,7 +222,6 @@ def show_constituents_dialog(
                 s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
 
                 with st.container(border=True):
-                    # 💡 銘柄名とモメンタム（TradingViewへの外部リンク付き）
                     hc1, hc2 = st.columns([3.8, 1.2])
                     hc1.markdown(
                         f"<div style='font-size:0.86rem; font-weight:600; color:{s_color}; line-height:1.4; "
@@ -249,7 +244,6 @@ def show_constituents_dialog(
                         unsafe_allow_html=True
                     )
 
-                    # 💡 ローソク足ミニチャート（25/75/200MA、最背面BB、ローソク足最前面、破線非表示、.00解消）
                     if not df_display.empty and len(df_display) >= 2:
                         sma25_s = df_display.set_index("date")["sma25"]
                         sma75_s = df_display.set_index("date")["sma75"]
@@ -270,11 +264,10 @@ def show_constituents_dialog(
 
 
 # =====================================================================
-# 📌 【フラグメント3】ウォッチリスト編集パネル（完全独立）
+# 📌 【フラグメント3】ウォッチリスト編集パネル
 # =====================================================================
 @st.fragment
 def render_watchlist_editor_fragment():
-    """ウォッチリストの登録・削除だけを行う独立フラグメント。上部チャートにリランを一切伝播させない。"""
     st.subheader("📌 ウォッチリスト登録・削除")
     
     search_query = st.text_input(
@@ -356,12 +349,10 @@ def render_watchlist_editor_fragment():
 
 
 # =====================================================================
-# 📊 【フラグメント1】重ね合わせ比較チャート（完全独立）
+# 📊 【フラグメント1】重ね合わせ比較チャート
 # =====================================================================
 @st.fragment
 def render_overlay_chart_fragment(is_jp: bool):
-    """重ね合わせ比較チャートの計算と描画をカプセル化。ウィジェット操作時に下部チャートは再計算されません。"""
-    
     title_col, refresh_col = st.columns([3, 1])
     with title_col:
         st.markdown("### 📊 セクター・テーマ相対強度（RS）重ね合わせ比較")
@@ -447,11 +438,10 @@ def render_overlay_chart_fragment(is_jp: bool):
 
 
 # =====================================================================
-# 📈 【フラグメント2】セクターミニチャート一覧（完全独立）
+# 📈 【フラグメント2】セクターミニチャート一覧
 # =====================================================================
 @st.fragment
 def render_sector_mini_charts_fragment(is_jp: bool):
-    """17業種ETF、厳選テーマなどのミニチャート群を描画。リラン時に上部重ね書きに影響を与えません。"""
     st.markdown("### 📈 セクター・テーマ ミニチャート")
 
     col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1.5, 1.5, 1])
@@ -468,7 +458,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
     interval = interval_map[tf_label]
     resample_weekly = (tf_label == "週足")
 
-    # ─── 日本株モード ───
     if is_jp:
         view_mode = st.radio(
             "表示データを選択",
@@ -520,7 +509,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             etf_abs = pd.Series(dtype=float)
                             etf_sma75 = etf_sma200 = etf_wvf = etf_vol = pd.Series(dtype=float)
 
-                        # 💡 25MA を算出
                         etf_sma25 = etf_abs.rolling(window=25, min_periods=1).mean() if not etf_abs.empty else pd.Series(dtype=float)
 
                         etf_mom = get_sector_momentum(
@@ -528,7 +516,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             days=min(5, period_days)
                         )
                         badge_e = "🟢" if etf_mom >= 0 else "🔴"
-                        color_e = "#26a69a" if etf_mom >= 0 else "#ef5350"
 
                         btn_label = f"{badge_e} {code} {name} ({etf_mom:+.2f}%) 🔍"
                         if hc1.button(btn_label, key=f"btn_dlg_etf_{code}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
@@ -542,7 +529,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             )
 
                         if not etf_abs.empty:
-                            # 💡 25/75/200MA付きで描画
                             render_lwc_sector_mini(
                                 etf_abs, 
                                 sma25=etf_sma25,
@@ -568,7 +554,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                         render_etf_card(code, name)
 
         else:
-            # 厳選テーマ (シートA)
             sectors_loaded = load_sector_master_from_sheets(is_jp=True)
             if not sectors_loaded:
                 st.info("テーマデータが読み取れませんでした。")
@@ -593,13 +578,11 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             ret_rate, sma75, sma200, total_val = get_theme_return_rate_cached(
                                 interval, tuple(tickers), period_days, resample_weekly, is_jp=is_jp
                             )
-                            # 💡 25MA を算出
                             sma25 = ret_rate.rolling(window=25, min_periods=1).mean() if not ret_rate.empty else pd.Series(dtype=float)
 
                             if not ret_rate.empty:
                                 last_ret = ret_rate.iloc[-1]
                                 badge_t = "🟢" if last_ret >= 0 else "🔴"
-                                color_t = "#26a69a" if last_ret >= 0 else "#ef5350"
 
                                 btn_label = f"{badge_t} {t_name} ({last_ret:+.2f}%) 🔍"
                                 if hc1.button(btn_label, key=f"btn_dlg_theme_{t_name}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
@@ -612,7 +595,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                                         is_jp=is_jp
                                     )
 
-                                # 💡 25/75/200MA付きで描画
                                 render_lwc_sector_mini(
                                     ret_rate, 
                                     sma25=sma25,
@@ -637,7 +619,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                         with row_cols[ci]:
                             render_theme_card(t_name, tickers)
 
-    # ─── 米国株モード ───
     else:
         sectors = load_sector_master_from_sheets(is_jp)
         
@@ -672,7 +653,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                 sname, tickers = sector_list[idx]
                 mom = momentum_scores.get(sname, 0.0)
                 badge = "🟢" if mom >= 3.0 else "🔴" if mom <= -3.0 else "⚪"
-                color_theme = "#26a69a" if mom >= 3.0 else "#ef5350" if mom <= -3.0 else "#9e9e9e"
 
                 try:
                     sec_abs, sma75, sma200, is_wvf_lit, trading_val = get_sector_absolute_data_cached(
@@ -720,11 +700,10 @@ def render_sector_mini_charts_fragment(is_jp: bool):
 
 
 # =====================================================================
-# 📌 【フラグメント4】ウォッチリスト個別ミニチャート（完全独立）
+# 📌 【フラグメント4】ウォッチリスト個別ミニチャート
 # =====================================================================
 @st.fragment
 def render_watchlist_mini_charts_fragment(is_jp: bool):
-    """登録されている個別銘柄のミニチャートを描画。削除トリガー時にこのエリア内のみで即時更新が完結します。"""
     custom_tickers = st.session_state.get(CUSTOM_SECTOR_KEY, {})
     if not custom_tickers:
         return
@@ -814,18 +793,14 @@ if sample_df.empty:
     st.warning("⚠️ データベースが見つかりません。Google Drive上にデータが存在するか確認、または「データ管理・保守」画面で構築を行ってください。")
     st.stop()
 
-# ── 1. 重ね合わせ比較チャートフラグメントを実行
 render_overlay_chart_fragment(is_jp=is_jp)
 
 st.write("---")
 
-# ── 2. セクターミニチャート一覧フラグメントを実行
 render_sector_mini_charts_fragment(is_jp=is_jp)
 
 st.write("---")
 
-# ── 3. ウォッチリスト編集パネルフラグメントを実行
 render_watchlist_editor_fragment()
 
-# ── 4. ウォッチリスト個別ミニチャート一覧フラグメントを実行
 render_watchlist_mini_charts_fragment(is_jp=is_jp)
