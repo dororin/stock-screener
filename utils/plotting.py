@@ -174,7 +174,8 @@ def build_lwc_candle_chart(
     height: int = 200, 
     is_jp: bool = True, 
     wvf_df: pd.DataFrame = None,
-    bb_dict: dict = None
+    bb_dict: dict = None,
+    event_markers: list = None  # 💡 決算・配当イベント用極小ドットマーカー
 ) -> dict:
     if df is None or df.empty:
         return {}
@@ -301,7 +302,7 @@ def build_lwc_candle_chart(
         if not any(pd.isna(v) for v in [o, h, l, c])
     ]
 
-    series.append({
+    candlestick_series = {
         "type": "Candlestick",
         "data": candle_data,
         "options": {
@@ -312,7 +313,19 @@ def build_lwc_candle_chart(
             "priceLineVisible": False,
             "lastValueVisible": True,
         },
-    })
+    }
+
+    # 💡 決算（黄）・配当（水色）極小ドットマーカーの安全注入（チャート表示期間内のものに限定）
+    if event_markers:
+        valid_times = set(times)
+        filtered_markers = [
+            m for m in event_markers
+            if m.get("time") in valid_times
+        ]
+        if filtered_markers:
+            candlestick_series["markers"] = sorted(filtered_markers, key=lambda x: x["time"])
+
+    series.append(candlestick_series)
 
     # 4. 出来高
     if "volume" in df.columns:
@@ -524,13 +537,14 @@ def render_lwc_candle_mini(
     sma25: pd.Series = None,
     sma75: pd.Series = None, 
     sma200: pd.Series = None, 
-    sma_fast: pd.Series = None,
-    sma_slow: pd.Series = None,
+    sma_fast: pd.Series = None, 
+    sma_slow: pd.Series = None, 
     key: str = "lwc_candle", 
     height: int = 200, 
     is_jp: bool = True, 
     wvf_df: pd.DataFrame = None,
-    bb_dict: dict = None
+    bb_dict: dict = None,
+    event_markers: list = None  # 💡 決算・配当イベント用極小ドットマーカー
 ):
     chart_def = build_lwc_candle_chart(
         df, 
@@ -542,7 +556,8 @@ def render_lwc_candle_mini(
         height=height, 
         is_jp=is_jp, 
         wvf_df=wvf_df, 
-        bb_dict=bb_dict
+        bb_dict=bb_dict,
+        event_markers=event_markers
     )
     if not chart_def:
         st.caption("データなし")

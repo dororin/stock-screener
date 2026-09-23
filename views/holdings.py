@@ -5,13 +5,17 @@ import pandas as pd
 import numpy as np
 
 from config import settings
-from data_access.sheets_api import load_holdings_from_sheets
+from data_access.sheets_api import load_holdings_from_sheets, load_events_from_sheets
 from data_access.local_db import get_price_data_cached
 from core.calculator import compute_wvf_signals
+from core.event_collector import (
+    get_earnings_countdown_badge,
+    build_event_markers
+)
 from utils.plotting import render_lwc_candle_mini
 
 st.title("💼 所持中株（ポートフォリオ）")
-st.caption("楽天証券で保有中の現物ポジションを集約し、日足ミニチャート・口座別内訳・WVF状態を表示します。")
+st.caption("楽天証券で保有中の現物ポジションを集約し、日足ミニチャート・口座別内訳・WVF状態・決算カウントダウンを表示します。")
 
 
 # =====================================================================
@@ -50,7 +54,8 @@ def render_holdings_controls(df_holdings: pd.DataFrame):
 # 📌 【フラグメント2】個別保有銘柄カード
 # =====================================================================
 @st.fragment
-def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFrame, db_df: pd.DataFrame):
+def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFrame, db_df: pd.DataFrame, events_dict: dict = None):
+    ticker_clean = str(ticker).strip().upper()
     total_qty = int(group_df["保有数量"].sum())
     total_eval = float(group_df["時価評価額"].sum())
     total_profit = float(group_df["評価損益額"].sum())
@@ -85,7 +90,7 @@ def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFra
     # チャートデータの抽出と計算
     df_stock = pd.DataFrame()
     if not db_df.empty and "ticker" in db_df.columns:
-        mask = db_df["ticker"] == ticker
+        mask = db_df["ticker"] == ticker_clean
         if mask.any():
             df_stock = db_df[mask].copy().sort_values("date").reset_index(drop=True)
 
@@ -128,38 +133,51 @@ def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFra
             lime_streak = int((df_stock["is_lime"].iloc[::-1].cumprod()).sum())
             wvf_badge_html = (
                 f"<span style='font-size:0.75rem; background:#00e676; color:#000; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
-                f"🟢 パニック点灯中 ({lime_streak}日目)</span> "
+                f"🟢 点灯中({lime_streak}日目)</span> "
                 f"<span style='font-size:0.75rem; color:#b0bec5;'>翌日消灯目安: {ext_str}</span>"
             )
         elif latest_row.get("is_fuchsia", False):
-            # 最新1日のみ反応する反発消灯シグナル
             wvf_badge_html = (
                 f"<span style='font-size:0.75rem; background:#37474f; color:#ffffff; border:1px solid #78909c; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
                 f"⚪ 反発消灯</span>"
             )
         elif latest_row.get("is_normal_off", False):
-            # 最新1日のみ反応する通常消灯シグナル
             wvf_badge_html = (
                 f"<span style='font-size:0.75rem; background:#37474f; color:#ffffff; border:1px solid #78909c; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
                 f"⚪ 消灯</span>"
             )
         else:
-            # 平常時は消灯目安もバッジも一切非表示
             wvf_badge_html = ""
 
-    tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{ticker}"
+    # 💡 決算カウントダウン警告バッジ ＆ イベントマーカーの取得
+    ev_info = (events_dict or {}).get(ticker_clean, {})
+    next_earnings = ev_info.get("next_earnings", "")
+    prev_earnings = ev_info.get("prev_earnings", "")
+    prev_dividend = ev_info.get("prev_dividend", "")
+
+    earnings_badge_html = get_earnings_countdown_badge(next_earnings)
+    event_markers = build_event_markers(prev_earnings, prev_dividend)
+
+    header_badges = []
+    if wvf_badge_html:
+        header_badges.append(wvf_badge_html)
+    if earnings_badge_html:
+        header_badges.append(earnings_badge_html)
+    combined_badges_html = "&nbsp;&nbsp;".join(header_badges)
+
+    tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{ticker_clean}"
 
     with st.container(border=True):
         head_col1, head_col2 = st.columns([3, 2])
-        head_col1.markdown(f"#### [{ticker}]({tv_url}) {stock_name}")
+        head_col1.markdown(f"#### [{ticker_clean}]({tv_url}) {stock_name}")
         head_col2.markdown(
-            f"<div style='text-align:right; margin-top:6px;'>{wvf_badge_html}</div>", 
+            f"<div style='text-align:right; margin-top:6px; white-space:nowrap; overflow:hidden;'>{combined_badges_html}</div>", 
             unsafe_allow_html=True
         )
 
         c_left, c_right = st.columns([1, 1])
 
-        # ミニチャート（左側）
+        # ミニチャート（左側 ＆ イベントマーカー注入）
         with c_left:
             if not df_stock.empty and len(df_stock) >= 15:
                 sma25_s = chart_display.set_index("date")["sma25"]
@@ -170,11 +188,12 @@ def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFra
                     sma25=sma25_s,
                     sma75=sma75_s,
                     sma200=sma200_s,
-                    key=f"holding_candle_{ticker}",
+                    key=f"holding_candle_{ticker_clean}",
                     height=200,
                     is_jp=True,
                     wvf_df=chart_display,
-                    bb_dict=bb_dict
+                    bb_dict=bb_dict,
+                    event_markers=event_markers
                 )
             else:
                 st.caption("チャートデータ準備中（ローカルDBから取得できませんでした）")
@@ -205,6 +224,9 @@ if not holdings_raw_df.empty:
     holding_tickers = holdings_raw_df["銘柄コード"].unique().tolist()
     db_df = get_price_data_cached("1d", limit_days=365, is_jp=True)
 
+    # 決算・配当カレンダー辞書の高速ロード (O(1) 参照)
+    events_calendar_map = load_events_from_sheets()
+
     grouped = holdings_raw_df.groupby("銘柄コード")
     unique_tickers = list(grouped.groups.keys())
 
@@ -223,5 +245,6 @@ if not holdings_raw_df.empty:
                         ticker=t,
                         stock_name=s_name,
                         group_df=g_df,
-                        db_df=db_df
+                        db_df=db_df,
+                        events_dict=events_calendar_map
                     )

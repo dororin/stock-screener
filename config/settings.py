@@ -101,6 +101,7 @@ WATCHLIST_SHEET_NAME = "watchlist"
 REPAIR_LOG_SHEET_NAME = "repair_log"
 EXTRA_TICKERS_SHEET = "extra_tickers"
 HOLDINGS_SHEET_NAME = "my_holdings"  # 💡 保有株同期用シート名
+EVENT_CALENDAR_SHEET_NAME = "event_calendar"  # 💡 決算・配当カレンダー用シート名
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # --- セクター定義（スプレッドシート接続不可時のデフォルト） ---

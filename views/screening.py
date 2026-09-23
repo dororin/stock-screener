@@ -9,7 +9,12 @@ from data_access.local_db import get_price_data_cached
 from data_access.sheets_api import (
     save_history,
     get_history_list,
-    load_history
+    load_history,
+    load_events_from_sheets
+)
+from core.event_collector import (
+    get_earnings_countdown_badge,
+    build_event_markers
 )
 from core.screener import run_fast_screening
 from utils.plotting import render_lwc_candle_mini
@@ -102,13 +107,13 @@ def render_screener_controls_panel():
 # 📌 【フラグメント2】個別銘柄ミニチャートカード（セクターローテーション準拠）
 # =====================================================================
 @st.fragment
-def render_screened_stock_card(index_num: int, unique_key: str):
+def render_screened_stock_card(index_num: int, unique_key: str, events_dict: dict = None):
     rdf = st.session_state.result_df
     if index_num >= len(rdf):
         return
 
     r = rdf.iloc[index_num]
-    code = str(r['コード'])
+    code = str(r['コード']).strip().upper()
     name = str(r['銘柄'])
     tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{code}"
     display_label = f"{code}　{name}"
@@ -151,7 +156,7 @@ def render_screened_stock_card(index_num: int, unique_key: str):
         except Exception:
             pass
 
-    # WVFバッジの構成
+    # 1. WVFバッジの構成
     ext_val = r.get('消灯目安') if '消灯目安' in r else r.get('消灯目安(安値)', 0.0)
     try:
         ext_val = float(ext_val)
@@ -165,6 +170,21 @@ def render_screened_stock_card(index_num: int, unique_key: str):
         f"🟢 点灯中({streak}日目)</span> "
         f"<span style='font-size:0.75rem; color:#b0bec5;'>翌日消灯目安: {ext_str}</span>"
     )
+
+    # 2. 決算カウントダウン警告バッジ ＆ イベントマーカーの特定
+    ev_info = (events_dict or {}).get(code, {})
+    next_earnings = ev_info.get("next_earnings", "")
+    prev_earnings = ev_info.get("prev_earnings", "")
+    prev_dividend = ev_info.get("prev_dividend", "")
+
+    earnings_badge_html = get_earnings_countdown_badge(next_earnings)
+    event_markers = build_event_markers(prev_earnings, prev_dividend)
+
+    # バッジ行の結合
+    if earnings_badge_html:
+        header_badges_html = f"{wvf_badge_html}&nbsp;&nbsp;{earnings_badge_html}"
+    else:
+        header_badges_html = wvf_badge_html
 
     s_badge = "🟢" if s_mom >= 3.0 else "🔴" if s_mom <= -3.0 else "⚪"
     s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
@@ -190,14 +210,14 @@ def render_screened_stock_card(index_num: int, unique_key: str):
         if new_fav != is_fav:
             st.session_state.result_df.at[index_num, 'お気に入り'] = new_fav
 
-        # 2行目: WVF点灯日数 & 翌日消灯目安
+        # 2行目: WVF点灯日数 & 翌日消灯目安 ＆ 決算カウントダウン警告バッジ
         st.markdown(
-            f"<div style='margin-top:2px; margin-bottom:4px; height:20px; line-height:20px; overflow:hidden;'>"
-            f"{wvf_badge_html}</div>",
+            f"<div style='margin-top:2px; margin-bottom:4px; height:20px; line-height:20px; overflow:hidden; white-space:nowrap;'>"
+            f"{header_badges_html}</div>",
             unsafe_allow_html=True
         )
 
-        # 3行目: ローソク足ミニチャート (高さ170px)
+        # 3行目: ローソク足ミニチャート (高さ170px ＆ 過去イベント極小ドットマーカー注入)
         if not chart_df.empty and len(chart_df) >= 2:
             disp_indexed = chart_df.set_index("date")
             render_lwc_candle_mini(
@@ -209,7 +229,8 @@ def render_screened_stock_card(index_num: int, unique_key: str):
                 height=170,
                 is_jp=True,
                 wvf_df=chart_df,
-                bb_dict=bb_dict
+                bb_dict=bb_dict,
+                event_markers=event_markers
             )
         else:
             st.caption("データなし")
@@ -220,6 +241,9 @@ def render_screened_stock_card(index_num: int, unique_key: str):
 # =====================================================================
 
 render_screener_controls_panel()
+
+# 決算・配当カレンダー辞書の高速ロード (O(1) 参照用)
+events_calendar_map = load_events_from_sheets()
 
 # ─── 実行ログ（エラーや例外が存在する場合のみ表示） ───
 if st.session_state.screening_logs:
@@ -244,7 +268,11 @@ if not st.session_state.result_df.empty:
         for j in range(N_COLS):
             if i + j < len(rdf):
                 with cols[j]:
-                    render_screened_stock_card(index_num=i + j, unique_key=f"g_{i}_{j}")
+                    render_screened_stock_card(
+                        index_num=i + j,
+                        unique_key=f"g_{i}_{j}",
+                        events_dict=events_calendar_map
+                    )
 else:
     if st.session_state.performed_scan:
         st.warning("⚠️ スキャンの結果、条件に一致する銘柄は見つかりませんでした。")

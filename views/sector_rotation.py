@@ -13,7 +13,12 @@ from data_access.local_db import get_price_data_cached
 from data_access.sheets_api import (
     load_watchlist_from_sheets,
     save_watchlist_to_sheets,
-    load_sector_master_from_sheets
+    load_sector_master_from_sheets,
+    load_events_from_sheets
+)
+from core.event_collector import (
+    get_earnings_countdown_badge,
+    build_event_markers
 )
 from core.screener import get_jpx_full_list
 from core.calculator import (
@@ -124,6 +129,7 @@ def show_constituents_dialog(
         return
 
     name_map = get_all_stock_names_map(is_jp)
+    events_map = load_events_from_sheets()  # 💡 決算・配当カレンダーをO(1)参照
     db_df = get_price_data_cached(interval, limit_days=period_days + 365, is_jp=is_jp)
     display_start = pd.Timestamp.now() - pd.Timedelta(days=period_days)
 
@@ -179,7 +185,7 @@ def show_constituents_dialog(
                     if len(recent_closes) >= 2 and recent_closes[0] > 0:
                         s_mom = float((recent_closes[-1] / recent_closes[0] - 1) * 100)
 
-                    # 💡 WVFシグナル状態判定（最新日のみ反応、消灯目安は最新日点灯時のみ表示）
+                    # WVFシグナル状態判定
                     latest_row = df_stock.iloc[-1]
                     ext_price_val = latest_row.get("ext_price", np.nan)
                     ext_str = f"¥{ext_price_val:,.1f}" if pd.notna(ext_price_val) else "-"
@@ -192,19 +198,16 @@ def show_constituents_dialog(
                             f"<span style='font-size:0.75rem; color:#b0bec5;'>翌日消灯目安: {ext_str}</span>"
                         )
                     elif latest_row.get("is_fuchsia", False):
-                        # 最新1日のみ反応する反発消灯シグナル
                         wvf_badge_html = (
                             f"<span style='font-size:0.75rem; background:#37474f; color:#ffffff; border:1px solid #78909c; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
                             f"⚪ 反発消灯</span>"
                         )
                     elif latest_row.get("is_normal_off", False):
-                        # 最新1日のみ反応する通常消灯シグナル
                         wvf_badge_html = (
                             f"<span style='font-size:0.75rem; background:#37474f; color:#ffffff; border:1px solid #78909c; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
                             f"⚪ 消灯</span>"
                         )
                     else:
-                        # 平常時は消灯目安もバッジも非表示
                         wvf_badge_html = ""
 
                     df_display = df_stock[df_stock["date"] >= display_start].copy().reset_index(drop=True)
@@ -217,6 +220,23 @@ def show_constituents_dialog(
                             "p3": disp_indexed["bb_p3"],
                             "m3": disp_indexed["bb_m3"]
                         }
+
+                # 💡 決算カウントダウン警告バッジ ＆ イベントマーカーの取得
+                ev_info = (events_map or {}).get(clean_code, {})
+                next_earnings = ev_info.get("next_earnings", "")
+                prev_earnings = ev_info.get("prev_earnings", "")
+                prev_dividend = ev_info.get("prev_dividend", "")
+
+                earnings_badge_html = get_earnings_countdown_badge(next_earnings)
+                event_markers = build_event_markers(prev_earnings, prev_dividend)
+
+                # バッジ表示の合成
+                badge_items = []
+                if wvf_badge_html:
+                    badge_items.append(wvf_badge_html)
+                if earnings_badge_html:
+                    badge_items.append(earnings_badge_html)
+                badges_combined_html = "&nbsp;&nbsp;".join(badge_items)
 
                 s_badge = "🟢" if s_mom >= 3.0 else "🔴" if s_mom <= -3.0 else "⚪"
                 s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
@@ -239,8 +259,8 @@ def show_constituents_dialog(
                     )
 
                     st.markdown(
-                        f"<div style='margin-top:2px; margin-bottom:4px; height:18px; line-height:18px; overflow:hidden;'>"
-                        f"{wvf_badge_html}</div>",
+                        f"<div style='margin-top:2px; margin-bottom:4px; height:18px; line-height:18px; overflow:hidden; white-space:nowrap;'>"
+                        f"{badges_combined_html}</div>",
                         unsafe_allow_html=True
                     )
 
@@ -257,7 +277,8 @@ def show_constituents_dialog(
                             height=170,
                             is_jp=is_jp,
                             wvf_df=df_display,
-                            bb_dict=bb_dict
+                            bb_dict=bb_dict,
+                            event_markers=event_markers
                         )
                     else:
                         st.caption("データなし")

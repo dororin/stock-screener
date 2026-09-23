@@ -1,6 +1,7 @@
 # data_access/sheets_api.py
 
 import os
+import json
 import pandas as pd
 import pytz
 from datetime import datetime
@@ -262,7 +263,7 @@ def save_watchlist_to_sheets(watchlist: dict):
         pass
 
 # =====================================================================
-# 💼 【新規追加】保有銘柄データ（my_holdings）の読み書き
+# 💼 保有銘柄データ（my_holdings）の読み書き
 # =====================================================================
 HOLDINGS_COLUMNS = ["銘柄コード", "銘柄名", "口座区分", "保有数量", "取得単価", "現在値", "時価評価額", "評価損益額", "評価損益率", "更新日時"]
 
@@ -311,6 +312,123 @@ def load_holdings_from_sheets() -> pd.DataFrame:
     except Exception as e:
         print(f"❌ [sheets_api] 保有銘柄シートのロードに失敗しました: {e}")
         return pd.DataFrame()
+
+# =====================================================================
+# 📅 【新規追加】決算・配当カレンダー（event_calendar）の読み書き
+# =====================================================================
+EVENT_CALENDAR_COLUMNS = ["銘柄コード", "銘柄名", "次回決算日", "直近決算日", "次回配当日", "直近配当日", "更新日時"]
+
+def save_events_to_sheets(df: pd.DataFrame) -> bool:
+    """
+    TradingViewから取得した決算・配当スケジュールを
+    Google Sheets (event_calendar) に保存し、同時にローカルJSONへキャッシュします。
+    """
+    if df is None or df.empty:
+        return False
+
+    save_df = df.copy()
+    for col in EVENT_CALENDAR_COLUMNS:
+        if col not in save_df.columns:
+            save_df[col] = ""
+    save_df = save_df[EVENT_CALENDAR_COLUMNS].fillna("")
+
+    # 1. ローカルJSONキャッシュへの高速保存
+    try:
+        json_path = os.path.join(settings.WORK_DIR, "event_calendar.json")
+        os.makedirs(settings.WORK_DIR, exist_ok=True)
+        event_dict = {}
+        for _, row in save_df.iterrows():
+            code = str(row["銘柄コード"]).strip().upper()
+            if code:
+                event_dict[code] = {
+                    "code": code,
+                    "name": str(row["銘柄名"]).strip(),
+                    "next_earnings": str(row["次回決算日"]).strip(),
+                    "prev_earnings": str(row["直近決算日"]).strip(),
+                    "next_dividend": str(row["次回配当日"]).strip(),
+                    "prev_dividend": str(row["直近配当日"]).strip(),
+                    "updated_at": str(row["更新日時"]).strip(),
+                }
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(event_dict, f, ensure_ascii=False, indent=2)
+    except Exception as e_json:
+        print(f"⚠️ [sheets_api] event_calendar.json のローカル保存に失敗しました: {e_json}")
+
+    # 2. Google Sheetsへの永続保存
+    sh = get_sector_spreadsheet()
+    if sh is None:
+        return False
+    try:
+        sheet_name = getattr(settings, "EVENT_CALENDAR_SHEET_NAME", "event_calendar")
+        try:
+            ws = sh.worksheet(sheet_name)
+        except Exception:
+            ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=len(EVENT_CALENDAR_COLUMNS))
+
+        rows = [EVENT_CALENDAR_COLUMNS] + save_df.values.tolist()
+        ws.clear()
+        ws.update(values=rows, range_name="A1")
+        return True
+    except Exception as e:
+        print(f"❌ [sheets_api] 決算・配当シートへの書き込みに失敗しました: {e}")
+        return False
+
+def load_events_from_sheets(force_sheets: bool = False) -> dict:
+    """
+    決算・配当カレンダーを O(1) で引ける辞書形式 {銘柄コード: {...}} で返します。
+    ローカルJSONが存在すればミリ秒単位で高速ロードし、存在しない場合はGoogle Sheetsから取得・復元します。
+    """
+    json_path = os.path.join(settings.WORK_DIR, "event_calendar.json")
+
+    # 1. ローカルJSONキャッシュ優先ロード
+    if not force_sheets and os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data and isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+
+    # 2. Google Sheetsからのフォールバックロード
+    sh = get_sector_spreadsheet()
+    if sh is None:
+        return {}
+
+    try:
+        sheet_name = getattr(settings, "EVENT_CALENDAR_SHEET_NAME", "event_calendar")
+        ws = sh.worksheet(sheet_name)
+        records = ws.get_all_records()
+        if not records:
+            return {}
+
+        event_dict = {}
+        for r in records:
+            code = str(r.get("銘柄コード", "")).strip().split(".")[0].upper()
+            if not code:
+                continue
+            event_dict[code] = {
+                "code": code,
+                "name": str(r.get("銘柄名", "")).strip(),
+                "next_earnings": str(r.get("次回決算日", "")).strip(),
+                "prev_earnings": str(r.get("直近決算日", "")).strip(),
+                "next_dividend": str(r.get("次回配当日", "")).strip(),
+                "prev_dividend": str(r.get("直近配当日", "")).strip(),
+                "updated_at": str(r.get("更新日時", "")).strip(),
+            }
+
+        # 取得できた場合はローカルキャッシュも更新
+        try:
+            os.makedirs(settings.WORK_DIR, exist_ok=True)
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(event_dict, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        return event_dict
+    except Exception as e:
+        print(f"❌ [sheets_api] 決算・配当カレンダーのロードに失敗しました: {e}")
+        return {}
 
 REPAIR_LOG_COLUMNS = ["executed_at", "ticker", "market", "cliff_date", "interval", "before_close", "after_close", "multiplier", "memo"]
 

@@ -15,13 +15,17 @@ from data_access.sheets_api import (
     save_extra_tickers_to_sheets,
     load_repair_log_from_sheets,
     save_repair_log_to_sheets,
-    upload_sync_log_to_drive
+    upload_sync_log_to_drive,
+    load_events_from_sheets,
+    save_events_to_sheets,
+    load_sector_master_from_sheets
 )
 from core.collector import (
     sync_extra_tickers_to_local,
     get_all_collection_tickers,
     sanitize_ticker
 )
+from core.event_collector import fetch_events_from_tradingview
 from core.screener import get_jpx_full_list
 from core.database_service import (
     analyze_db_update_needs,
@@ -53,6 +57,59 @@ def get_db_last_update_cached(interval: str, is_jp: bool = True) -> str:
         return last.strftime("%Y-%m-%d")
     except Exception:
         return "不明"
+
+
+# ── 📅 決算発表日・配当権利日マスタ一括更新コンポーネント ──
+@st.fragment
+def render_sync_event_calendar_ui(is_jp: bool):
+    """TradingView Screener APIから全監視銘柄の最新スケジュールを一括バルク取得・保存するコンポーネント"""
+    with st.container(border=True):
+        st.subheader("📅 決算発表日・配当権利日マスタ更新")
+        st.caption("TradingViewから全監視銘柄の次回・直近決算日および配当権利日スケジュールを一括バルク取得します。")
+
+        events_dict = load_events_from_sheets()
+        count = len(events_dict)
+        last_updated = "未同期"
+        if count > 0:
+            sample_item = next(iter(events_dict.values()))
+            last_updated = sample_item.get("updated_at", "不明")
+
+        c_info1, c_info2 = st.columns([2, 1])
+        c_info1.markdown(f"**最終同期日時:** `{last_updated}` （登録数: **{count:,}** 銘柄）")
+
+        btn_label = "🔄 決算・配当カレンダーを一括更新 (約3秒)"
+        if c_info2.button(btn_label, key="btn_sync_events_calendar", type="primary", use_container_width=True):
+            with st.spinner("TradingViewから全銘柄の決算・配当スケジュールを取得中..."):
+                try:
+                    # 1. スプレッドシートから既存の全監視銘柄コードを取得
+                    if is_jp:
+                        all_tickers = get_all_collection_tickers()
+                    else:
+                        us_sectors = load_sector_master_from_sheets(is_jp=False)
+                        all_tickers = sorted(list({t for t_list in us_sectors.values() for t in t_list}))
+
+                    if not all_tickers:
+                        st.error("❌ 対象銘柄リストが取得できませんでした。")
+                        return
+
+                    # 2. TradingView Screener API からバルク取得
+                    df_events = fetch_events_from_tradingview(all_tickers, is_jp=is_jp)
+
+                    if df_events.empty:
+                        st.warning("⚠️ TradingViewからイベントデータを取得できませんでした。")
+                        return
+
+                    # 3. Google Sheets (event_calendar) およびローカルJSONへ書き込み
+                    saved = save_events_to_sheets(df_events)
+                    if saved:
+                        st.cache_data.clear()
+                        st.success(f"✅ {len(df_events)} 銘柄のスケジュールを正常に更新しました！")
+                        time.sleep(1.0)
+                        st.rerun(scope="fragment")
+                    else:
+                        st.error("❌ スプレッドシートへの保存に失敗しました。")
+                except Exception as ex:
+                    st.error(f"❌ カレンダー同期中にエラーが発生しました: {ex}")
 
 
 # ── 追加ETF（extra_tickers）管理コンポーネント ──
@@ -987,6 +1044,9 @@ render_jp_manual_merge_center(is_jp)
 
 # 🚀 日本株専用：統合段差スキャン・一括自動修復（日本株選択時のみ）
 render_jp_split_scan_and_repair_ui(is_jp)
+
+# 📅 決算発表日・配当権利日マスタ一括更新コンポーネント
+render_sync_event_calendar_ui(is_jp)
 
 # 🔄 ETF構成銘柄の同期（結果が消えないように新設関数で呼出）
 render_sync_etf_master_ui(is_jp)
