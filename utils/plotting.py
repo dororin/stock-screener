@@ -12,12 +12,12 @@ from streamlit_lightweight_charts import renderLightweightCharts
 # =====================================================================
 
 def _to_lwc_time(dt_index) -> list:
-    """DatetimeIndexをLWCのtime文字列（YYYY-MM-DD）リストに変換します。"""
+    """DatetimeIndex/SeriesをLWCのtime文字列（YYYY-MM-DD）リストに変換します。"""
     return [str(d)[:10] for d in dt_index]
 
-def _lwc_base_options(height: int = 160, right_offset: int = 5) -> dict:
+def _lwc_base_options(height: int = 160, right_offset: int = 5, has_left_scale: bool = False) -> dict:
     """LWC共通レイアウトオプションを生成します。"""
-    return {
+    opts = {
         "height": height,
         "layout": {
             "background": {"type": "solid", "color": "transparent"},
@@ -33,8 +33,9 @@ def _lwc_base_options(height: int = 160, right_offset: int = 5) -> dict:
             "borderColor": "rgba(128,128,128,0.3)", 
             "scaleMargins": {
                 "top": 0.08, 
-                "bottom": 0.25
-            }
+                "bottom": 0.15
+            },
+            "visible": True,
         },
         "overlayPriceScales": {
             "scaleMargins": {
@@ -51,6 +52,13 @@ def _lwc_base_options(height: int = 160, right_offset: int = 5) -> dict:
         "handleScroll": True,
         "handleScale": True,
     }
+    if has_left_scale:
+        opts["leftPriceScale"] = {
+            "borderColor": "rgba(128,128,128,0.3)",
+            "scaleMargins": {"top": 0.08, "bottom": 0.15},
+            "visible": True,
+        }
+    return opts
 
 def detect_price_format(prices, is_jp: bool = True) -> dict:
     """株価データから適切な小数点桁数と刻み幅を動的に判定します。"""
@@ -175,7 +183,7 @@ def build_lwc_candle_chart(
     is_jp: bool = True, 
     wvf_df: pd.DataFrame = None,
     bb_dict: dict = None,
-    event_markers: list = None  # 💡 決算・配当イベント用極小ドットマーカー
+    event_markers: list = None
 ) -> dict:
     if df is None or df.empty:
         return {}
@@ -188,7 +196,6 @@ def build_lwc_candle_chart(
     else:
         times = _to_lwc_time(df.index)
 
-    # 💡 安全対策：Seriesが日付インデックスを持たない（連番0,1,2...）場合でもローソク足のtimesにフォールバック
     def _safe_get_times(s: pd.Series) -> list:
         if s is None or s.empty:
             return []
@@ -315,7 +322,6 @@ def build_lwc_candle_chart(
         },
     }
 
-    # 💡 決算（黄）・配当（水色）極小ドットマーカーの安全注入（チャート表示期間内のものに限定）
     if event_markers:
         valid_times = set(times)
         filtered_markers = [
@@ -346,7 +352,7 @@ def build_lwc_candle_chart(
 
             sig = wvf_map.get(t, {})
             if sig.get("lime"):
-                color = "rgba(0, 230, 118, 0.95)"   # 🟢 パニック点灯中のみ緑ライトアップ
+                color = "rgba(0, 230, 118, 0.95)"
             else:
                 color = "rgba(38, 166, 154, 0.2)" if (pd.isna(o) or pd.isna(c) or c >= o) else "rgba(239, 83, 80, 0.2)"
 
@@ -544,7 +550,7 @@ def render_lwc_candle_mini(
     is_jp: bool = True, 
     wvf_df: pd.DataFrame = None,
     bb_dict: dict = None,
-    event_markers: list = None  # 💡 決算・配当イベント用極小ドットマーカー
+    event_markers: list = None
 ):
     chart_def = build_lwc_candle_chart(
         df, 
@@ -562,6 +568,97 @@ def render_lwc_candle_mini(
     if not chart_def:
         st.caption("データなし")
         return
+    try:
+        renderLightweightCharts([chart_def], key=key)
+    except Exception as e:
+        st.caption(f"描画エラー: {e}")
+
+# =====================================================================
+# 🚀 【新設】マーケット情報専用の共通LWC描画関数群
+# =====================================================================
+
+def render_lwc_dual_line_chart(
+    series1_data: list,
+    series2_data: list,
+    title1: str = "",
+    title2: str = "",
+    color1: str = "#ffa726",
+    color2: str = "#ef5350",
+    height: int = 230,
+    key: str = "dual_line_chart"
+):
+    """日経平均(左軸) & 裁定倍率(右軸)のような2軸折れ線チャートを描画します。"""
+    chart_options = _lwc_base_options(height=height, right_offset=8, has_left_scale=True)
+    chart_def = {
+        "chart": chart_options,
+        "series": [
+            {
+                "type": "Line",
+                "data": series1_data,
+                "options": {
+                    "color": color1,
+                    "lineWidth": 2,
+                    "priceScaleId": "left",
+                    "title": title1,
+                    "lastValueVisible": True,
+                    "crosshairMarkerVisible": True,
+                }
+            },
+            {
+                "type": "Line",
+                "data": series2_data,
+                "options": {
+                    "color": color2,
+                    "lineWidth": 2,
+                    "priceScaleId": "right",
+                    "title": title2,
+                    "lastValueVisible": True,
+                    "crosshairMarkerVisible": True,
+                }
+            }
+        ]
+    }
+    try:
+        renderLightweightCharts([chart_def], key=key)
+    except Exception as e:
+        st.caption(f"描画エラー: {e}")
+
+def render_lwc_area_chart(
+    series_definitions: list,
+    height: int = 160,
+    key: str = "area_chart"
+):
+    """信用比率・NAAIM指数・信用残高などのエリア／ラインチャートを描画します。"""
+    chart_options = _lwc_base_options(height=height, right_offset=8)
+    chart_def = {
+        "chart": chart_options,
+        "series": series_definitions
+    }
+    try:
+        renderLightweightCharts([chart_def], key=key)
+    except Exception as e:
+        st.caption(f"描画エラー: {e}")
+
+def render_lwc_histogram_chart(
+    hist_data: list,
+    color: str = "#42a5f5",
+    height: int = 160,
+    key: str = "hist_chart"
+):
+    """裁定買残などのヒストグラムチャートを描画します。"""
+    chart_options = _lwc_base_options(height=height, right_offset=5)
+    chart_def = {
+        "chart": chart_options,
+        "series": [{
+            "type": "Histogram",
+            "data": hist_data,
+            "options": {
+                "color": color,
+                "priceFormat": {"type": "volume"},
+                "lastValueVisible": True
+            }
+        }]
+    }
     try:
         renderLightweightCharts([chart_def], key=key)
     except Exception as e:

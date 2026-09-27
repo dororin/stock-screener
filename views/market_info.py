@@ -1,3 +1,5 @@
+# views/market_info.py
+
 import io
 import re
 import json
@@ -6,40 +8,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
-import yfinance as yf
 
 from config import settings
 from data_access.sheets_api import conn
-from streamlit_lightweight_charts import renderLightweightCharts
-
-# =====================================================================
-# 📊 LWC 共通ヘルパー関数
-# =====================================================================
-def _to_lwc_time(dt_series) -> list:
-    return [str(d)[:10] for d in dt_series]
-
-def _lwc_base_options(height: int = 160) -> dict:
-    return {
-        "height": height,
-        "layout": {
-            "background": {"type": "solid", "color": "transparent"},
-            "textColor": "#9e9e9e",
-            "fontSize": 10,
-        },
-        "grid": {
-            "vertLines": {"color": "rgba(128,128,128,0.12)"},
-            "horzLines": {"color": "rgba(128,128,128,0.12)"},
-        },
-        "crosshair": {"mode": 1},
-        "timeScale": {
-            "borderColor": "rgba(128,128,128,0.3)",
-            "timeVisible": True,
-            "secondsVisible": False
-        },
-        "handleScroll": True,
-        "handleScale": True,
-    }
-
+from utils.ui_components import card_container, render_card_header, build_status_badge
+from utils.plotting import (
+    _to_lwc_time,
+    render_lwc_dual_line_chart,
+    render_lwc_area_chart,
+    render_lwc_histogram_chart
+)
 
 # =====================================================================
 # 📡 NAAIM Exposure Index 収集・同期ロジック
@@ -104,7 +82,6 @@ def update_and_load_naaim_data() -> pd.DataFrame:
         except Exception:
             pass
     return merged_df
-
 
 # =====================================================================
 # 📡 信用残高（IRBank / 日経225JP）収集・同期ロジック
@@ -208,7 +185,6 @@ def update_and_load_sinyou_data() -> pd.DataFrame:
         pass
     return merged_df
 
-
 # =====================================================================
 # 📡 裁定取引残高 収集・同期ロジック
 # =====================================================================
@@ -273,7 +249,6 @@ def update_and_load_saitei_data() -> pd.DataFrame:
         pass
     return merged_df
 
-
 # =====================================================================
 # 📈 セッション状態の初期化
 # =====================================================================
@@ -298,43 +273,38 @@ if 'naaim_df' not in st.session_state:
     except Exception:
         st.session_state.naaim_df = pd.DataFrame()
 
-
 st.title("📈 マーケット情報")
-st.write("---")
-
+st.caption("日経平均・裁定取引・信用取引残高および米NAAIM指数の動向をモニタリングします。")
 
 # =====================================================================
-# 📊 【フラグメント1】全体指数分析ダッシュボード（LWC化 ＆ 閉域化）
+# 📊 【フラグメント1】全体指数分析ダッシュボード
 # =====================================================================
 @st.fragment
 def render_market_dashboard_fragment():
-    """指数最新化・期間選択・各種LWCダッシュボードを内包。ボタンやスライダー操作が外部に影響しません。"""
-    
-    # フラグメント内での指数最新化処理
-    if st.button("🔄 マーケット指数データを最新化 (Google Sheets同期)", type="primary", use_container_width=True):
-        with st.spinner("外部サイトから指数情報を最新化しています..."):
-            df_s = update_and_load_saitei_data()
-            if not df_s.empty:
-                st.session_state.saitei_df = df_s
-            df_m = update_and_load_sinyou_data()
-            if not df_m.empty:
-                st.session_state.sinyou_df = df_m
-            df_n = update_and_load_naaim_data()
-            if not df_n.empty:
-                st.session_state.naaim_df = df_n
-            st.success("指数データの同期が完了しました。")
-            st.rerun(scope="fragment")
-
-    st.markdown("### 📊 指数複合ダッシュボード")
-    
-    # 期間コントロール
-    period = st.radio(
-        "表示期間の変更:", 
-        ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "3年", "全"], 
-        index=3, 
-        horizontal=True,
-        key="dashboard_period_selector"
-    )
+    with card_container(border=True):
+        col_ctrl1, col_ctrl2 = st.columns([3, 1])
+        with col_ctrl1:
+            period = st.radio(
+                "表示期間", 
+                ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "3年", "全期間"], 
+                index=3, 
+                horizontal=True,
+                key="dashboard_period_selector"
+            )
+        with col_ctrl2:
+            if st.button("🔄 指数データを最新化", type="primary", use_container_width=True, help="外部サイトから指数情報を同期します"):
+                with st.spinner("外部サイトから指数情報を最新化中..."):
+                    df_s = update_and_load_saitei_data()
+                    if not df_s.empty:
+                        st.session_state.saitei_df = df_s
+                    df_m = update_and_load_sinyou_data()
+                    if not df_m.empty:
+                        st.session_state.sinyou_df = df_m
+                    df_n = update_and_load_naaim_data()
+                    if not df_n.empty:
+                        st.session_state.naaim_df = df_n
+                    st.toast("✅ 指数データの同期が完了しました。")
+                    st.rerun(scope="fragment")
 
     saitei_df = st.session_state.saitei_df
     sinyou_df = st.session_state.sinyou_df
@@ -344,7 +314,6 @@ def render_market_dashboard_fragment():
         st.warning("⚠️ 指数データがありません。上記ボタンを押して初期データを同期・取得してください。")
         return
 
-    # 期間フィルター計算
     end_dt = saitei_df['Date'].max() if not saitei_df.empty else pd.Timestamp.now()
     if period == "1ヶ月":
         start_dt = end_dt - pd.DateOffset(months=1)
@@ -359,17 +328,6 @@ def render_market_dashboard_fragment():
     else:
         start_dt = saitei_df['Date'].min() if not saitei_df.empty else end_dt - pd.DateOffset(years=10)
 
-    # 1. 総合メトリクス表示
-    m_col1, m_col2 = st.columns(2)
-    with m_col1:
-        if not naaim_df.empty:
-            latest_naaim = naaim_df.iloc[-1]
-            prev_naaim = naaim_df.iloc[-2] if len(naaim_df) > 1 else latest_naaim
-            delta = round(latest_naaim['NAAIM'] - prev_naaim['NAAIM'], 2)
-            st.metric("最新 NAAIM Exposure Index", f"{latest_naaim['NAAIM']}", delta=f"{delta}")
-            st.caption(f"更新日: {latest_naaim['Date'].strftime('%Y-%m-%d')}")
-
-    # 日本株指数データの加工マージ
     df_jp = pd.DataFrame()
     if not saitei_df.empty and not sinyou_df.empty:
         d1 = saitei_df.copy()
@@ -386,124 +344,165 @@ def render_market_dashboard_fragment():
         
         df_jp['ratio_sai'] = df_jp[buy_sai_col] / df_jp[nik_col]
         df_jp['ratio_sin'] = df_jp[buy_sin_col] / df_jp[nik_col]
-
-        # 期間でスライス
         df_jp = df_jp[(df_jp['date'] >= start_dt) & (df_jp['date'] <= end_dt)]
 
-    st.write("---")
+    st.markdown("### 📊 日本市場 指数＆需給複合分析")
 
-    # 2. チャート1: 日経平均 (左) & 裁定倍率 (右) の LWC 重ね書き
+    # 1. 日経平均 & 裁定倍率
     if not df_jp.empty:
-        st.markdown("**📈 日経平均 ＆ 裁定倍率推移**")
         times = _to_lwc_time(df_jp['date'])
+        latest_row = df_jp.iloc[-1]
+        prev_row = df_jp.iloc[-2] if len(df_jp) > 1 else latest_row
         
-        nk_data = [{"time": t, "value": float(v)} for t, v in zip(times, df_jp[nik_col]) if not pd.isna(v)]
-        ratio_data = [{"time": t, "value": float(v)} for t, v in zip(times, df_jp['ratio_sai']) if not pd.isna(v)]
+        nik_latest = latest_row[nik_col]
+        nik_diff = nik_latest - prev_row[nik_col]
+        nik_pct = (nik_diff / prev_row[nik_col] * 100.0) if prev_row[nik_col] > 0 else 0.0
 
-        chart_options = _lwc_base_options(height=260)
-        chart_options["leftPriceScale"] = {"visible": True, "borderColor": "rgba(128,128,128,0.3)"}
-        chart_options["rightPriceScale"] = {"visible": True, "borderColor": "rgba(128,128,128,0.3)"}
+        sai_ratio_latest = latest_row['ratio_sai']
+        sai_ratio_diff = sai_ratio_latest - prev_row['ratio_sai']
 
-        chart_def = {
-            "chart": chart_options,
-            "series": [
-                {
-                    "type": "Line",
-                    "data": nk_data,
-                    "options": {
-                        "color": "#ffa726",
-                        "lineWidth": 2,
-                        "priceScaleId": "left",
-                        "title": "日経平均 (左軸)",
-                        "lastValueVisible": True,
-                    }
-                },
-                {
-                    "type": "Line",
-                    "data": ratio_data,
-                    "options": {
-                        "color": "#ef5350",
-                        "lineWidth": 2,
-                        "priceScaleId": "right",
-                        "title": "裁定倍率 (右軸)",
-                        "lastValueVisible": True,
-                    }
-                }
-            ]
-        }
-        renderLightweightCharts([chart_def], key="lwc_jp_index")
+        with card_container(border=True):
+            badge_html = (
+                f"<span style='color:#ffa726; margin-right:12px;'>日経平均(左): <b>¥{nik_latest:,.0f}</b></span>"
+                f"<span style='color:#ef5350;'>裁定倍率(右): <b>{sai_ratio_latest:.4f}</b></span> "
+                f"<span style='color:#9e9e9e; margin-left:8px;'>(更新: {latest_row['date'].strftime('%Y-%m-%d')})</span>"
+            )
+            render_card_header(
+                title="日経平均 ＆ 裁定倍率推移",
+                mom_value=nik_pct,
+                mom_sub_text=f"倍率差: {sai_ratio_diff:+.4f}",
+                badge_html=badge_html
+            )
 
-        # 3. チャート2: 裁定買残 (Histogram) ＆ 信用比率 (Area)
-        st.markdown("**📊 裁定買残 (億円) ＆ 信用比率 (買残/日経平均)**")
-        col_c1, col_c2 = st.columns(2)
-        with col_c1:
-            st.caption("裁定買残推移")
-            sai_vol_data = [{"time": t, "value": float(v), "color": "rgba(31, 119, 180, 0.75)"} for t, v in zip(times, df_jp[buy_sai_col]) if not pd.isna(v)]
-            chart_def_sai = {
-                "chart": _lwc_base_options(height=180),
-                "series": [{"type": "Histogram", "data": sai_vol_data, "options": {"color": "#1f77b4"}}]
-            }
-            renderLightweightCharts([chart_def_sai], key="lwc_sai_vol")
+            nk_data = [{"time": t, "value": float(v)} for t, v in zip(times, df_jp[nik_col]) if not pd.isna(v)]
+            ratio_data = [{"time": t, "value": float(v)} for t, v in zip(times, df_jp['ratio_sai']) if not pd.isna(v)]
 
-        with col_c2:
-            st.caption("信用比率推移")
-            sin_ratio_data = [{"time": t, "value": float(v)} for t, v in zip(times, df_jp['ratio_sin']) if not pd.isna(v)]
-            chart_def_sin = {
-                "chart": _lwc_base_options(height=180),
-                "series": [{
-                    "type": "Area", 
-                    "data": sin_ratio_data, 
-                    "options": {
-                        "topColor": "rgba(38, 166, 154, 0.4)", 
-                        "bottomColor": "rgba(38, 166, 154, 0.05)", 
-                        "lineColor": "#26a69a", 
-                        "lineWidth": 1.5
-                    }
-                }]
-            }
-            renderLightweightCharts([chart_def_sin], key="lwc_sin_ratio")
+            render_lwc_dual_line_chart(
+                series1_data=nk_data,
+                series2_data=ratio_data,
+                title1="日経平均",
+                title2="裁定倍率",
+                height=230,
+                key="lwc_jp_index"
+            )
 
-    # 4. チャート3: NAAIM Index (US)
+        col_g1, col_g2 = st.columns(2)
+
+        with col_g1:
+            with card_container(border=True):
+                sai_val_latest = latest_row[buy_sai_col]
+                sai_val_prev = prev_row[buy_sai_col]
+                sai_val_diff = sai_val_latest - sai_val_prev
+                sign_sai = "+" if sai_val_diff >= 0 else ""
+
+                render_card_header(
+                    title="裁定買残推移 (億円)",
+                    mom_sub_text=f"前日比: {sign_sai}{sai_val_diff:,} 億円",
+                    badge_html=f"<span style='color:#42a5f5;'>最新: <b>{sai_val_latest:,} 億円</b></span>"
+                )
+
+                sai_vol_data = [
+                    {"time": t, "value": float(v), "color": "rgba(66, 165, 245, 0.65)"} 
+                    for t, v in zip(times, df_jp[buy_sai_col]) if not pd.isna(v)
+                ]
+                render_lwc_histogram_chart(sai_vol_data, color="#42a5f5", height=160, key="lwc_sai_vol")
+
+        with col_g2:
+            with card_container(border=True):
+                sin_ratio_latest = latest_row['ratio_sin']
+                sin_ratio_prev = prev_row['ratio_sin']
+                sin_ratio_diff = sin_ratio_latest - sin_ratio_prev
+                sign_sin = "+" if sin_ratio_diff >= 0 else ""
+
+                render_card_header(
+                    title="信用比率 (買残 ÷ 日経平均)",
+                    mom_sub_text=f"前週比: {sign_sin}{sin_ratio_diff:.2f}",
+                    badge_html=f"<span style='color:#26a69a;'>最新: <b>{sin_ratio_latest:.2f}</b></span>"
+                )
+
+                sin_ratio_data = [
+                    {"time": t, "value": float(v)} 
+                    for t, v in zip(times, df_jp['ratio_sin']) if not pd.isna(v)
+                ]
+                render_lwc_area_chart(
+                    series_definitions=[{
+                        "type": "Area", 
+                        "data": sin_ratio_data, 
+                        "options": {
+                            "topColor": "rgba(38, 166, 154, 0.35)", 
+                            "bottomColor": "rgba(38, 166, 154, 0.03)", 
+                            "lineColor": "#26a69a", 
+                            "lineWidth": 2,
+                            "lastValueVisible": True
+                        }
+                    }],
+                    height=160,
+                    key="lwc_sin_ratio"
+                )
+
+    # 3. NAAIM Exposure Index
     if not naaim_df.empty:
         st.write("---")
-        st.markdown("**🇺🇸 NAAIM Exposure Index 推移**")
+        st.markdown("### 🇺🇸 米国市場 NAAIM Exposure Index")
+
         df_us = naaim_df[(naaim_df['Date'] >= start_dt) & (naaim_df['Date'] <= end_dt)].sort_values('Date')
-        us_times = _to_lwc_time(df_us['Date'])
-        naaim_data = [{"time": t, "value": float(v)} for t, v in zip(us_times, df_us['NAAIM']) if not pd.isna(v)]
+        if not df_us.empty:
+            latest_naaim = df_us.iloc[-1]
+            prev_naaim = df_us.iloc[-2] if len(df_us) > 1 else latest_naaim
+            delta = round(latest_naaim['NAAIM'] - prev_naaim['NAAIM'], 2)
+            sign_n = "+" if delta >= 0 else ""
+            badge_text = "🟢 強気傾向" if latest_naaim['NAAIM'] >= 80 else "🔴 弱気傾向" if latest_naaim['NAAIM'] <= 40 else "⚪ 中立"
+            badge_tag = build_status_badge(badge_text, bg_color="#37474f", text_color="#ffffff", border_color="#78909c")
 
-        chart_def_naaim = {
-            "chart": _lwc_base_options(height=200),
-            "series": [{
-                "type": "Line", 
-                "data": naaim_data, 
-                "options": {
-                    "color": "#2e5bff", 
-                    "lineWidth": 2, 
-                    "title": "NAAIM Index", 
-                    "lastValueVisible": True
-                }
-            }]
-        }
-        renderLightweightCharts([chart_def_naaim], key="lwc_naaim_index")
+            with card_container(border=True):
+                badge_html = (
+                    f"{badge_tag} "
+                    f"<span style='color:#9e9e9e; margin-left:6px;'>更新日: {latest_naaim['Date'].strftime('%Y-%m-%d')}</span>"
+                )
+                render_card_header(
+                    title="NAAIM Exposure Index",
+                    mom_sub_text=f"前週差: {sign_n}{delta}",
+                    badge_html=badge_html
+                )
 
+                us_times = _to_lwc_time(df_us['Date'])
+                naaim_data = [{"time": t, "value": float(v)} for t, v in zip(us_times, df_us['NAAIM']) if not pd.isna(v)]
+
+                render_lwc_area_chart(
+                    series_definitions=[{
+                        "type": "Line", 
+                        "data": naaim_data, 
+                        "options": {
+                            "color": "#42a5f5", 
+                            "lineWidth": 2, 
+                            "title": "", 
+                            "lastValueVisible": True,
+                            "crosshairMarkerVisible": True,
+                        }
+                    }],
+                    height=180,
+                    key="lwc_naaim_index"
+                )
 
 # =====================================================================
-# 📈 【フラグメント2】個別銘柄の信用残検索（LWC化 ＆ 閉域化）
+# 📈 【フラグメント2】個別銘柄の信用残検索
 # =====================================================================
 @st.fragment
 def render_individual_margin_fragment():
-    """個別株の信用残検索。上部ダッシュボードを一切巻き込まず、個別銘柄の描画が1ミリ秒で更新されます。"""
     st.subheader("🔍 個別銘柄 信用残検索 (IRBank)")
-    
-    col_s1, col_s2 = st.columns([1, 4])
-    with col_s1:
-        search_code = st.text_input("銘柄コード", value="1321", placeholder="例: 1321", key="margin_search_code")
-    with col_s2:
-        period_ir = st.radio("表示期間の変更:", ["6ヶ月", "1年", "3年", "全"], index=1, horizontal=True, key="ir_p_selector")
+
+    with card_container(border=True):
+        col_s1, col_s2 = st.columns([1, 4])
+        with col_s1:
+            search_code = st.text_input("銘柄コード", value="1321", placeholder="例: 1321", key="margin_search_code")
+        with col_s2:
+            period_ir = st.radio("表示期間", ["6ヶ月", "1年", "3年", "全期間"], index=1, horizontal=True, key="ir_p_selector")
 
     if search_code:
-        with st.spinner(f"{search_code} の信用残データを取得中..."):
-            idf = fetch_irbank_margin(search_code)
+        clean_code = str(search_code).strip().upper()
+
+        with st.spinner(f"{clean_code} の信用残データを取得中..."):
+            idf = fetch_irbank_margin(clean_code)
             if not idf.empty:
                 i_end = idf['Date'].max()
                 if period_ir == "6ヶ月":
@@ -515,60 +514,74 @@ def render_individual_margin_fragment():
                 else:
                     i_start = idf['Date'].min()
                     
-                vdf = idf[idf['Date'] >= i_start].sort_values('Date')
+                vdf = idf[idf['Date'] >= i_start].sort_values('Date').reset_index(drop=True)
                 
                 if not vdf.empty:
+                    latest_ir = vdf.iloc[-1]
+                    prev_ir = vdf.iloc[-2] if len(vdf) > 1 else latest_ir
+
+                    buy_now = latest_ir['Buy(Shares)']
+                    sell_now = latest_ir['Sell(Shares)']
+                    buy_diff = buy_now - prev_ir['Buy(Shares)']
+                    sell_diff = sell_now - prev_ir['Sell(Shares)']
+                    margin_ratio = (buy_now / sell_now) if sell_now > 0 else 0.0
+
                     times = _to_lwc_time(vdf['Date'])
                     buy_shares = [{"time": t, "value": float(v)} for t, v in zip(times, vdf['Buy(Shares)']) if not pd.isna(v)]
                     sell_shares = [{"time": t, "value": float(v)} for t, v in zip(times, vdf['Sell(Shares)']) if not pd.isna(v)]
 
-                    chart_options = _lwc_base_options(height=300)
-                    chart_options["rightPriceScale"] = {"visible": True, "borderColor": "rgba(128,128,128,0.3)"}
+                    with card_container(border=True):
+                        badge_html = (
+                            f"<span style='color:#ef5350; margin-right:12px;'>信用買残: <b>{buy_now:,} 株</b> ({buy_diff:+,.0f})</span>"
+                            f"<span style='color:#42a5f5; margin-right:12px;'>信用売残: <b>{sell_now:,} 株</b> ({sell_diff:+,.0f})</span>"
+                            f"<span style='color:#b0bec5;'>倍率: <b>{margin_ratio:.2f} 倍</b></span>"
+                        )
+                        render_card_header(
+                            title=f"{clean_code} 信用残高推移",
+                            code=clean_code,
+                            is_jp=True,
+                            mom_sub_text="IRBank提供",
+                            badge_html=badge_html
+                        )
 
-                    chart_def = {
-                        "chart": chart_options,
-                        "series": [
-                            {
-                                "type": "Area",
-                                "data": buy_shares,
-                                "options": {
-                                    "topColor": "rgba(239, 83, 80, 0.35)",
-                                    "bottomColor": "rgba(239, 83, 80, 0.05)",
-                                    "lineColor": "#ef5350",
-                                    "lineWidth": 2,
-                                    "title": "信用買い残 (株)",
-                                    "lastValueVisible": True,
+                        render_lwc_area_chart(
+                            series_definitions=[
+                                {
+                                    "type": "Area",
+                                    "data": buy_shares,
+                                    "options": {
+                                        "topColor": "rgba(239, 83, 80, 0.35)",
+                                        "bottomColor": "rgba(239, 83, 80, 0.03)",
+                                        "lineColor": "#ef5350",
+                                        "lineWidth": 2,
+                                        "title": "信用買残 (株)",
+                                        "lastValueVisible": True,
+                                    }
+                                },
+                                {
+                                    "type": "Area",
+                                    "data": sell_shares,
+                                    "options": {
+                                        "topColor": "rgba(66, 165, 245, 0.35)",
+                                        "bottomColor": "rgba(66, 165, 245, 0.03)",
+                                        "lineColor": "#42a5f5",
+                                        "lineWidth": 2,
+                                        "title": "信用売残 (株)",
+                                        "lastValueVisible": True,
+                                    }
                                 }
-                            },
-                            {
-                                "type": "Area",
-                                "data": sell_shares,
-                                "options": {
-                                    "topColor": "rgba(66, 165, 245, 0.35)",
-                                    "bottomColor": "rgba(66, 165, 245, 0.05)",
-                                    "lineColor": "#42a5f5",
-                                    "lineWidth": 2,
-                                    "title": "信用売り残 (株)",
-                                    "lastValueVisible": True,
-                                }
-                            }
-                        ]
-                    }
-                    renderLightweightCharts([chart_def], key=f"lwc_margin_ind_{search_code}")
+                            ],
+                            height=240,
+                            key=f"lwc_margin_ind_{clean_code}"
+                        )
                 else:
                     st.caption("指定期間のデータがありません。")
             else:
                 st.warning("IRBankからデータが見つかりませんでした。日本株のコードを再確認してください。")
 
-
 # =====================================================================
-# 呼び出し実行部 (全体再描画を挟まない並列配置)
+# 🚀 画面描画制御部
 # =====================================================================
-
-# 1. 全体指数分析ダッシュボードフラグメントの実行
 render_market_dashboard_fragment()
-
 st.write("---")
-
-# 2. 個別信用残検索フラグメントの実行
 render_individual_margin_fragment()

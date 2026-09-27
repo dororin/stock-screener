@@ -2,11 +2,9 @@
 
 import os
 import time
-import re
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 
 from config import settings
 from data_access.local_db import get_price_data_cached
@@ -16,20 +14,25 @@ from data_access.sheets_api import (
     load_sector_master_from_sheets,
     load_events_from_sheets
 )
-from core.event_collector import (
-    get_earnings_countdown_badge,
-    build_event_markers
-)
-from core.screener import get_jpx_full_list
 from core.calculator import (
+    prepare_candle_indicators,
     get_sector_momentum,
     relativize_series,
     get_sector_index_cached,
     get_theme_return_rate_cached,
     get_sector_absolute_data_cached,
     get_macro_cores_cached,
-    get_benchmark_data_cached,
-    compute_wvf_signals
+    get_benchmark_data_cached
+)
+from core.event_collector import (
+    get_earnings_countdown_badge,
+    build_event_markers
+)
+from core.screener import get_jpx_full_list
+from utils.ui_components import (
+    card_container, 
+    render_card_header, 
+    build_wvf_badge_html
 )
 from utils.plotting import (
     render_lwc_rs_overlay,
@@ -41,7 +44,6 @@ CUSTOM_SECTOR_KEY = "custom_sector_tickers"
 
 if CUSTOM_SECTOR_KEY not in st.session_state:
     st.session_state[CUSTOM_SECTOR_KEY] = load_watchlist_from_sheets()
-
 
 # =====================================================================
 # 🏷️ 【東証全銘柄・日本語社名マスタ】
@@ -107,7 +109,6 @@ def get_all_stock_names_map(is_jp: bool = True) -> dict:
 
     return name_map
 
-
 # =====================================================================
 # 🪟 【共通モーダルダイアログ】個別株ローソク足ミニチャート一覧展開
 # =====================================================================
@@ -129,7 +130,7 @@ def show_constituents_dialog(
         return
 
     name_map = get_all_stock_names_map(is_jp)
-    events_map = load_events_from_sheets()  # 💡 決算・配当カレンダーをO(1)参照
+    events_map = load_events_from_sheets()
     db_df = get_price_data_cached(interval, limit_days=period_days + 365, is_jp=is_jp)
     display_start = pd.Timestamp.now() - pd.Timedelta(days=period_days)
 
@@ -143,11 +144,6 @@ def show_constituents_dialog(
             stock_name = name_map.get(clean_code, "")
             display_label = f"{clean_code}　{stock_name}" if stock_name else clean_code
 
-            if is_jp:
-                tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{clean_code}"
-            else:
-                tv_url = f"https://jp.tradingview.com/chart/?symbol={clean_code}"
-
             with grid_cols[ci]:
                 df_stock = pd.DataFrame()
                 if not db_df.empty and "ticker" in db_df.columns:
@@ -155,113 +151,26 @@ def show_constituents_dialog(
                     if mask.any():
                         df_stock = db_df[mask].copy().sort_values("date").reset_index(drop=True)
 
-                s_mom = 0.0
-                df_display = pd.DataFrame()
-                wvf_badge_html = ""
-                bb_dict = None
-
-                if not df_stock.empty and len(df_stock) >= 2:
-                    df_stock = compute_wvf_signals(df_stock)
-
-                    if resample_weekly:
-                        df_stock = df_stock.set_index("date").resample("W-FRI").agg({
-                            "open": "first", "high": "max", "low": "min",
-                            "close": "last", "volume": "sum", "ticker": "last",
-                            "is_lime": "any", "is_fuchsia": "any", "is_normal_off": "any", "ext_price": "last"
-                        }).dropna().reset_index()
-
-                    df_stock["sma25"]  = df_stock["close"].rolling(window=25, min_periods=1).mean()
-                    df_stock["sma75"]  = df_stock["close"].rolling(window=75, min_periods=1).mean()
-                    df_stock["sma200"] = df_stock["close"].rolling(window=200, min_periods=1).mean()
-
-                    bb_mid = df_stock["close"].rolling(window=20, min_periods=1).mean()
-                    bb_std = df_stock["close"].rolling(window=20, min_periods=1).std(ddof=0)
-                    df_stock["bb_p2"] = bb_mid + (2.0 * bb_std)
-                    df_stock["bb_m2"] = bb_mid - (2.0 * bb_std)
-                    df_stock["bb_p3"] = bb_mid + (3.0 * bb_std)
-                    df_stock["bb_m3"] = bb_mid - (3.0 * bb_std)
-
-                    recent_closes = df_stock["close"].tail(min(5, len(df_stock))).values
-                    if len(recent_closes) >= 2 and recent_closes[0] > 0:
-                        s_mom = float((recent_closes[-1] / recent_closes[0] - 1) * 100)
-
-                    # WVFシグナル状態判定
-                    latest_row = df_stock.iloc[-1]
-                    ext_price_val = latest_row.get("ext_price", np.nan)
-                    ext_str = f"¥{ext_price_val:,.1f}" if pd.notna(ext_price_val) else "-"
-
-                    if latest_row.get("is_lime", False):
-                        lime_streak = int((df_stock["is_lime"].iloc[::-1].cumprod()).sum())
-                        wvf_badge_html = (
-                            f"<span style='font-size:0.75rem; background:#00e676; color:#000; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
-                            f"🟢 点灯中({lime_streak}日目)</span> "
-                            f"<span style='font-size:0.75rem; color:#b0bec5;'>翌日消灯目安: {ext_str}</span>"
-                        )
-                    elif latest_row.get("is_fuchsia", False):
-                        wvf_badge_html = (
-                            f"<span style='font-size:0.75rem; background:#37474f; color:#ffffff; border:1px solid #78909c; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
-                            f"⚪ 反発消灯</span>"
-                        )
-                    elif latest_row.get("is_normal_off", False):
-                        wvf_badge_html = (
-                            f"<span style='font-size:0.75rem; background:#37474f; color:#ffffff; border:1px solid #78909c; padding:2px 6px; border-radius:3px; font-weight:bold;'>"
-                            f"⚪ 消灯</span>"
-                        )
-                    else:
-                        wvf_badge_html = ""
-
-                    df_display = df_stock[df_stock["date"] >= display_start].copy().reset_index(drop=True)
-
-                    if not df_display.empty:
-                        disp_indexed = df_display.set_index("date")
-                        bb_dict = {
-                            "p2": disp_indexed["bb_p2"],
-                            "m2": disp_indexed["bb_m2"],
-                            "p3": disp_indexed["bb_p3"],
-                            "m3": disp_indexed["bb_m3"]
-                        }
-
-                # 💡 決算カウントダウン警告バッジ ＆ イベントマーカーの取得
+                df_calc, bb_dict, s_mom, wvf_summary = prepare_candle_indicators(df_stock, resample_weekly=resample_weekly)
+                
+                # バッジの合成
+                wvf_badge_html = build_wvf_badge_html(wvf_summary)
                 ev_info = (events_map or {}).get(clean_code, {})
-                next_earnings = ev_info.get("next_earnings", "")
-                prev_earnings = ev_info.get("prev_earnings", "")
-                prev_dividend = ev_info.get("prev_dividend", "")
+                earnings_badge_html = get_earnings_countdown_badge(ev_info.get("next_earnings", ""))
+                event_markers = build_event_markers(ev_info.get("prev_earnings", ""), ev_info.get("prev_dividend", ""))
 
-                earnings_badge_html = get_earnings_countdown_badge(next_earnings)
-                event_markers = build_event_markers(prev_earnings, prev_dividend)
+                badge_items = [b for b in [wvf_badge_html, earnings_badge_html] if b]
+                badges_combined = "&nbsp;&nbsp;".join(badge_items)
 
-                # バッジ表示の合成
-                badge_items = []
-                if wvf_badge_html:
-                    badge_items.append(wvf_badge_html)
-                if earnings_badge_html:
-                    badge_items.append(earnings_badge_html)
-                badges_combined_html = "&nbsp;&nbsp;".join(badge_items)
+                df_display = df_calc[df_calc["date"] >= display_start].copy().reset_index(drop=True) if not df_calc.empty else pd.DataFrame()
 
-                s_badge = "🟢" if s_mom >= 3.0 else "🔴" if s_mom <= -3.0 else "⚪"
-                s_color = "#26a69a" if s_mom >= 3.0 else "#ef5350" if s_mom <= -3.0 else "#9e9e9e"
-
-                with st.container(border=True):
-                    hc1, hc2 = st.columns([3.8, 1.2])
-                    hc1.markdown(
-                        f"<div style='font-size:0.86rem; font-weight:600; color:{s_color}; line-height:1.4; "
-                        f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis;' title='TradingViewで開く: {display_label}'>"
-                        f"{s_badge} <a href='{tv_url}' target='_blank' rel='noopener noreferrer' "
-                        f"style='color:{s_color}; text-decoration:none; border-bottom:1px dotted {s_color};'>"
-                        f"{display_label}</a></div>",
-                        unsafe_allow_html=True
-                    )
-                    hc2.markdown(
-                        f"<div style='font-size:0.83rem; text-align:right; color:{s_color}; font-weight:bold; "
-                        f"line-height:1.4;'>"
-                        f"{s_mom:+.2f}%</div>",
-                        unsafe_allow_html=True
-                    )
-
-                    st.markdown(
-                        f"<div style='margin-top:2px; margin-bottom:4px; height:18px; line-height:18px; overflow:hidden; white-space:nowrap;'>"
-                        f"{badges_combined_html}</div>",
-                        unsafe_allow_html=True
+                with card_container(border=True):
+                    render_card_header(
+                        title=display_label,
+                        code=clean_code,
+                        is_jp=is_jp,
+                        mom_value=s_mom,
+                        badge_html=badges_combined
                     )
 
                     if not df_display.empty and len(df_display) >= 2:
@@ -282,7 +191,6 @@ def show_constituents_dialog(
                         )
                     else:
                         st.caption("データなし")
-
 
 # =====================================================================
 # 📌 【フラグメント3】ウォッチリスト編集パネル
@@ -367,7 +275,6 @@ def render_watchlist_editor_fragment():
             st.rerun(scope="fragment")
     else:
         st.caption("まだ銘柄が登録されていません")
-
 
 # =====================================================================
 # 📊 【フラグメント1】重ね合わせ比較チャート
@@ -457,7 +364,6 @@ def render_overlay_chart_fragment(is_jp: bool):
     else:
         st.caption("表示対象のデータがありません。")
 
-
 # =====================================================================
 # 📈 【フラグメント2】セクターミニチャート一覧
 # =====================================================================
@@ -508,7 +414,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
 
             def render_etf_card(code, name):
                 visible = st.session_state[f"etf_visible_{code}"]
-                
                 jp_sector_name = TOPIX17_TO_JP_SECTOR.get(code)
                 constituent_codes = settings.JP_SECTORS.get(jp_sector_name, []) if jp_sector_name else []
                 if not constituent_codes and jp_sector_name:
@@ -516,10 +421,10 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                 if not constituent_codes:
                     constituent_codes = sectors_loaded.get(name, [])
 
-                with st.container(border=True):
-                    hc1, hc2 = st.columns([5, 1])
-                    vis_label = "表示" if not visible else "非表示"
-                    hc2.button(vis_label, key=f"vis_btn_{code}", use_container_width=True, on_click=toggle_etf_visibility, args=(code,))
+                with card_container(border=True):
+                    def right_act():
+                        vis_label = "表示" if not visible else "非表示"
+                        st.button(vis_label, key=f"vis_btn_{code}", use_container_width=True, on_click=toggle_etf_visibility, args=(code,))
 
                     if visible:
                         try:
@@ -531,15 +436,20 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             etf_sma75 = etf_sma200 = etf_wvf = etf_vol = pd.Series(dtype=float)
 
                         etf_sma25 = etf_abs.rolling(window=25, min_periods=1).mean() if not etf_abs.empty else pd.Series(dtype=float)
-
                         etf_mom = get_sector_momentum(
                             get_sector_index_cached(interval, (code,), period_days, resample_weekly, is_jp=is_jp),
                             days=min(5, period_days)
                         )
-                        badge_e = "🟢" if etf_mom >= 0 else "🔴"
 
-                        btn_label = f"{badge_e} {code} {name} ({etf_mom:+.2f}%) 🔍"
-                        if hc1.button(btn_label, key=f"btn_dlg_etf_{code}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
+                        render_card_header(
+                            title=f"{code} {name}",
+                            code=code,
+                            is_jp=True,
+                            mom_value=etf_mom,
+                            right_action_fn=right_act
+                        )
+
+                        if st.button("🔍 構成銘柄を展開", key=f"btn_dlg_etf_{code}", use_container_width=True):
                             show_constituents_dialog(
                                 title=f"{code} {name}",
                                 constituent_codes=constituent_codes,
@@ -564,7 +474,10 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                         else:
                             st.caption("データなし")
                     else:
-                        hc1.markdown(f"<span style='font-size:0.85rem; color:#9e9e9e;'>{code} {name}</span>", unsafe_allow_html=True)
+                        render_card_header(
+                            title=f"{code} {name} (非表示)",
+                            right_action_fn=right_act
+                        )
 
             rows_17 = [all_etf_codes[i:i + n_cols] for i in range(0, len(all_etf_codes), n_cols)]
             for row_codes in rows_17:
@@ -590,32 +503,35 @@ def render_sector_mini_charts_fragment(is_jp: bool):
 
                 def render_theme_card(t_name, tickers):
                     visible = st.session_state[f"theme_visible_{t_name}"]
-                    with st.container(border=True):
-                        hc1, hc2 = st.columns([5, 1])
-                        vis_label = "表示" if not visible else "非表示"
-                        hc2.button(vis_label, key=f"theme_btn_{t_name}", use_container_width=True, on_click=toggle_theme_visibility, args=(t_name,))
+                    with card_container(border=True):
+                        def right_act():
+                            vis_label = "表示" if not visible else "非表示"
+                            st.button(vis_label, key=f"theme_btn_{t_name}", use_container_width=True, on_click=toggle_theme_visibility, args=(t_name,))
 
                         if visible:
                             ret_rate, sma75, sma200, total_val = get_theme_return_rate_cached(
                                 interval, tuple(tickers), period_days, resample_weekly, is_jp=is_jp
                             )
                             sma25 = ret_rate.rolling(window=25, min_periods=1).mean() if not ret_rate.empty else pd.Series(dtype=float)
+                            last_ret = ret_rate.iloc[-1] if not ret_rate.empty else 0.0
+
+                            render_card_header(
+                                title=t_name,
+                                mom_value=last_ret,
+                                right_action_fn=right_act
+                            )
+
+                            if st.button("🔍 構成銘柄を展開", key=f"btn_dlg_theme_{t_name}", use_container_width=True):
+                                show_constituents_dialog(
+                                    title=t_name,
+                                    constituent_codes=tickers,
+                                    interval=interval,
+                                    period_days=period_days,
+                                    resample_weekly=resample_weekly,
+                                    is_jp=is_jp
+                                )
 
                             if not ret_rate.empty:
-                                last_ret = ret_rate.iloc[-1]
-                                badge_t = "🟢" if last_ret >= 0 else "🔴"
-
-                                btn_label = f"{badge_t} {t_name} ({last_ret:+.2f}%) 🔍"
-                                if hc1.button(btn_label, key=f"btn_dlg_theme_{t_name}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
-                                    show_constituents_dialog(
-                                        title=t_name,
-                                        constituent_codes=tickers,
-                                        interval=interval,
-                                        period_days=period_days,
-                                        resample_weekly=resample_weekly,
-                                        is_jp=is_jp
-                                    )
-
                                 render_lwc_sector_mini(
                                     ret_rate, 
                                     sma25=sma25,
@@ -630,7 +546,10 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             else:
                                 st.caption("データなし")
                         else:
-                            hc1.markdown(f"<span style='font-size:0.85rem; color:#9e9e9e;'>{t_name} (非表示)</span>", unsafe_allow_html=True)
+                            render_card_header(
+                                title=f"{t_name} (非表示)",
+                                right_action_fn=right_act
+                            )
 
                 rows_theme = [theme_names[i:i + n_cols] for i in range(0, len(theme_names), n_cols)]
                 for row_themes in rows_theme:
@@ -642,7 +561,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
 
     else:
         sectors = load_sector_master_from_sheets(is_jp)
-        
         sector_index_cache = {}
         momentum_scores = {}
         for sname, tickers in sectors.items():
@@ -673,7 +591,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                     break
                 sname, tickers = sector_list[idx]
                 mom = momentum_scores.get(sname, 0.0)
-                badge = "🟢" if mom >= 3.0 else "🔴" if mom <= -3.0 else "⚪"
 
                 try:
                     sec_abs, sma75, sma200, is_wvf_lit, trading_val = get_sector_absolute_data_cached(
@@ -688,12 +605,14 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                     wvf_active = False
 
                 with cols[col_i]:
-                    with st.container(border=True):
-                        hc1, hc2 = st.columns([3, 1])
+                    with card_container(border=True):
                         wvf_badge = " 🔥" if wvf_active else ""
-                        
-                        btn_label = f"{badge} {sname}{wvf_badge} 🔍"
-                        if hc1.button(btn_label, key=f"btn_dlg_us_{sname}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
+                        render_card_header(
+                            title=f"{sname}{wvf_badge}",
+                            mom_value=mom
+                        )
+
+                        if st.button("🔍 構成銘柄を展開", key=f"btn_dlg_us_{sname}", use_container_width=True):
                             show_constituents_dialog(
                                 title=sname,
                                 constituent_codes=tickers,
@@ -702,7 +621,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                                 resample_weekly=resample_weekly,
                                 is_jp=is_jp
                             )
-                        hc2.metric("", f"{mom:+.2f}%", label_visibility="collapsed")
 
                         if not sec_abs.empty:
                             render_lwc_sector_mini(
@@ -718,7 +636,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             )
                         else:
                             st.caption("データなし")
-
 
 # =====================================================================
 # 📌 【フラグメント4】ウォッチリスト個別ミニチャート
@@ -757,22 +674,27 @@ def render_watchlist_mini_charts_fragment(is_jp: bool):
             code = custom_codes[idx]
             name = custom_tickers[code]
 
-            def remove_item(c):
+            def remove_item(c=code):
                 del st.session_state[CUSTOM_SECTOR_KEY][c]
                 save_watchlist_to_sheets(st.session_state[CUSTOM_SECTOR_KEY])
                 st.rerun(scope="fragment")
 
             single_series = get_sector_index_cached(interval, (code,), period_days, resample_weekly, is_jp=is_jp)
             mom_single = get_sector_momentum(single_series, days=min(5, period_days)) if not single_series.empty else 0.0
-            badge = "🟢" if mom_single >= 3.0 else "🔴" if mom_single <= -3.0 else "⚪"
-            color_theme = "#26a69a" if mom_single >= 3.0 else "#ef5350" if mom_single <= -3.0 else "#9e9e9e"
 
             with cols[col_i]:
-                with st.container(border=True):
-                    hc1, hc2, hc3 = st.columns([3, 1, 1])
-                    hc1.markdown(f"<span style='font-weight:600;color:{color_theme}'>{badge} {code} {name}</span>", unsafe_allow_html=True)
-                    hc2.metric("", f"{mom_single:+.2f}%", label_visibility="collapsed")
-                    hc3.button("🗑️", key=f"wl_del_btn_{code}", help=f"{code}を削除", on_click=remove_item, args=(code,))
+                with card_container(border=True):
+                    def right_act(c=code):
+                        st.button("🗑️", key=f"wl_del_btn_{c}", help=f"{c}を削除", on_click=remove_item, args=(c,))
+
+                    render_card_header(
+                        title=f"{code} {name}",
+                        code=code,
+                        is_jp=is_jp,
+                        mom_value=mom_single,
+                        right_action_fn=right_act,
+                        col_ratio=[3.2, 1.2, 0.6]
+                    )
 
                     try:
                         w_abs, w_sma75, w_sma200, w_wvf_lit, w_trading_val = get_sector_absolute_data_cached(
@@ -799,11 +721,9 @@ def render_watchlist_mini_charts_fragment(is_jp: bool):
                     else:
                         st.caption("データなし")
 
-
 # =====================================================================
 # 🛠️ メイン画面描画制御
 # =====================================================================
-
 with st.sidebar:
     st.subheader("🌐 市場の選択")
     market_mode = st.radio("マーケット", ["日本株 🇯🇵", "米国株 🇺🇸"], horizontal=True, label_visibility="collapsed")
@@ -815,13 +735,8 @@ if sample_df.empty:
     st.stop()
 
 render_overlay_chart_fragment(is_jp=is_jp)
-
 st.write("---")
-
 render_sector_mini_charts_fragment(is_jp=is_jp)
-
 st.write("---")
-
 render_watchlist_editor_fragment()
-
 render_watchlist_mini_charts_fragment(is_jp=is_jp)

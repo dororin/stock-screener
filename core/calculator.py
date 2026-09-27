@@ -8,10 +8,7 @@ from data_access.local_db import load_price_db, get_price_data_cached
 
 @st.cache_data(ttl=3600)
 def fetch_proxy_market_value(proxy_ticker: str, start_date: datetime, end_date: datetime, db_df: pd.DataFrame = None) -> pd.Series:
-    """
-    市場全体の総売買代金の代理（プロキシ）として、1306 や SPY の
-    時系列データを取得します。
-    """
+    """市場全体の総売買代金の代理（プロキシ）として、1306 や SPY の時系列データを取得します。"""
     try:
         pure_ticker = str(proxy_ticker).strip().upper()
         is_jp = True
@@ -467,3 +464,73 @@ def compute_wvf_signals(df: pd.DataFrame) -> pd.DataFrame:
     df['ext_price'] = ext_price
 
     return df
+
+
+# =====================================================================
+# 🚀 【新設】個別株ローソク足ミニチャート用・指標一括事前計算共通関数
+# =====================================================================
+def prepare_candle_indicators(df: pd.DataFrame, resample_weekly: bool = False) -> tuple[pd.DataFrame, dict, float, dict]:
+    """
+    全画面（screening, sector_rotation, holdings）で重複していた
+    SMA(25/75/200)、ボリンジャーバンド(±2σ/±3σ)、WVF状態、直近5日騰落率を
+    インメモリで一括算出して返します。
+    
+    戻り値: (df_calculated, bb_dict, s_mom, wvf_summary)
+    """
+    if df is None or df.empty or len(df) < 2:
+        return pd.DataFrame(), None, 0.0, {}
+
+    df_calc = df.copy()
+    if "date" in df_calc.columns:
+        df_calc["date"] = pd.to_datetime(df_calc["date"])
+        df_calc = df_calc.sort_values("date").reset_index(drop=True)
+
+    df_calc = compute_wvf_signals(df_calc)
+
+    if resample_weekly:
+        df_calc = df_calc.set_index("date").resample("W-FRI").agg({
+            "open": "first", "high": "max", "low": "min",
+            "close": "last", "volume": "sum", "ticker": "last",
+            "is_lime": "any", "is_fuchsia": "any", "is_normal_off": "any", "ext_price": "last"
+        }).dropna().reset_index()
+
+    # 移動平均線
+    df_calc["sma25"]  = df_calc["close"].rolling(window=25, min_periods=1).mean()
+    df_calc["sma75"]  = df_calc["close"].rolling(window=75, min_periods=1).mean()
+    df_calc["sma200"] = df_calc["close"].rolling(window=200, min_periods=1).mean()
+
+    # ボリンジャーバンド
+    bb_mid = df_calc["close"].rolling(window=20, min_periods=1).mean()
+    bb_std = df_calc["close"].rolling(window=20, min_periods=1).std(ddof=0)
+    df_calc["bb_p2"] = bb_mid + (2.0 * bb_std)
+    df_calc["bb_m2"] = bb_mid - (2.0 * bb_std)
+    df_calc["bb_p3"] = bb_mid + (3.0 * bb_std)
+    df_calc["bb_m3"] = bb_mid - (3.0 * bb_std)
+
+    disp_indexed = df_calc.set_index("date")
+    bb_dict = {
+        "p2": disp_indexed["bb_p2"],
+        "m2": disp_indexed["bb_m2"],
+        "p3": disp_indexed["bb_p3"],
+        "m3": disp_indexed["bb_m3"]
+    }
+
+    # 直近5日モメンタム（騰落率）
+    s_mom = 0.0
+    recent_closes = df_calc["close"].tail(min(5, len(df_calc))).values
+    if len(recent_closes) >= 2 and recent_closes[0] > 0:
+        s_mom = float((recent_closes[-1] / recent_closes[0] - 1) * 100.0)
+
+    # 最新日WVF状態サマリー
+    latest_row = df_calc.iloc[-1]
+    lime_streak = int((df_calc["is_lime"].iloc[::-1].cumprod()).sum()) if latest_row.get("is_lime", False) else 0
+
+    wvf_summary = {
+        "is_lime": bool(latest_row.get("is_lime", False)),
+        "is_fuchsia": bool(latest_row.get("is_fuchsia", False)),
+        "is_normal_off": bool(latest_row.get("is_normal_off", False)),
+        "ext_price": latest_row.get("ext_price", np.nan),
+        "lime_streak": lime_streak
+    }
+
+    return df_calc, bb_dict, s_mom, wvf_summary
