@@ -157,7 +157,7 @@ def show_constituents_dialog(
                 # 指定期間（period_days）でスライス
                 df_display = df_calc[df_calc["date"] >= display_start].copy().reset_index(drop=True) if not df_calc.empty else pd.DataFrame()
                 
-                # 💡 スライス後のdf_displayからbb_dictを生成することで、X軸の期間が完全に一致！
+                # 💡 スライス後のdf_displayからbb_dictを生成することで、X軸の期間が完全に一致
                 bb_dict = extract_bb_dict(df_display)
 
                 wvf_badge_html = build_wvf_badge_html(wvf_summary)
@@ -371,8 +371,48 @@ def render_overlay_chart_fragment(is_jp: bool):
 # =====================================================================
 # 📈 【フラグメント2】セクターミニチャート一覧
 # =====================================================================
+def _format_sector_title(title: str, max_chars: int = 15) -> str:
+    """タイトルが長すぎる場合にスマートに短縮・省略します。"""
+    t = str(title).strip()
+    # 頻出する冗長な名称の省略
+    t = t.replace("NEXT FUNDS ", "NF ").replace("NEXT FUNDS", "NF")
+    t = t.replace("iシェアーズ・コア ", "iSコア ").replace("上場投信", "")
+    t = t.strip()
+    if len(t) > max_chars:
+        return t[:max_chars - 1] + "…"
+    return t
+
+
 @st.fragment
 def render_sector_mini_charts_fragment(is_jp: bool):
+    # 💡 セクターヘッダー用：枠なしスリムボタンスタイル注入
+    st.markdown("""
+    <style>
+    /* セクターカード用枠なしボタンスタイル */
+    div[data-testid="stColumn"] button[kind="tertiary"] {
+        padding: 0px 4px !important;
+        border: none !important;
+        background: transparent !important;
+        text-align: left !important;
+        justify-content: flex-start !important;
+        font-size: 0.88rem !important;
+        font-weight: 600 !important;
+        height: auto !important;
+        min-height: 0px !important;
+        line-height: 1.7 !important;
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        color: #e0e0e0 !important;
+    }
+    div[data-testid="stColumn"] button[kind="tertiary"]:hover {
+        background: rgba(255, 255, 255, 0.08) !important;
+        color: #ffffff !important;
+        border-radius: 4px !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     st.markdown("### 📈 セクター・テーマ ミニチャート")
 
     col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1.5, 1.5, 1])
@@ -425,10 +465,9 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                 if not constituent_codes:
                     constituent_codes = sectors_loaded.get(name, [])
 
-                with card_container(border=True):
-                    # 💡 ヘッダー：左側に「展開ボタン付きタイトル」、右側に「騰落率 ＆ 非表示ボタン」を整然と配置
-                    h_col1, h_col2, h_col3 = st.columns([3.0, 1.2, 0.8])
+                display_title = _format_sector_title(f"{code} {name}", max_chars=16)
 
+                with card_container(border=True):
                     if visible:
                         try:
                             etf_abs, etf_sma75, etf_sma200, etf_wvf, etf_vol = get_sector_absolute_data_cached(
@@ -446,8 +485,17 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                         badge_e = "🟢" if etf_mom >= 0 else "🔴"
                         color_e = "#26a69a" if etf_mom >= 0 else "#ef5350"
 
+                        # 💡 枠なしスリムヘッダー配置（左: 枠なしタイトル / 中: 騰落率 / 右: ×ボタン）
+                        h_col1, h_col2, h_col3 = st.columns([3.6, 1.1, 0.4])
+
                         with h_col1:
-                            if st.button(f"{badge_e} {code} {name} 🔍", key=f"btn_dlg_etf_{code}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
+                            if st.button(
+                                f"{badge_e} {display_title} 🔍",
+                                key=f"btn_dlg_etf_{code}",
+                                type="tertiary",
+                                help=f"{code} {name}（クリックして構成銘柄一覧を展開）",
+                                use_container_width=True
+                            ):
                                 show_constituents_dialog(
                                     title=f"{code} {name}",
                                     constituent_codes=constituent_codes,
@@ -457,9 +505,9 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                                     is_jp=is_jp
                                 )
                         with h_col2:
-                            st.markdown(f"<div style='text-align:right; font-size:0.84rem; font-weight:bold; color:{color_e}; padding-top:4px;'>{etf_mom:+.2f}%</div>", unsafe_allow_html=True)
+                            st.markdown(f"<div style='text-align:right; font-size:0.84rem; font-weight:bold; color:{color_e}; line-height:1.7;'>{etf_mom:+.2f}%</div>", unsafe_allow_html=True)
                         with h_col3:
-                            st.button("非表示", key=f"vis_btn_{code}", use_container_width=True, on_click=toggle_etf_visibility, args=(code,))
+                            st.button("✕", key=f"vis_btn_{code}", type="tertiary", help=f"{name} を非表示にする", use_container_width=True, on_click=toggle_etf_visibility, args=(code,))
 
                         if not etf_abs.empty:
                             render_lwc_sector_mini(
@@ -476,10 +524,11 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                         else:
                             st.caption("データなし")
                     else:
+                        h_col1, h_col2 = st.columns([4.2, 0.8])
                         with h_col1:
-                            st.markdown(f"<div style='font-size:0.85rem; color:#9e9e9e; padding-top:4px;'>{code} {name} (非表示)</div>", unsafe_allow_html=True)
-                        with h_col3:
-                            st.button("表示", key=f"vis_btn_{code}", use_container_width=True, on_click=toggle_etf_visibility, args=(code,))
+                            st.markdown(f"<div style='font-size:0.85rem; color:#9e9e9e; line-height:1.7;'>{display_title} (非表示)</div>", unsafe_allow_html=True)
+                        with h_col2:
+                            st.button("表示", key=f"vis_btn_{code}", type="tertiary", use_container_width=True, on_click=toggle_etf_visibility, args=(code,))
 
             rows_17 = [all_etf_codes[i:i + n_cols] for i in range(0, len(all_etf_codes), n_cols)]
             for row_codes in rows_17:
@@ -505,9 +554,9 @@ def render_sector_mini_charts_fragment(is_jp: bool):
 
                 def render_theme_card(t_name, tickers):
                     visible = st.session_state[f"theme_visible_{t_name}"]
-                    with card_container(border=True):
-                        h_col1, h_col2, h_col3 = st.columns([3.0, 1.2, 0.8])
+                    display_title = _format_sector_title(t_name, max_chars=16)
 
+                    with card_container(border=True):
                         if visible:
                             ret_rate, sma75, sma200, total_val = get_theme_return_rate_cached(
                                 interval, tuple(tickers), period_days, resample_weekly, is_jp=is_jp
@@ -517,8 +566,17 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             badge_t = "🟢" if last_ret >= 0 else "🔴"
                             color_t = "#26a69a" if last_ret >= 0 else "#ef5350"
 
+                            # 💡 枠なしスリムヘッダー配置（左: 枠なしタイトル / 中: 騰落率 / 右: ×ボタン）
+                            h_col1, h_col2, h_col3 = st.columns([3.6, 1.1, 0.4])
+
                             with h_col1:
-                                if st.button(f"{badge_t} {t_name} 🔍", key=f"btn_dlg_theme_{t_name}", help="クリックして構成銘柄のミニチャート一覧を展開します", use_container_width=True):
+                                if st.button(
+                                    f"{badge_t} {display_title} 🔍",
+                                    key=f"btn_dlg_theme_{t_name}",
+                                    type="tertiary",
+                                    help=f"{t_name}（クリックして構成銘柄一覧を展開）",
+                                    use_container_width=True
+                                ):
                                     show_constituents_dialog(
                                         title=t_name,
                                         constituent_codes=tickers,
@@ -528,9 +586,9 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                                         is_jp=is_jp
                                     )
                             with h_col2:
-                                st.markdown(f"<div style='text-align:right; font-size:0.84rem; font-weight:bold; color:{color_t}; padding-top:4px;'>{last_ret:+.2f}%</div>", unsafe_allow_html=True)
+                                st.markdown(f"<div style='text-align:right; font-size:0.84rem; font-weight:bold; color:{color_t}; line-height:1.7;'>{last_ret:+.2f}%</div>", unsafe_allow_html=True)
                             with h_col3:
-                                st.button("非表示", key=f"theme_btn_{t_name}", use_container_width=True, on_click=toggle_theme_visibility, args=(t_name,))
+                                st.button("✕", key=f"theme_btn_{t_name}", type="tertiary", help=f"{t_name} を非表示にする", use_container_width=True, on_click=toggle_theme_visibility, args=(t_name,))
 
                             if not ret_rate.empty:
                                 render_lwc_sector_mini(
@@ -547,10 +605,11 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             else:
                                 st.caption("データなし")
                         else:
+                            h_col1, h_col2 = st.columns([4.2, 0.8])
                             with h_col1:
-                                st.markdown(f"<div style='font-size:0.85rem; color:#9e9e9e; padding-top:4px;'>{t_name} (非表示)</div>", unsafe_allow_html=True)
-                            with h_col3:
-                                st.button("表示", key=f"theme_btn_{t_name}", use_container_width=True, on_click=toggle_theme_visibility, args=(t_name,))
+                                st.markdown(f"<div style='font-size:0.85rem; color:#9e9e9e; line-height:1.7;'>{display_title} (非表示)</div>", unsafe_allow_html=True)
+                            with h_col2:
+                                st.button("表示", key=f"theme_btn_{t_name}", type="tertiary", use_container_width=True, on_click=toggle_theme_visibility, args=(t_name,))
 
                 rows_theme = [theme_names[i:i + n_cols] for i in range(0, len(theme_names), n_cols)]
                 for row_themes in rows_theme:
@@ -608,9 +667,15 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                 with cols[col_i]:
                     with card_container(border=True):
                         wvf_badge = " 🔥" if wvf_active else ""
-                        c_h1, c_h2 = st.columns([3.5, 1.5])
+                        c_h1, c_h2 = st.columns([3.8, 1.2])
                         with c_h1:
-                            if st.button(f"{sname}{wvf_badge} 🔍", key=f"btn_dlg_us_{sname}", use_container_width=True):
+                            if st.button(
+                                f"{sname}{wvf_badge} 🔍",
+                                key=f"btn_dlg_us_{sname}",
+                                type="tertiary",
+                                help=f"{sname}（クリックして構成銘柄一覧を展開）",
+                                use_container_width=True
+                            ):
                                 show_constituents_dialog(
                                     title=sname,
                                     constituent_codes=tickers,
@@ -621,7 +686,7 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                                 )
                         with c_h2:
                             color_u = "#26a69a" if mom >= 0 else "#ef5350"
-                            st.markdown(f"<div style='text-align:right; font-size:0.84rem; font-weight:bold; color:{color_u}; padding-top:4px;'>{mom:+.2f}%</div>", unsafe_allow_html=True)
+                            st.markdown(f"<div style='text-align:right; font-size:0.84rem; font-weight:bold; color:{color_u}; line-height:1.7;'>{mom:+.2f}%</div>", unsafe_allow_html=True)
 
                         if not sec_abs.empty:
                             render_lwc_sector_mini(
