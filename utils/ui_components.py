@@ -9,7 +9,6 @@ import streamlit as st
 def card_container(border: bool = True):
     """
     全画面共通のカード外枠コンテナ（コンテキストマネージャ）。
-    将来的なスタイル・余白変更を一元管理します。
     """
     with st.container(border=border):
         yield
@@ -34,7 +33,7 @@ def build_tradingview_link(
 
     return (
         f"<a href='{tv_url}' target='_blank' rel='noopener noreferrer' "
-        f"style='color:{color}; text-decoration:none; border-bottom:1px dotted {color};' "
+        f"style='color:{color}; text-decoration:none; border-bottom:1px dotted {color}; padding-bottom:1px;' "
         f"title='TradingViewで開く: {label}'>{label}</a>"
     )
 
@@ -54,7 +53,7 @@ def build_status_badge(
     return (
         f"<span style='display:inline-block; font-size:0.75rem; background:{bg_color}; "
         f"color:{text_color}; {border_css} padding:2px 6px; border-radius:3px; "
-        f"font-weight:bold; white-space:nowrap;' {title_attr}>{text}</span>"
+        f"font-weight:bold; white-space:nowrap; vertical-align:middle;' {title_attr}>{text}</span>"
     )
 
 
@@ -70,10 +69,10 @@ def build_wvf_badge_html(wvf_summary: dict) -> str:
         ext_val = wvf_summary.get("ext_price", 0.0)
         ext_str = f"¥{ext_val:,.1f}" if pd.notna(ext_val) and ext_val > 0 else "-"
         return (
-            f"<span style='font-size:0.75rem; background:#00e676; color:#000000; "
-            f"padding:2px 6px; border-radius:3px; font-weight:bold;'>"
+            f"<span style='display:inline-block; font-size:0.75rem; background:#00e676; color:#000000; "
+            f"padding:2px 6px; border-radius:3px; font-weight:bold; vertical-align:middle;'>"
             f"🟢 点灯中({streak}日目)</span> "
-            f"<span style='font-size:0.75rem; color:#b0bec5;'>翌日消灯目安: {ext_str}</span>"
+            f"<span style='font-size:0.75rem; color:#b0bec5; vertical-align:middle;'>翌日消灯目安: {ext_str}</span>"
         )
     elif wvf_summary.get("is_fuchsia", False):
         return build_status_badge("⚪ 反発消灯", bg_color="#37474f", text_color="#ffffff", border_color="#78909c")
@@ -94,9 +93,9 @@ def render_card_header(
     col_ratio: list = None
 ):
     """
-    全画面で統一されたカード上部ヘッダー（左: タイトル・リンク・バッジ、右: 騰落率/メトリクス/アクション）を描画します。
+    全画面で統一されたカード上部ヘッダーを描画します。
+    文字下部の欠け（クリッピング）を完全に防ぐ余白・行高を確保しています。
     """
-    # 騰落率に応じたデザインカラーの決定
     if mom_value is not None:
         if mom_value >= 0.01:
             badge_icon = "🟢"
@@ -116,24 +115,23 @@ def render_card_header(
         theme_color = "#ffffff"
         mom_display = None
 
-    # 左側タイトル部分の構築
     if code:
         link_html = build_tradingview_link(code=code, display_name=title, is_jp=is_jp, color=theme_color)
         left_main_html = (
-            f"<div style='font-size:0.88rem; font-weight:600; color:{theme_color}; line-height:1.5; "
-            f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis;'>"
+            f"<div style='font-size:0.88rem; font-weight:600; color:{theme_color}; line-height:1.7; "
+            f"padding-bottom:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;'>"
             f"{badge_icon + ' ' if badge_icon else ''}{link_html}</div>"
         )
     else:
         left_main_html = (
-            f"<div style='font-size:0.88rem; font-weight:600; color:{theme_color}; line-height:1.5; "
-            f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis;'>"
+            f"<div style='font-size:0.88rem; font-weight:600; color:{theme_color}; line-height:1.7; "
+            f"padding-bottom:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;'>"
             f"{badge_icon + ' ' if badge_icon else ''}{title}</div>"
         )
 
-    # 左右カラム比率の調整
+    # アクションボタンがある場合、潰れないよう比率を調整
     if right_action_fn:
-        ratio = col_ratio if col_ratio and len(col_ratio) == 3 else [3.4, 1.0, 0.6]
+        ratio = col_ratio if col_ratio and len(col_ratio) == 3 else [3.2, 1.1, 0.9]
         c_left, c_right_val, c_right_act = st.columns(ratio)
     else:
         ratio = col_ratio if col_ratio and len(col_ratio) == 2 else [3.8, 1.2]
@@ -144,7 +142,7 @@ def render_card_header(
         st.markdown(left_main_html, unsafe_allow_html=True)
         if badge_html:
             st.markdown(
-                f"<div style='margin-top:2px; margin-bottom:4px; height:20px; line-height:20px; "
+                f"<div style='margin-top:1px; margin-bottom:4px; min-height:20px; line-height:20px; "
                 f"overflow:hidden; white-space:nowrap;'>{badge_html}</div>",
                 unsafe_allow_html=True
             )
@@ -152,7 +150,7 @@ def render_card_header(
     with c_right_val:
         if mom_display is not None or mom_sub_text is not None:
             val_html = (
-                f"<div style='text-align:right; line-height:1.4;'>"
+                f"<div style='text-align:right; line-height:1.4; padding-top:2px;'>"
                 f"{f'<div style=\"font-size:0.84rem; font-weight:bold; color:{theme_color};\">{mom_display}</div>' if mom_display else ''}"
                 f"{f'<div style=\"font-size:0.75rem; color:#9e9e9e;\">{mom_sub_text}</div>' if mom_sub_text else ''}"
                 f"</div>"

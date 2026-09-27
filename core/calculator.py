@@ -8,7 +8,6 @@ from data_access.local_db import load_price_db, get_price_data_cached
 
 @st.cache_data(ttl=3600)
 def fetch_proxy_market_value(proxy_ticker: str, start_date: datetime, end_date: datetime, db_df: pd.DataFrame = None) -> pd.Series:
-    """市場全体の総売買代金の代理（プロキシ）として、1306 や SPY の時系列データを取得します。"""
     try:
         pure_ticker = str(proxy_ticker).strip().upper()
         is_jp = True
@@ -44,7 +43,6 @@ def fetch_proxy_market_value(proxy_ticker: str, start_date: datetime, end_date: 
         return pd.Series(dtype=float)
 
 def compute_sector_index_from_df(db_df: pd.DataFrame, tickers: list, period_days: int, resample_weekly: bool) -> pd.Series:
-    """指定された複数のティッカーの等金額分散投資指数を計算します。"""
     if db_df.empty:
         return pd.Series(dtype=float)
     db_df = db_df.copy()
@@ -69,7 +67,6 @@ def compute_sector_index_from_df(db_df: pd.DataFrame, tickers: list, period_days
     return index_series
 
 def get_sector_momentum(index_series: pd.Series, days: int = 5) -> float:
-    """直近指定日数における合成インデックスの騰落率(%)を計算します。"""
     if index_series is None or len(index_series) < 2:
         return 0.0
     recent = index_series.iloc[-min(days, len(index_series)):]
@@ -121,7 +118,6 @@ def get_benchmark_data(ticker: str, period_days: int, interval: str) -> pd.Serie
     return _compute_benchmark_data_internal(ticker, period_days, interval, is_jp=True)
 
 def relativize_series(idx_series: pd.Series, bm_series: pd.Series) -> pd.Series:
-    """基準指数に対する相対強度(RS)のインデックス推移を計算します。"""
     if bm_series is None or bm_series.empty:
         return idx_series
     bm_aligned = bm_series.reindex(idx_series.index, method='ffill')
@@ -133,7 +129,6 @@ def relativize_series(idx_series: pd.Series, bm_series: pd.Series) -> pd.Series:
     return rel
 
 def compute_sector_absolute_data(db_df: pd.DataFrame, tickers: list, period_days: int, resample_weekly: bool, interval: str = "1d", is_jp: bool = True) -> tuple:
-    """指定された構成群から絶対価格平均、移動平均、WVF、合算売買代金などを一挙算出します。"""
     if db_df.empty:
         return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=float)
     db_df = db_df.copy()
@@ -407,15 +402,10 @@ def get_benchmark_data_cached(ticker: str, period_days: int, interval: str, is_j
     else:
         return _get_benchmark_data_intraday_cached(ticker, period_days, interval, is_jp)
 
-
 # =====================================================================
-# 💡 WVFシグナル計算ロジック（反発消灯・通常消灯対応）
+# 💡 WVFシグナル計算ロジック
 # =====================================================================
 def compute_wvf_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    WVF（Williams Vix Fix）およびChris Moody版準拠の
-    ボトム判定シグナル（Lime / 反発消灯 / 通常消灯）と次回消灯目安値をインメモリ計算します。
-    """
     if df is None or df.empty or len(df) < 15:
         return df
 
@@ -423,7 +413,6 @@ def compute_wvf_signals(df: pd.DataFrame) -> pd.DataFrame:
     if 'date' in df.columns:
         df = df.sort_values('date').reset_index(drop=True)
 
-    # 1. 基本WVFおよびバンドの算出
     highest_close = df['close'].rolling(window=11).max()
     wvf = (highest_close - df['low']) / highest_close * 100.0
     wvf_std = wvf.rolling(window=20).std(ddof=0)
@@ -431,25 +420,18 @@ def compute_wvf_signals(df: pd.DataFrame) -> pd.DataFrame:
     wvf_upper = wvf_mid + (2.0 * wvf_std)
     range_high = wvf.rolling(window=100, min_periods=20).max() * 0.85
 
-    # 2. パニック点灯シグナル (Lime / alert1)
     is_lime = ((wvf >= wvf_upper) | (wvf >= range_high)) & (wvf >= 5.0)
 
-    # 3. 前日点灯・当日消灯の判定
     was_lime = is_lime.shift(1).fillna(False).astype(bool)
     now_off = ~is_lime
 
-    # 反発プライスアクション: 安値切り上げ かつ 前日高値を上回る引け
     prev_low = df['low'].shift(1)
     prev_high = df['high'].shift(1)
     up_reversal = (df['low'] > prev_low) & (df['close'] > prev_high)
 
-    # 🌸 反発消灯シグナル: 前日点灯 ➔ 当日消灯 ＆ 反発プライスアクション成立
     is_fuchsia = was_lime & now_off & up_reversal
-
-    # ⚪ 通常消灯シグナル: 前日点灯 ➔ 当日消灯 ＆ 反発プライスアクション未成立
     is_normal_off = was_lime & now_off & (~up_reversal)
 
-    # 4. 次回消灯目安値（安値）（ext_price）
     p_upper = highest_close * (1.0 - wvf_upper / 100.0)
     p_range = highest_close * (1.0 - range_high / 100.0)
     p_floor = highest_close * (1.0 - 5.0 / 100.0)
@@ -465,20 +447,33 @@ def compute_wvf_signals(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
 # =====================================================================
 # 🚀 【新設】個別株ローソク足ミニチャート用・指標一括事前計算共通関数
 # =====================================================================
-def prepare_candle_indicators(df: pd.DataFrame, resample_weekly: bool = False) -> tuple[pd.DataFrame, dict, float, dict]:
+def extract_bb_dict(df_sliced: pd.DataFrame) -> dict:
     """
-    全画面（screening, sector_rotation, holdings）で重複していた
-    SMA(25/75/200)、ボリンジャーバンド(±2σ/±3σ)、WVF状態、直近5日騰落率を
-    インメモリで一括算出して返します。
+    スライスされた表示用DataFrameから、期間が完全に一致したbb_dictを抽出します。
+    """
+    if df_sliced is None or df_sliced.empty:
+        return None
+    disp_indexed = df_sliced.set_index("date") if "date" in df_sliced.columns else df_sliced
+    return {
+        "p2": disp_indexed.get("bb_p2"),
+        "m2": disp_indexed.get("bb_m2"),
+        "p3": disp_indexed.get("bb_p3"),
+        "m3": disp_indexed.get("bb_m3")
+    }
+
+def prepare_candle_indicators(df: pd.DataFrame, resample_weekly: bool = False) -> tuple[pd.DataFrame, float, dict]:
+    """
+    全画面で重複していたSMA(25/75/200)、ボリンジャーバンド(±2σ/±3σ)、WVF状態、
+    直近5日騰落率を一括算出して返します。
+    ※bb_dictは表示期間スライス後に extract_bb_dict(df_display) で安全に取得します。
     
-    戻り値: (df_calculated, bb_dict, s_mom, wvf_summary)
+    戻り値: (df_calc, s_mom, wvf_summary)
     """
     if df is None or df.empty or len(df) < 2:
-        return pd.DataFrame(), None, 0.0, {}
+        return pd.DataFrame(), 0.0, {}
 
     df_calc = df.copy()
     if "date" in df_calc.columns:
@@ -499,7 +494,7 @@ def prepare_candle_indicators(df: pd.DataFrame, resample_weekly: bool = False) -
     df_calc["sma75"]  = df_calc["close"].rolling(window=75, min_periods=1).mean()
     df_calc["sma200"] = df_calc["close"].rolling(window=200, min_periods=1).mean()
 
-    # ボリンジャーバンド
+    # ボリンジャーバンド列
     bb_mid = df_calc["close"].rolling(window=20, min_periods=1).mean()
     bb_std = df_calc["close"].rolling(window=20, min_periods=1).std(ddof=0)
     df_calc["bb_p2"] = bb_mid + (2.0 * bb_std)
@@ -507,21 +502,13 @@ def prepare_candle_indicators(df: pd.DataFrame, resample_weekly: bool = False) -
     df_calc["bb_p3"] = bb_mid + (3.0 * bb_std)
     df_calc["bb_m3"] = bb_mid - (3.0 * bb_std)
 
-    disp_indexed = df_calc.set_index("date")
-    bb_dict = {
-        "p2": disp_indexed["bb_p2"],
-        "m2": disp_indexed["bb_m2"],
-        "p3": disp_indexed["bb_p3"],
-        "m3": disp_indexed["bb_m3"]
-    }
-
-    # 直近5日モメンタム（騰落率）
+    # 直近5日モメンタム
     s_mom = 0.0
     recent_closes = df_calc["close"].tail(min(5, len(df_calc))).values
     if len(recent_closes) >= 2 and recent_closes[0] > 0:
         s_mom = float((recent_closes[-1] / recent_closes[0] - 1) * 100.0)
 
-    # 最新日WVF状態サマリー
+    # 最新日WVF状態
     latest_row = df_calc.iloc[-1]
     lime_streak = int((df_calc["is_lime"].iloc[::-1].cumprod()).sum()) if latest_row.get("is_lime", False) else 0
 
@@ -533,4 +520,4 @@ def prepare_candle_indicators(df: pd.DataFrame, resample_weekly: bool = False) -
         "lime_streak": lime_streak
     }
 
-    return df_calc, bb_dict, s_mom, wvf_summary
+    return df_calc, s_mom, wvf_summary

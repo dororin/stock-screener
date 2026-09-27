@@ -12,7 +12,7 @@ from data_access.sheets_api import (
     load_history,
     load_events_from_sheets
 )
-from core.calculator import prepare_candle_indicators
+from core.calculator import prepare_candle_indicators, extract_bb_dict
 from core.event_collector import (
     get_earnings_countdown_badge,
     build_event_markers
@@ -124,11 +124,12 @@ def render_screened_stock_card(index_num: int, unique_key: str, events_dict: dic
             _raw = r['チャート']
             if isinstance(_raw, str) and len(_raw) > 10:
                 raw_df = pd.read_json(io.StringIO(_raw))
-                chart_df, bb_dict, s_mom, wvf_summary = prepare_candle_indicators(raw_df)
+                chart_df, s_mom, wvf_summary = prepare_candle_indicators(raw_df)
+                # 💡 スライス済み（60本分）のchart_dfからbb_dictを抽出して期間を完全に一致させる
+                bb_dict = extract_bb_dict(chart_df)
         except Exception:
             pass
 
-    # WVFバッジの構成（結果行の特定値を優先適用）
     ext_val = r.get('消灯目安') if '消灯目安' in r else r.get('消灯目安(安値)', 0.0)
     streak = r.get('点灯日数', 1)
     wvf_summary.update({
@@ -138,7 +139,6 @@ def render_screened_stock_card(index_num: int, unique_key: str, events_dict: dic
     })
     wvf_badge_html = build_wvf_badge_html(wvf_summary)
 
-    # 決算・配当バッジ & マーカー
     ev_info = (events_dict or {}).get(code, {})
     earnings_badge_html = get_earnings_countdown_badge(ev_info.get("next_earnings", ""))
     event_markers = build_event_markers(ev_info.get("prev_earnings", ""), ev_info.get("prev_dividend", ""))

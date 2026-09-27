@@ -7,14 +7,14 @@ import numpy as np
 from config import settings
 from data_access.sheets_api import load_holdings_from_sheets, load_events_from_sheets
 from data_access.local_db import get_price_data_cached
-from core.calculator import prepare_candle_indicators
+from core.calculator import prepare_candle_indicators, extract_bb_dict
 from core.event_collector import (
     get_earnings_countdown_badge,
     build_event_markers
 )
 from utils.ui_components import (
     card_container, 
-    render_card_header, 
+    build_tradingview_link,
     build_status_badge, 
     build_wvf_badge_html
 )
@@ -89,14 +89,17 @@ def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFra
         if mask.any():
             df_stock = db_df[mask].copy().sort_values("date").reset_index(drop=True)
 
-    df_calc, bb_dict, s_mom, wvf_summary = prepare_candle_indicators(df_stock)
+    df_calc, s_mom, wvf_summary = prepare_candle_indicators(df_stock)
     latest_close = group_df["現在値"].iloc[-1] if not group_df.empty else 0.0
 
     if not df_calc.empty:
         latest_close = df_calc.iloc[-1]["close"]
         chart_display = df_calc.tail(180).copy().reset_index(drop=True)
+        # 💡 スライス後のchart_displayからbb_dictを生成することでX軸が完全に180日に一致！
+        bb_dict = extract_bb_dict(chart_display)
     else:
         chart_display = pd.DataFrame()
+        bb_dict = None
 
     wvf_badge_html = build_wvf_badge_html(wvf_summary)
 
@@ -107,17 +110,20 @@ def render_holding_stock_card(ticker: str, stock_name: str, group_df: pd.DataFra
     badge_items = [b for b in [wvf_badge_html, earnings_badge_html] if b]
     combined_badges = "&nbsp;&nbsp;".join(badge_items)
 
-    display_label = f"{ticker_clean} {stock_name}"
+    link_html = build_tradingview_link(code=ticker_clean, display_name=f"{ticker_clean} {stock_name}", is_jp=True, color="#ffffff")
+    sign_icon = "🟢" if profit_pct >= 0 else "🔴"
 
     with card_container(border=True):
-        render_card_header(
-            title=display_label,
-            code=ticker_clean,
-            is_jp=True,
-            mom_value=profit_pct,
-            mom_sub_text=f"損益: ¥{total_profit:+,.0f}",
-            badge_html=combined_badges,
-            col_ratio=[3.5, 1.5]
+        # 💡 ヘッダー：左側に銘柄名(TradingViewリンク)、右側にWVF/決算バッジをスッキリ配置（二重表示解消）
+        head_col1, head_col2 = st.columns([3, 2])
+        head_col1.markdown(
+            f"<div style='font-size:0.92rem; font-weight:600; line-height:1.7; padding-bottom:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;'>"
+            f"{sign_icon} {link_html}</div>",
+            unsafe_allow_html=True
+        )
+        head_col2.markdown(
+            f"<div style='text-align:right; margin-top:2px; white-space:nowrap; overflow:hidden;'>{combined_badges}</div>", 
+            unsafe_allow_html=True
         )
 
         c_left, c_right = st.columns([1, 1])
