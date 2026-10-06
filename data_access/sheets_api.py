@@ -314,7 +314,7 @@ def load_holdings_from_sheets() -> pd.DataFrame:
         return pd.DataFrame()
 
 # =====================================================================
-# 📅 【新規追加】決算・配当カレンダー（event_calendar）の読み書き
+# 📅 決算・配当カレンダー（event_calendar）の読み書き
 # =====================================================================
 EVENT_CALENDAR_COLUMNS = ["銘柄コード", "銘柄名", "次回決算日", "直近決算日", "次回配当日", "直近配当日", "更新日時"]
 
@@ -417,7 +417,6 @@ def load_events_from_sheets(force_sheets: bool = False) -> dict:
                 "updated_at": str(r.get("更新日時", "")).strip(),
             }
 
-        # 取得できた場合はローカルキャッシュも更新
         try:
             os.makedirs(settings.WORK_DIR, exist_ok=True)
             with open(json_path, "w", encoding="utf-8") as f:
@@ -539,6 +538,59 @@ def save_extra_tickers_to_sheets(df: pd.DataFrame):
         ws.update(rows, "A1")
     except Exception:
         pass
+
+# =====================================================================
+# 👥 投資部門別売買動向（investor_type_data）の読み書き
+# =====================================================================
+INVESTOR_TYPE_COLUMNS = [
+    "week", "date", "海外投資家_差引(億円)", "個人現金_差引(億円)", 
+    "個人信用_差引(億円)", "信託銀行_差引(億円)", "事業法人_差引(億円)"
+]
+
+def save_investor_type_data(df: pd.DataFrame) -> bool:
+    """投資部門別売買動向データをスプレッドシートに保存します。"""
+    sh = get_sector_spreadsheet()
+    if sh is None or df is None or df.empty:
+        return False
+    try:
+        sheet_name = getattr(settings, "INVESTOR_TYPE_SHEET_NAME", "investor_type_data")
+        try:
+            ws = sh.worksheet(sheet_name)
+        except Exception:
+            ws = sh.add_worksheet(title=sheet_name, rows=500, cols=len(INVESTOR_TYPE_COLUMNS))
+
+        save_df = df.copy()
+        for col in INVESTOR_TYPE_COLUMNS:
+            if col not in save_df.columns:
+                save_df[col] = ""
+        save_df = save_df[INVESTOR_TYPE_COLUMNS].fillna("")
+
+        rows = [INVESTOR_TYPE_COLUMNS] + save_df.values.tolist()
+        ws.clear()
+        ws.update(values=rows, range_name="A1")
+        return True
+    except Exception as e:
+        print(f"❌ [sheets_api] 投資部門別シートへの書き込みに失敗しました: {e}")
+        return False
+
+def load_investor_type_data() -> pd.DataFrame:
+    """スプレッドシートから投資部門別売買動向データを取得します。"""
+    sh = get_sector_spreadsheet()
+    if sh is None:
+        return pd.DataFrame(columns=INVESTOR_TYPE_COLUMNS)
+    try:
+        sheet_name = getattr(settings, "INVESTOR_TYPE_SHEET_NAME", "investor_type_data")
+        ws = sh.worksheet(sheet_name)
+        records = ws.get_all_records()
+        if not records:
+            return pd.DataFrame(columns=INVESTOR_TYPE_COLUMNS)
+        df = pd.DataFrame(records)
+        for col in ["海外投資家_差引(億円)", "個人現金_差引(億円)", "個人信用_差引(億円)", "信託銀行_差引(億円)", "事業法人_差引(億円)"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+    except Exception as e:
+        return pd.DataFrame(columns=INVESTOR_TYPE_COLUMNS)
 
 ETF_MASTER_COLUMNS = ["ETFコード", "セクター名", "フィルターポリシー", "ファンド"]
 SECTOR_JP_COLUMNS = ["セクター名", "銘柄コード", "備考", "ETFコード"]

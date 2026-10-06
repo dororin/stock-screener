@@ -1,4 +1,5 @@
 # config/settings.py
+
 import os
 
 try:
@@ -8,7 +9,7 @@ except ImportError:
     HAS_STREAMLIT = False
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# --- 環境判定とディレクトリ設定（ロードの都合上、先に定義） ---
+# --- 環境判定とディレクトリ設定 ---
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def setup_directories():
     is_colab = False
@@ -42,11 +43,10 @@ def setup_directories():
 PROJECT_ROOT, DRIVE_DIR, WORK_DIR = setup_directories()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🚀 secrets.toml からの共通環境設定ロード（Streamlit/ローカル双方対応）
+# 🚀 secrets.toml からの共通環境設定ロード
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 cfg_secrets = {}
 
-# 1. Streamlit Secrets のロード試行
 if HAS_STREAMLIT:
     try:
         if hasattr(st, "secrets") and st.secrets:
@@ -54,7 +54,6 @@ if HAS_STREAMLIT:
     except Exception:
         pass
 
-# 2. 非GUI環境（ローカル実行時等）のための直接 TOML ロード試行
 if not cfg_secrets:
     secrets_path = os.path.join(PROJECT_ROOT, ".streamlit", "secrets.toml")
     if os.path.exists(secrets_path):
@@ -69,9 +68,6 @@ if not cfg_secrets:
         "❌ 認証・設定ファイル (secrets.toml) が正常にロードされていません。プログラムの実行を中断します。"
     )
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🚀 新しい secrets.toml のキーから環境設定を安全に取得
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 try:
     FOLDER_ID = cfg_secrets["FOLDER_ID"]
     LOGS_FOLDER_ID = cfg_secrets["LOGS_FOLDER_ID"]
@@ -86,9 +82,12 @@ except KeyError as e:
 # --- 各種外部URL・基本設定 ---
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 JPX_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx"
+JPX_INVESTOR_TYPE_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/investor-type/index.html"
+NIKKEI225JP_SINYOU_URL = "https://nikkei225jp.com/_data/_nfsDATA/data_DAY/dailyweek2.json"
+NIKKEI225JP_SAITEI_URL = "https://nikkei225jp.com/_data/_nfsDATA/json_DAY/daily_saitei.json"
+
 TIMEFRAMES = ["1d", "60m", "5m", "1m"]
 
-# --- 株式分割スキャン：各時間足の遡り走査期間（営業日ベース） ---
 SPLIT_SCAN_LOOKBACK_BDAYS = {
     "1m": 9,
     "5m": 15,
@@ -100,11 +99,39 @@ SPLIT_SCAN_LOOKBACK_BDAYS = {
 WATCHLIST_SHEET_NAME = "watchlist"
 REPAIR_LOG_SHEET_NAME = "repair_log"
 EXTRA_TICKERS_SHEET = "extra_tickers"
-HOLDINGS_SHEET_NAME = "my_holdings"  # 💡 保有株同期用シート名
-EVENT_CALENDAR_SHEET_NAME = "event_calendar"  # 💡 決算・配当カレンダー用シート名
+HOLDINGS_SHEET_NAME = "my_holdings"
+EVENT_CALENDAR_SHEET_NAME = "event_calendar"
+INVESTOR_TYPE_SHEET_NAME = "investor_type_data"  # 💡 投資部門別売買動向用
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# --- セクター定義（スプレッドシート接続不可時のデフォルト） ---
+# 🌐 マクロ監視マスター辞書 ＆ 警戒ライン定義
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MACRO_WATCHLIST = {
+    # ── ① 通貨・流動性 ──
+    "USD/JPY": {"symbol": "JPY=X", "name": "ドル円", "category": "為替"},
+    "ドル指数": {"symbol": "DX-Y.NYB", "name": "ドルインデックス", "category": "為替"},
+    # ── ② 金利・債券 ──
+    "米10年金利": {"symbol": "^TNX", "name": "米10年債利回り", "category": "金利"},
+    "米2年金利": {"symbol": "^2YY", "name": "米2年債利回り", "category": "金利"},
+    # ── ③ 信用リスク・恐怖（CDS代用） ──
+    "信用スプレッド": {"symbol": "HYG_LQD", "name": "HYG/LQDレシオ", "category": "信用リスク"},
+    "VIX指数": {"symbol": "^VIX", "name": "株式恐怖指数", "category": "ボラティリティ"},
+    # ── ④ 主要株価指数 ──
+    "S&P500": {"symbol": "^GSPC", "name": "S&P 500", "category": "株式指数"},
+    "NASDAQ100": {"symbol": "^NDX", "name": "NASDAQ 100", "category": "株式指数"},
+    "SOX指数": {"symbol": "^SOX", "name": "半導体株指数", "category": "株式指数"},
+    # ── ⑤ コモディティ ──
+    "WTI原油": {"symbol": "CL=F", "name": "WTI原油先物", "category": "コモディティ"},
+    "ゴールド": {"symbol": "GC=F", "name": "金先物", "category": "コモディティ"},
+    "銅先物": {"symbol": "HG=F", "name": "銅先物(Dr.Copper)", "category": "コモディティ"},
+}
+
+# 裁定取引の危険警戒ライン（億円）
+SAITEI_ALERT_THRESHOLD_HIGH = 25000  # 2.5兆円（過熱・急落警戒）
+SAITEI_ALERT_THRESHOLD_LOW  = 5000   # 5,000億円（売り枯れ・大底圏）
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# --- セクター定義 ---
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 JP_SECTORS = {
     "半導体・装置": ["8035", "6857", "6146", "6920", "6963", "4063", "6981"],
@@ -139,7 +166,6 @@ US_SECTORS = {
 JP_BENCHMARKS = {"なし（絶対値）": None, "TOPIX (1306.T)": "1306.T", "日経平均": "^N225"}
 US_BENCHMARKS = {"なし（絶対値）": None, "S&P500": "^GSPC", "NASDAQ100": "^NDX"}
 
-# --- TOPIX-17 ETF 定義 ---
 TOPIX17_ETF_MAPPING = {
     "① 金融・金利敏感": ["1631", "1632", "1633"],
     "② ディフェンシブ": ["1617", "1621", "1627", "1628", "1630"],
@@ -156,5 +182,4 @@ TOPIX17_NAMES = {
     "1632": "金融（除く銀行）", "1633": "不動産"
 }
 
-# --- Solactive PCF CSV 設定 ---
 SOLACTIVE_PCF_BASE_URL = "https://www.solactive.com/downloads/etfservices/tse-pcf/single/"

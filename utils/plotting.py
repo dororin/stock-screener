@@ -289,7 +289,7 @@ def build_lwc_candle_chart(
         st_times = _safe_get_times(sma25)
         series.append({
             "type": "Line",
-            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma25.values) if not pd.isna(v)],
+            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(s25_times, sma25.values) if not pd.isna(v)],
             "options": {
                 "color": "rgba(239, 83, 80, 0.75)", 
                 "lineWidth": 1, 
@@ -548,7 +548,7 @@ def render_lwc_candle_mini(
     key: str = "lwc_candle", 
     height: int = 200, 
     is_jp: bool = True, 
-    wvf_df: pd.DataFrame = None,
+    wvf_df: pd.DataFrame = None, 
     bb_dict: dict = None,
     event_markers: list = None
 ):
@@ -574,7 +574,7 @@ def render_lwc_candle_mini(
         st.caption(f"描画エラー: {e}")
 
 # =====================================================================
-# 🚀 【新設】マーケット情報専用の共通LWC描画関数群
+# 🚀 マーケット情報専用のLWC描画関数群
 # =====================================================================
 
 def render_lwc_dual_line_chart(
@@ -657,6 +657,204 @@ def render_lwc_histogram_chart(
                 "priceFormat": {"type": "volume"},
                 "lastValueVisible": True
             }
+        }]
+    }
+    try:
+        renderLightweightCharts([chart_def], key=key)
+    except Exception as e:
+        st.caption(f"描画エラー: {e}")
+
+# =====================================================================
+# 🌟 【新設】裁定取引しきい値ライン・投資部門別・マクロミニチャート
+# =====================================================================
+
+def render_lwc_saitei_with_thresholds(
+    df_sai: pd.DataFrame,
+    high_threshold: float = 25000,
+    low_threshold: float = 5000,
+    height: int = 180,
+    key: str = "saitei_chart"
+):
+    """
+    裁定買残のヒストグラムに、過熱警戒ライン（赤破線）と底打ちライン（青破線）を
+    重ね合わせて描画します。
+    """
+    if df_sai is None or df_sai.empty:
+        st.caption("データなし")
+        return
+
+    times = _to_lwc_time(df_sai["date"])
+    buy_col = "buy(oku-yen)" if "buy(oku-yen)" in df_sai.columns else "buy_sai"
+
+    vol_data = [
+        {"time": t, "value": float(v), "color": "rgba(66, 165, 245, 0.65)"}
+        for t, v in zip(times, df_sai[buy_col]) if not pd.isna(v)
+    ]
+    
+    line_high = [{"time": t, "value": float(high_threshold)} for t in times]
+    line_low  = [{"time": t, "value": float(low_threshold)} for t in times]
+
+    chart_options = _lwc_base_options(height=height, right_offset=5)
+    chart_options["rightPriceScale"] = {
+        "borderColor": "rgba(128,128,128,0.3)",
+        "scaleMargins": {"top": 0.08, "bottom": 0.08},
+        "visible": True,
+    }
+
+    chart_def = {
+        "chart": chart_options,
+        "series": [
+            {
+                "type": "Histogram",
+                "data": vol_data,
+                "options": {
+                    "priceFormat": {"type": "volume"},
+                    "lastValueVisible": True,
+                    "title": "裁定買残",
+                }
+            },
+            {
+                "type": "Line",
+                "data": line_high,
+                "options": {
+                    "color": "#ef5350",
+                    "lineWidth": 1,
+                    "lineStyle": 2,  # 破線
+                    "priceLineVisible": False,
+                    "lastValueVisible": False,
+                    "crosshairMarkerVisible": False,
+                    "title": "過熱警戒(2.5兆円)",
+                }
+            },
+            {
+                "type": "Line",
+                "data": line_low,
+                "options": {
+                    "color": "#42a5f5",
+                    "lineWidth": 1,
+                    "lineStyle": 2,  # 破線
+                    "priceLineVisible": False,
+                    "lastValueVisible": False,
+                    "crosshairMarkerVisible": False,
+                    "title": "大底圏(0.5兆円)",
+                }
+            }
+        ]
+    }
+    try:
+        renderLightweightCharts([chart_def], key=key)
+    except Exception as e:
+        st.caption(f"描画エラー: {e}")
+
+def render_lwc_investor_type_chart(
+    df_investor: pd.DataFrame, 
+    height: int = 180, 
+    key: str = "investor_chart"
+):
+    """
+    投資部門別（海外勢・事業法人・個人信用）の週間純売買動向（億円）を
+    カラーヒストグラムおよびラインとして描画します。
+    """
+    if df_investor is None or df_investor.empty:
+        st.caption("データなし")
+        return
+
+    df_sorted = df_investor.sort_values("date").reset_index(drop=True)
+    times = _to_lwc_time(pd.to_datetime(df_sorted["date"]))
+
+    foreign_data = []
+    corp_data = []
+    margin_data = []
+
+    for t, (_, r) in zip(times, df_sorted.iterrows()):
+        f_val = r.get("海外投資家_差引(億円)", 0.0)
+        c_val = r.get("事業法人_差引(億円)", 0.0)
+        m_val = r.get("個人信用_差引(億円)", 0.0)
+
+        f_color = "rgba(38, 166, 154, 0.85)" if f_val >= 0 else "rgba(239, 83, 80, 0.85)"
+        foreign_data.append({"time": t, "value": float(f_val), "color": f_color})
+        corp_data.append({"time": t, "value": float(c_val)})
+        margin_data.append({"time": t, "value": float(m_val)})
+
+    chart_options = _lwc_base_options(height=height, right_offset=5)
+    chart_def = {
+        "chart": chart_options,
+        "series": [
+            {
+                "type": "Histogram",
+                "data": foreign_data,
+                "options": {
+                    "priceFormat": {"type": "volume"},
+                    "title": "海外投資家 純売買",
+                    "lastValueVisible": True,
+                }
+            },
+            {
+                "type": "Line",
+                "data": corp_data,
+                "options": {
+                    "color": "#ab47bc",  # 紫（自社株買い）
+                    "lineWidth": 2,
+                    "title": "事業法人(自社株買い)",
+                    "lastValueVisible": True,
+                }
+            },
+            {
+                "type": "Line",
+                "data": margin_data,
+                "options": {
+                    "color": "#ffa726",  # 橙（個人逆張り）
+                    "lineWidth": 1,
+                    "lineStyle": 1,
+                    "title": "個人信用",
+                    "lastValueVisible": True,
+                }
+            }
+        ]
+    }
+    try:
+        renderLightweightCharts([chart_def], key=key)
+    except Exception as e:
+        st.caption(f"描画エラー: {e}")
+
+def render_lwc_macro_mini(
+    df: pd.DataFrame, 
+    title: str = "", 
+    is_area: bool = False, 
+    color: str = "#42a5f5", 
+    height: int = 140, 
+    key: str = "macro_mini"
+):
+    """マクロ指標グリッド用の軽量ミニチャートを描画します。"""
+    if df is None or df.empty or "close" not in df.columns:
+        st.caption("データなし")
+        return
+
+    times = _to_lwc_time(df["date"] if "date" in df.columns else df.index)
+    data = [{"time": t, "value": round(float(v), 4)} for t, v in zip(times, df["close"].values) if not pd.isna(v)]
+
+    series_type = "Area" if is_area else "Line"
+    series_options = {
+        "color": color,
+        "lineWidth": 2,
+        "priceLineVisible": False,
+        "lastValueVisible": True,
+        "crosshairMarkerVisible": True,
+    }
+    if is_area:
+        series_options.update({
+            "lineColor": color,
+            "topColor": "rgba(171, 71, 188, 0.35)" if color == "#ab47bc" else "rgba(66, 165, 245, 0.35)",
+            "bottomColor": "rgba(171, 71, 188, 0.03)" if color == "#ab47bc" else "rgba(66, 165, 245, 0.03)",
+        })
+
+    chart_options = _lwc_base_options(height=height, right_offset=5)
+    chart_def = {
+        "chart": chart_options,
+        "series": [{
+            "type": series_type,
+            "data": data,
+            "options": series_options
         }]
     }
     try:

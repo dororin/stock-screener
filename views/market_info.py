@@ -8,15 +8,25 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
+from datetime import datetime
 
 from config import settings
-from data_access.sheets_api import conn
+from data_access.sheets_api import (
+    conn,
+    load_investor_type_data,
+    save_investor_type_data
+)
+from core.macro_collector import fetch_macro_market_data_ondemand
+from core.investor_type_collector import sync_jpx_investor_type_data
 from utils.ui_components import card_container, render_card_header, build_status_badge
 from utils.plotting import (
     _to_lwc_time,
     render_lwc_dual_line_chart,
     render_lwc_area_chart,
-    render_lwc_histogram_chart
+    render_lwc_histogram_chart,
+    render_lwc_saitei_with_thresholds,
+    render_lwc_investor_type_chart,
+    render_lwc_macro_mini
 )
 
 # =====================================================================
@@ -84,56 +94,10 @@ def update_and_load_naaim_data() -> pd.DataFrame:
     return merged_df
 
 # =====================================================================
-# 📡 信用残高（IRBank / 日経225JP）収集・同期ロジック
+# 📡 信用取引データ（新URL・評価損益率対応）
 # =====================================================================
-def fetch_irbank_margin(code: str) -> pd.DataFrame:
-    url = f"https://irbank.net/{code}/margin"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        res = requests.get(url, headers=headers, timeout=15)
-        if res.status_code != 200:
-            return pd.DataFrame()
-        soup = BeautifulSoup(res.text, "html.parser")
-        table = soup.find("table")
-        if not table:
-            return pd.DataFrame()
-        rows = table.find_all("tr")
-        data = []
-        current_year = str(pd.Timestamp.now().year)
-        for row in rows:
-            if "occ" in row.get('class', []):
-                year_td = row.find("td", class_="ct")
-                if year_td:
-                    year_val = year_td.get_text(strip=True)
-                    if re.match(r"^\d{4}$", year_val):
-                        current_year = year_val
-                continue
-            if any(cls in row.get('class', []) for cls in ["obb", "odd"]):
-                cells = row.find_all("td")
-                if len(cells) < 4:
-                    continue
-                date_text = cells[0].get_text(strip=True)
-                if not re.match(r"^\d{1,2}/\d{1,2}$", date_text):
-                    continue
-                try:
-                    buy_text = cells[1].get_text(separator="|", strip=True).split("|")[0].replace(",", "")
-                    sell_text = cells[3].get_text(separator="|", strip=True).split("|")[0].replace(",", "")
-                    data.append({
-                        'Date': pd.to_datetime(f"{current_year}/{date_text}"),
-                        'Buy(Shares)': int(buy_text),
-                        'Sell(Shares)': int(sell_text)
-                    })
-                except Exception:
-                    continue
-        df = pd.DataFrame(data)
-        if not df.empty:
-            df = df.drop_duplicates(subset=['Date']).sort_values('Date').reset_index(drop=True)
-        return df
-    except Exception:
-        return pd.DataFrame()
-
 def fetch_sinyou_data() -> pd.DataFrame:
-    url = "https://nikkei225jp.com/_data/_nfsWEB/DAY/dailyweek2.json"
+    url = settings.NIKKEI225JP_SINYOU_URL
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://nikkei225jp.com/data/sinyou.php"}
     try:
         res = requests.get(url, headers=headers, timeout=15)
@@ -144,12 +108,16 @@ def fetch_sinyou_data() -> pd.DataFrame:
         raw_rows = json.loads(json_text)
         data = []
         for r in raw_rows:
-            if len(r) >= 7 and r[4] != "" and r[6] != "":
+            if len(r) >= 9 and str(r[4]).strip() != "" and str(r[6]).strip() != "":
+                loss_rate = float(r[7]) if r[7] != "" and not pd.isna(r[7]) else np.nan
+                margin_ratio = float(r[8]) if r[8] != "" and not pd.isna(r[8]) else np.nan
                 data.append({
                     'Date': pd.to_datetime(r[0], unit='ms'),
                     'Nikkei225': float(r[1]) if r[1] != "" else np.nan,
                     'Sell(M-yen)': int(str(r[4]).replace(',', '')),
-                    'Buy(M-yen)': int(str(r[6]).replace(',', ''))
+                    'Buy(M-yen)': int(str(r[6]).replace(',', '')),
+                    'MarginLossRate': loss_rate,
+                    'MarginRatio': margin_ratio
                 })
         df = pd.DataFrame(data)
         if not df.empty:
@@ -186,7 +154,7 @@ def update_and_load_sinyou_data() -> pd.DataFrame:
     return merged_df
 
 # =====================================================================
-# 📡 裁定取引残高 収集・同期ロジック
+# 📡 裁定取引残高（新URL対応）
 # =====================================================================
 def parse_saitei_amount(val) -> float:
     try:
@@ -197,7 +165,7 @@ def parse_saitei_amount(val) -> float:
         return np.nan
 
 def fetch_saitei_data() -> pd.DataFrame:
-    url = "https://nikkei225jp.com/_data/_nfsWEB/HS_DATA_DAY/daily_saitei.json"
+    url = settings.NIKKEI225JP_SAITEI_URL
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://nikkei225jp.com/data/saitei.php"}
     try:
         res = requests.get(url, headers=headers, timeout=15)
@@ -250,6 +218,55 @@ def update_and_load_saitei_data() -> pd.DataFrame:
     return merged_df
 
 # =====================================================================
+# 📡 個別銘柄 信用残高 (IRBank)
+# =====================================================================
+def fetch_irbank_margin(code: str) -> pd.DataFrame:
+    url = f"https://irbank.net/{code}/margin"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200:
+            return pd.DataFrame()
+        soup = BeautifulSoup(res.text, "html.parser")
+        table = soup.find("table")
+        if not table:
+            return pd.DataFrame()
+        rows = table.find_all("tr")
+        data = []
+        current_year = str(pd.Timestamp.now().year)
+        for row in rows:
+            if "occ" in row.get('class', []):
+                year_td = row.find("td", class_="ct")
+                if year_td:
+                    year_val = year_td.get_text(strip=True)
+                    if re.match(r"^\d{4}$", year_val):
+                        current_year = year_val
+                continue
+            if any(cls in row.get('class', []) for cls in ["obb", "odd"]):
+                cells = row.find_all("td")
+                if len(cells) < 4:
+                    continue
+                date_text = cells[0].get_text(strip=True)
+                if not re.match(r"^\d{1,2}/\d{1,2}$", date_text):
+                    continue
+                try:
+                    buy_text = cells[1].get_text(separator="|", strip=True).split("|")[0].replace(",", "")
+                    sell_text = cells[3].get_text(separator="|", strip=True).split("|")[0].replace(",", "")
+                    data.append({
+                        'Date': pd.to_datetime(f"{current_year}/{date_text}"),
+                        'Buy(Shares)': int(buy_text),
+                        'Sell(Shares)': int(sell_text)
+                    })
+                except Exception:
+                    continue
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df = df.drop_duplicates(subset=['Date']).sort_values('Date').reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+# =====================================================================
 # 📈 セッション状態の初期化
 # =====================================================================
 if 'saitei_df' not in st.session_state:
@@ -273,234 +290,305 @@ if 'naaim_df' not in st.session_state:
     except Exception:
         st.session_state.naaim_df = pd.DataFrame()
 
-st.title("📈 マーケット情報")
-st.caption("日経平均・裁定取引・信用取引残高および米NAAIM指数の動向をモニタリングします。")
+if 'investor_type_df' not in st.session_state:
+    st.session_state.investor_type_df = load_investor_type_data()
+
+st.title("📈 マーケット情報（Market Info Cockpit）")
+st.caption("マクロ流動性・信用リスク・市場需給の歪みをリアルタイムに監視する総合コックピットです。")
 
 # =====================================================================
-# 📊 【フラグメント1】全体指数分析ダッシュボード
+# 🎛️ 【最上部】コントロールパネル
 # =====================================================================
-@st.fragment
-def render_market_dashboard_fragment():
-    with card_container(border=True):
-        col_ctrl1, col_ctrl2 = st.columns([3, 1])
-        with col_ctrl1:
-            period = st.radio(
-                "表示期間", 
-                ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "3年", "全期間"], 
-                index=3, 
-                horizontal=True,
-                key="dashboard_period_selector"
-            )
-        with col_ctrl2:
-            if st.button("🔄 指数データを最新化", type="primary", use_container_width=True, help="外部サイトから指数情報を同期します"):
-                with st.spinner("外部サイトから指数情報を最新化中..."):
-                    df_s = update_and_load_saitei_data()
-                    if not df_s.empty:
-                        st.session_state.saitei_df = df_s
-                    df_m = update_and_load_sinyou_data()
-                    if not df_m.empty:
-                        st.session_state.sinyou_df = df_m
-                    df_n = update_and_load_naaim_data()
-                    if not df_n.empty:
-                        st.session_state.naaim_df = df_n
-                    st.toast("✅ 指数データの同期が完了しました。")
-                    st.rerun(scope="fragment")
+with card_container(border=True):
+    col_ctrl1, col_ctrl2 = st.columns([3, 1])
+    with col_ctrl1:
+        period_label = st.radio(
+            "表示期間", 
+            ["1ヶ月", "3ヶ月", "6ヶ月", "1年", "3年", "全期間"], 
+            index=3, 
+            horizontal=True,
+            key="dashboard_period_selector"
+        )
+    with col_ctrl2:
+        if st.button("🔄 指数データを最新化", type="primary", use_container_width=True, help="外部サイトおよびJPXから最新データを同期します"):
+            with st.spinner("需給データおよびJPX投資部門別動向を最新化中..."):
+                df_s = update_and_load_saitei_data()
+                if not df_s.empty:
+                    st.session_state.saitei_df = df_s
+                df_m = update_and_load_sinyou_data()
+                if not df_m.empty:
+                    st.session_state.sinyou_df = df_m
+                df_n = update_and_load_naaim_data()
+                if not df_n.empty:
+                    st.session_state.naaim_df = df_n
+                df_inv = sync_jpx_investor_type_data()
+                if not df_inv.empty:
+                    st.session_state.investor_type_df = df_inv
+                st.cache_data.clear()
+                st.toast("✅ 指数・需給データの同期が完了しました。")
+                st.rerun()
 
-    saitei_df = st.session_state.saitei_df
-    sinyou_df = st.session_state.sinyou_df
-    naaim_df = st.session_state.naaim_df
+# 期間フィルタの計算
+end_dt = pd.Timestamp.now()
+if period_label == "1ヶ月":
+    start_dt = end_dt - pd.DateOffset(months=1)
+elif period_label == "3ヶ月":
+    start_dt = end_dt - pd.DateOffset(months=3)
+elif period_label == "6ヶ月":
+    start_dt = end_dt - pd.DateOffset(months=6)
+elif period_label == "1年":
+    start_dt = end_dt - pd.DateOffset(years=1)
+elif period_label == "3年":
+    start_dt = end_dt - pd.DateOffset(years=3)
+else:
+    start_dt = end_dt - pd.DateOffset(years=10)
 
-    if saitei_df.empty and sinyou_df.empty and naaim_df.empty:
-        st.warning("⚠️ 指数データがありません。上記ボタンを押して初期データを同期・取得してください。")
-        return
+# オンデマンドマクロデータの取得（10分キャッシュ）
+macro_data = fetch_macro_market_data_ondemand(period_label)
 
-    end_dt = saitei_df['Date'].max() if not saitei_df.empty else pd.Timestamp.now()
-    if period == "1ヶ月":
-        start_dt = end_dt - pd.DateOffset(months=1)
-    elif period == "3ヶ月":
-        start_dt = end_dt - pd.DateOffset(months=3)
-    elif period == "6ヶ月":
-        start_dt = end_dt - pd.DateOffset(months=6)
-    elif period == "1年":
-        start_dt = end_dt - pd.DateOffset(years=1)
-    elif period == "3年":
-        start_dt = end_dt - pd.DateOffset(years=3)
-    else:
-        start_dt = saitei_df['Date'].min() if not saitei_df.empty else end_dt - pd.DateOffset(years=10)
+# =====================================================================
+# 🇯🇵 【第1層：日本市場 需給＆日経同期コックピット】
+# =====================================================================
+st.markdown("### 🇯🇵 【第1層：日本市場 需給＆日経同期コックピット】")
 
-    df_jp = pd.DataFrame()
-    if not saitei_df.empty and not sinyou_df.empty:
-        d1 = saitei_df.copy()
-        d2 = sinyou_df.copy()
-        d1['Date'] = pd.to_datetime(d1['Date']).dt.normalize()
-        d2['Date'] = pd.to_datetime(d2['Date']).dt.normalize()
-        df_jp = pd.merge(d1, d2, on='Date', how='inner', suffixes=('_sai', '_sin')).sort_values('Date')
-        df_jp = df_jp[~df_jp['Date'].duplicated(keep='last')]
-        df_jp.columns = [str(c).lower().strip() for c in df_jp.columns]
+df_nk = macro_data.get("^N225", pd.DataFrame())
+saitei_df = st.session_state.saitei_df
+inv_df = st.session_state.investor_type_df
+
+with card_container(border=True):
+    # ■ 上段：日経平均株価 (LWCライン / SMA 25, 75, 200)
+    if not df_nk.empty:
+        df_nk_filtered = df_nk[df_nk["date"] >= start_dt].copy()
+        nk_latest = df_nk_filtered.iloc[-1]["close"]
+        nk_prev = df_nk_filtered.iloc[-2]["close"] if len(df_nk_filtered) > 1 else nk_latest
+        nk_mom = ((nk_latest - nk_prev) / nk_prev) * 100.0
+
+        render_card_header(
+            title="日経平均株価（終値 ＆ 移動平均線 25 / 75 / 200）",
+            mom_value=nk_mom,
+            mom_sub_text=f"前日比: {nk_latest - nk_prev:+,.1f} 円",
+            badge_html=f"<span style='color:#ffa726;'>現在値: <b>¥{nk_latest:,.1f}</b></span>"
+        )
         
-        nik_col = 'nikkei225_sai' if 'nikkei225_sai' in df_jp.columns else 'nikkei225'
-        buy_sai_col = 'buy(oku-yen)'
-        buy_sin_col = 'buy(m-yen)'
+        times_nk = _to_lwc_time(df_nk_filtered["date"])
+        data_nk = [{"time": t, "value": round(float(v), 2)} for t, v in zip(times_nk, df_nk_filtered["close"])]
+        data_sma25 = [{"time": t, "value": round(float(v), 2)} for t, v in zip(times_nk, df_nk_filtered["sma25"]) if not pd.isna(v)]
+        data_sma75 = [{"time": t, "value": round(float(v), 2)} for t, v in zip(times_nk, df_nk_filtered["sma75"]) if not pd.isna(v)]
+        data_sma200 = [{"time": t, "value": round(float(v), 2)} for t, v in zip(times_nk, df_nk_filtered["sma200"]) if not pd.isna(v)]
+
+        chart_nk = {
+            "chart": _lwc_base_options(height=200, right_offset=5),
+            "series": [
+                {"type": "Line", "data": data_nk, "options": {"color": "#ffffff", "lineWidth": 2, "title": "日経平均"}},
+                {"type": "Line", "data": data_sma25, "options": {"color": "#ef5350", "lineWidth": 1, "title": "25SMA"}},
+                {"type": "Line", "data": data_sma75, "options": {"color": "#ffa726", "lineWidth": 1, "title": "75SMA"}},
+                {"type": "Line", "data": data_sma200, "options": {"color": "#ab47bc", "lineWidth": 1, "title": "200SMA"}},
+            ]
+        }
+        try:
+            from streamlit_lightweight_charts import renderLightweightCharts
+            renderLightweightCharts([chart_nk], key="lwc_nk_cockpit")
+        except Exception:
+            pass
+
+    st.markdown("<hr style='margin:0.4rem 0;'>", unsafe_allow_html=True)
+
+    # ■ 中段：裁定買残高推移 (ヒストグラム + 赤2.5兆/青0.5兆線)
+    if not saitei_df.empty:
+        df_sai_filtered = saitei_df[(saitei_df["Date"] >= start_dt) & (saitei_df["Date"] <= end_dt)].copy()
+        df_sai_filtered.columns = [str(c).lower().strip() for c in df_sai_filtered.columns]
         
-        df_jp['ratio_sai'] = df_jp[buy_sai_col] / df_jp[nik_col]
-        df_jp['ratio_sin'] = df_jp[buy_sin_col] / df_jp[nik_col]
-        df_jp = df_jp[(df_jp['date'] >= start_dt) & (df_jp['date'] <= end_dt)]
+        latest_sai = df_sai_filtered.iloc[-1]
+        sai_val = latest_sai["buy(oku-yen)"]
+        prev_sai = df_sai_filtered.iloc[-2]["buy(oku-yen)"] if len(df_sai_filtered) > 1 else sai_val
+        sai_diff = sai_val - prev_sai
 
-    st.markdown("### 📊 日本市場 指数＆需給複合分析")
+        alert_badge = ""
+        if sai_val >= settings.SAITEI_ALERT_THRESHOLD_HIGH:
+            alert_badge = build_status_badge("🚨 裁定買残2.5兆円超 (過熱・急落警戒)", bg_color="#d50000", text_color="#ffffff")
+        elif sai_val <= settings.SAITEI_ALERT_THRESHOLD_LOW:
+            alert_badge = build_status_badge("🟢 裁定買残0.5兆円割れ (大底圏・反発期)", bg_color="#1b5e20", text_color="#ffffff")
 
-    # 1. 日経平均 & 裁定倍率
-    if not df_jp.empty:
-        times = _to_lwc_time(df_jp['date'])
-        latest_row = df_jp.iloc[-1]
-        prev_row = df_jp.iloc[-2] if len(df_jp) > 1 else latest_row
-        
-        nik_latest = latest_row[nik_col]
-        nik_diff = nik_latest - prev_row[nik_col]
-        nik_pct = (nik_diff / prev_row[nik_col] * 100.0) if prev_row[nik_col] > 0 else 0.0
+        render_card_header(
+            title="裁定買残高推移（過熱警戒 2.5兆円ライン ＆ 底打ち 0.5兆円ライン）",
+            mom_sub_text=f"前日比: {sai_diff:+,.0f} 億円",
+            badge_html=f"<span style='color:#42a5f5; margin-right:8px;'>最新: <b>{sai_val:,.0f} 億円</b></span> {alert_badge}"
+        )
+        render_lwc_saitei_with_thresholds(
+            df_sai_filtered, 
+            high_threshold=settings.SAITEI_ALERT_THRESHOLD_HIGH,
+            low_threshold=settings.SAITEI_ALERT_THRESHOLD_LOW,
+            height=160, 
+            key="saitei_cockpit"
+        )
 
-        sai_ratio_latest = latest_row['ratio_sai']
-        sai_ratio_diff = sai_ratio_latest - prev_row['ratio_sai']
+    st.markdown("<hr style='margin:0.4rem 0;'>", unsafe_allow_html=True)
 
-        with card_container(border=True):
-            badge_html = (
-                f"<span style='color:#ffa726; margin-right:12px;'>日経平均(左): <b>¥{nik_latest:,.0f}</b></span>"
-                f"<span style='color:#ef5350;'>裁定倍率(右): <b>{sai_ratio_latest:.4f}</b></span> "
-                f"<span style='color:#9e9e9e; margin-left:8px;'>(更新: {latest_row['date'].strftime('%Y-%m-%d')})</span>"
+    # ■ 下段：投資部門別売買動向 (海外/事業法人/個人の週間棒)
+    if not inv_df.empty:
+        df_inv_filtered = inv_df[pd.to_datetime(inv_df["date"]) >= start_dt].copy()
+        if not df_inv_filtered.empty:
+            latest_inv = df_inv_filtered.iloc[-1]
+            f_net = latest_inv.get("海外投資家_差引(億円)", 0.0)
+            c_net = latest_inv.get("事業法人_差引(億円)", 0.0)
+            m_net = latest_inv.get("個人信用_差引(億円)", 0.0)
+
+            badge_inv = (
+                f"<span style='color:{'#26a69a' if f_net >= 0 else '#ef5350'}; margin-right:12px;'>海外勢: <b>{f_net:+,.0f} 億円</b></span>"
+                f"<span style='color:#ab47bc; margin-right:12px;'>事業法人(自社株買い): <b>{c_net:+,.0f} 億円</b></span>"
+                f"<span style='color:#ffa726;'>個人信用: <b>{m_net:+,.0f} 億円</b></span>"
             )
             render_card_header(
-                title="日経平均 ＆ 裁定倍率推移",
-                mom_value=nik_pct,
-                mom_sub_text=f"倍率差: {sai_ratio_diff:+.4f}",
-                badge_html=badge_html
+                title=f"投資部門別 株式売買状況 (週間純売買額 | 週: {latest_inv.get('week', '-')})",
+                badge_html=badge_inv
+            )
+            render_lwc_investor_type_chart(df_inv_filtered, height=160, key="inv_cockpit")
+        else:
+            st.caption("指定期間内の投資部門別データはありません。")
+    else:
+        st.info("ℹ️ 投資部門別データはまだ取得されていません。「🔄 指数データを最新化」ボタンを押してJPXから取得してください。")
+
+# =====================================================================
+# ⚖️ 【第2層：国内・海外 レバレッジ＆過熱感モニター】
+# =====================================================================
+st.markdown("### ⚖️ 【第2層：国内・海外 レバレッジ＆過熱感モニター】")
+
+col_l2_left, col_l2_right = st.columns(2)
+
+# ■ 左列：信用比率 ＆ 信用評価損益率 (最新値 & 推移)
+with col_l2_left:
+    with card_container(border=True):
+        sinyou_df = st.session_state.sinyou_df
+        if not sinyou_df.empty:
+            df_sin = sinyou_df[(sinyou_df["Date"] >= start_dt) & (sinyou_df["Date"] <= end_dt)].sort_values("Date").copy()
+            latest_sin = df_sin.iloc[-1]
+            prev_sin = df_sin.iloc[-2] if len(df_sin) > 1 else latest_sin
+
+            loss_rate = latest_sin.get("MarginLossRate", np.nan)
+            ratio_sin = latest_sin.get("MarginRatio", np.nan)
+            if pd.isna(ratio_sin) and "Buy(M-yen)" in latest_sin and "Sell(M-yen)" in latest_sin:
+                ratio_sin = latest_sin["Buy(M-yen)"] / latest_sin["Sell(M-yen)"] if latest_sin["Sell(M-yen)"] > 0 else 0.0
+
+            loss_badge = f"<span style='color:{'#26a69a' if loss_rate >= -5 else '#ef5350' if loss_rate <= -10 else '#ffa726'}; margin-right:10px;'>評価損益率: <b>{loss_rate:+.2f}%</b></span>" if pd.notna(loss_rate) else ""
+            ratio_badge = f"<span style='color:#42a5f5;'>信用倍率: <b>{ratio_sin:.2f}倍</b></span>" if pd.notna(ratio_sin) else ""
+
+            render_card_header(
+                title="個人信用評価損益率 ＆ 信用倍率",
+                badge_html=f"{loss_badge} {ratio_badge}"
             )
 
-            nk_data = [{"time": t, "value": float(v)} for t, v in zip(times, df_jp[nik_col]) if not pd.isna(v)]
-            ratio_data = [{"time": t, "value": float(v)} for t, v in zip(times, df_jp['ratio_sai']) if not pd.isna(v)]
+            times_sin = _to_lwc_time(df_sin["Date"])
+            loss_data = [{"time": t, "value": float(v)} for t, v in zip(times_sin, df_sin["MarginLossRate"]) if not pd.isna(v)]
 
-            render_lwc_dual_line_chart(
-                series1_data=nk_data,
-                series2_data=ratio_data,
-                title1="日経平均",
-                title2="裁定倍率",
-                height=230,
-                key="lwc_jp_index"
+            render_lwc_area_chart(
+                series_definitions=[{
+                    "type": "Line",
+                    "data": loss_data,
+                    "options": {
+                        "color": "#ef5350",
+                        "lineWidth": 2,
+                        "title": "信用評価損益率 (%)",
+                        "lastValueVisible": True,
+                    }
+                }],
+                height=160,
+                key="lwc_margin_loss_chart"
             )
+        else:
+            st.caption("信用データなし")
 
-        col_g1, col_g2 = st.columns(2)
+# ■ 右列：米 NAAIM Exposure Index
+with col_l2_right:
+    with card_container(border=True):
+        naaim_df = st.session_state.naaim_df
+        if not naaim_df.empty:
+            df_naaim = naaim_df[(naaim_df["Date"] >= start_dt) & (naaim_df["Date"] <= end_dt)].sort_values("Date").copy()
+            if not df_naaim.empty:
+                latest_n = df_naaim.iloc[-1]
+                prev_n = df_naaim.iloc[-2] if len(df_naaim) > 1 else latest_n
+                val_n = latest_n["NAAIM"]
+                diff_n = val_n - prev_n["NAAIM"]
 
-        with col_g1:
-            with card_container(border=True):
-                sai_val_latest = latest_row[buy_sai_col]
-                sai_val_prev = prev_row[buy_sai_col]
-                sai_val_diff = sai_val_latest - sai_val_prev
-                sign_sai = "+" if sai_val_diff >= 0 else ""
-
-                render_card_header(
-                    title="裁定買残推移 (億円)",
-                    mom_sub_text=f"前日比: {sign_sai}{sai_val_diff:,} 億円",
-                    badge_html=f"<span style='color:#42a5f5;'>最新: <b>{sai_val_latest:,} 億円</b></span>"
-                )
-
-                sai_vol_data = [
-                    {"time": t, "value": float(v), "color": "rgba(66, 165, 245, 0.65)"} 
-                    for t, v in zip(times, df_jp[buy_sai_col]) if not pd.isna(v)
-                ]
-                render_lwc_histogram_chart(sai_vol_data, color="#42a5f5", height=160, key="lwc_sai_vol")
-
-        with col_g2:
-            with card_container(border=True):
-                sin_ratio_latest = latest_row['ratio_sin']
-                sin_ratio_prev = prev_row['ratio_sin']
-                sin_ratio_diff = sin_ratio_latest - sin_ratio_prev
-                sign_sin = "+" if sin_ratio_diff >= 0 else ""
+                badge_tag = "🟢 強気・過熱(80超)" if val_n >= 80 else "🔴 総悲観・大底(40以下)" if val_n <= 40 else "⚪ 中立"
+                b_color = "#d50000" if val_n >= 80 else "#1b5e20" if val_n <= 40 else "#37474f"
+                status_html = build_status_badge(badge_tag, bg_color=b_color, text_color="#ffffff")
 
                 render_card_header(
-                    title="信用比率 (買残 ÷ 日経平均)",
-                    mom_sub_text=f"前週比: {sign_sin}{sin_ratio_diff:.2f}",
-                    badge_html=f"<span style='color:#26a69a;'>最新: <b>{sin_ratio_latest:.2f}</b></span>"
+                    title="米 NAAIM Exposure Index（機関投資家エクスポージャー）",
+                    mom_sub_text=f"前週差: {diff_n:+.2f}",
+                    badge_html=f"<span style='color:#42a5f5; margin-right:8px;'>最新: <b>{val_n:.1f}</b></span> {status_html}"
                 )
 
-                sin_ratio_data = [
-                    {"time": t, "value": float(v)} 
-                    for t, v in zip(times, df_jp['ratio_sin']) if not pd.isna(v)
-                ]
+                times_n = _to_lwc_time(df_naaim["Date"])
+                naaim_series = [{"time": t, "value": float(v)} for t, v in zip(times_n, df_naaim["NAAIM"]) if not pd.isna(v)]
+
                 render_lwc_area_chart(
                     series_definitions=[{
-                        "type": "Area", 
-                        "data": sin_ratio_data, 
+                        "type": "Line",
+                        "data": naaim_series,
                         "options": {
-                            "topColor": "rgba(38, 166, 154, 0.35)", 
-                            "bottomColor": "rgba(38, 166, 154, 0.03)", 
-                            "lineColor": "#26a69a", 
+                            "color": "#42a5f5",
                             "lineWidth": 2,
-                            "lastValueVisible": True
+                            "title": "NAAIM Index",
+                            "lastValueVisible": True,
                         }
                     }],
                     height=160,
-                    key="lwc_sin_ratio"
+                    key="lwc_naaim_monitor"
                 )
-
-    # 3. NAAIM Exposure Index
-    if not naaim_df.empty:
-        st.write("---")
-        st.markdown("### 🇺🇸 米国市場 NAAIM Exposure Index")
-
-        df_us = naaim_df[(naaim_df['Date'] >= start_dt) & (naaim_df['Date'] <= end_dt)].sort_values('Date')
-        if not df_us.empty:
-            latest_naaim = df_us.iloc[-1]
-            prev_naaim = df_us.iloc[-2] if len(df_us) > 1 else latest_naaim
-            delta = round(latest_naaim['NAAIM'] - prev_naaim['NAAIM'], 2)
-            sign_n = "+" if delta >= 0 else ""
-            badge_text = "🟢 強気傾向" if latest_naaim['NAAIM'] >= 80 else "🔴 弱気傾向" if latest_naaim['NAAIM'] <= 40 else "⚪ 中立"
-            badge_tag = build_status_badge(badge_text, bg_color="#37474f", text_color="#ffffff", border_color="#78909c")
-
-            with card_container(border=True):
-                badge_html = (
-                    f"{badge_tag} "
-                    f"<span style='color:#9e9e9e; margin-left:6px;'>更新日: {latest_naaim['Date'].strftime('%Y-%m-%d')}</span>"
-                )
-                render_card_header(
-                    title="NAAIM Exposure Index",
-                    mom_sub_text=f"前週差: {sign_n}{delta}",
-                    badge_html=badge_html
-                )
-
-                us_times = _to_lwc_time(df_us['Date'])
-                naaim_data = [{"time": t, "value": float(v)} for t, v in zip(us_times, df_us['NAAIM']) if not pd.isna(v)]
-
-                render_lwc_area_chart(
-                    series_definitions=[{
-                        "type": "Line", 
-                        "data": naaim_data, 
-                        "options": {
-                            "color": "#42a5f5", 
-                            "lineWidth": 2, 
-                            "title": "", 
-                            "lastValueVisible": True,
-                            "crosshairMarkerVisible": True,
-                        }
-                    }],
-                    height=180,
-                    key="lwc_naaim_index"
-                )
+        else:
+            st.caption("NAAIMデータなし")
 
 # =====================================================================
-# 📈 【フラグメント2】個別銘柄の信用残検索
+# 🌐 【第3層：グローバル・マクロ監視グリッド (自動TTL10分)】
 # =====================================================================
-@st.fragment
-def render_individual_margin_fragment():
-    st.subheader("🔍 個別銘柄 信用残検索 (IRBank)")
+st.markdown("### 🌐 【第3層：グローバル・マクロ監視グリッド (10分自動更新)】")
 
-    with card_container(border=True):
-        col_s1, col_s2 = st.columns([1, 4])
-        with col_s1:
-            search_code = st.text_input("銘柄コード", value="1321", placeholder="例: 1321", key="margin_search_code")
-        with col_s2:
-            period_ir = st.radio("表示期間", ["6ヶ月", "1年", "3年", "全期間"], index=1, horizontal=True, key="ir_p_selector")
+if macro_data:
+    macro_items = list(settings.MACRO_WATCHLIST.items())
+    N_COLS = 3
+    for i in range(0, len(macro_items), N_COLS):
+        row_items = macro_items[i:i + N_COLS]
+        cols = st.columns(N_COLS)
+        for j, (label, meta) in enumerate(row_items):
+            with cols[j]:
+                with card_container(border=True):
+                    df_m = macro_data.get(label, pd.DataFrame())
+                    if not df_m.empty:
+                        m_latest = df_m.iloc[-1]["close"]
+                        m_prev = df_m.iloc[-2]["close"] if len(df_m) > 1 else m_latest
+                        m_diff = m_latest - m_prev
+                        m_pct = (m_diff / m_prev * 100.0) if m_prev != 0 else 0.0
+
+                        is_area = (label == "信用スプレッド")
+                        m_color = "#ab47bc" if is_area else "#ffa726" if meta["category"] == "コモディティ" else "#42a5f5"
+
+                        badge_category = build_status_badge(meta["category"], bg_color="#263238", text_color="#90a4ae")
+                        render_card_header(
+                            title=f"{label} ({meta['name']})",
+                            mom_value=m_pct,
+                            mom_sub_text=f"{m_diff:+,.2f}",
+                            badge_html=f"<span style='color:{m_color}; margin-right:6px;'><b>{m_latest:,.2f}</b></span> {badge_category}"
+                        )
+                        render_lwc_macro_mini(df_m, is_area=is_area, color=m_color, height=130, key=f"macro_chart_{label}")
+                    else:
+                        st.caption(f"{label}: データ取得待機中...")
+else:
+    st.info("マクロデータをロード中...")
+
+# =====================================================================
+# 🔍 【最下部：個別銘柄 信用残高検索 (IRBank)】
+# =====================================================================
+st.write("---")
+with st.expander("🔍 個別銘柄 信用残高推移（IRBank検索・バックアップ）", expanded=False):
+    col_s1, col_s2 = st.columns([1, 4])
+    with col_s1:
+        search_code = st.text_input("銘柄コード", value="1321", placeholder="例: 1321", key="margin_search_code")
+    with col_s2:
+        period_ir = st.radio("表示期間", ["6ヶ月", "1年", "3年", "全期間"], index=1, horizontal=True, key="ir_p_selector")
 
     if search_code:
         clean_code = str(search_code).strip().upper()
-
         with st.spinner(f"{clean_code} の信用残データを取得中..."):
             idf = fetch_irbank_margin(clean_code)
             if not idf.empty:
@@ -571,17 +659,6 @@ def render_individual_margin_fragment():
                                     }
                                 }
                             ],
-                            height=240,
+                            height=200,
                             key=f"lwc_margin_ind_{clean_code}"
                         )
-                else:
-                    st.caption("指定期間のデータがありません。")
-            else:
-                st.warning("IRBankからデータが見つかりませんでした。日本株のコードを再確認してください。")
-
-# =====================================================================
-# 🚀 画面描画制御部
-# =====================================================================
-render_market_dashboard_fragment()
-st.write("---")
-render_individual_margin_fragment()
