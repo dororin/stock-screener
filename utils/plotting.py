@@ -174,15 +174,15 @@ def render_lwc_rs_overlay(sector_index_cache: dict, selected_sectors: list, heig
 
 def build_lwc_candle_chart(
     df: pd.DataFrame, 
-    sma25: pd.Series = None,
+    sma25: pd.Series = None, 
     sma75: pd.Series = None, 
-    sma200: pd.Series = None,
-    sma_fast: pd.Series = None,
-    sma_slow: pd.Series = None,
+    sma200: pd.Series = None, 
+    sma_fast: pd.Series = None, 
+    sma_slow: pd.Series = None, 
     height: int = 200, 
     is_jp: bool = True, 
-    wvf_df: pd.DataFrame = None,
-    bb_dict: dict = None,
+    wvf_df: pd.DataFrame = None, 
+    bb_dict: dict = None, 
     event_markers: list = None
 ) -> dict:
     if df is None or df.empty:
@@ -286,7 +286,7 @@ def build_lwc_candle_chart(
         })
 
     if sma25 is not None and not sma25.dropna().empty:
-        st_times = _safe_get_times(sma25)
+        s25_times = _safe_get_times(sma25)  # 👈 ここを st_times から s25_times に修正
         series.append({
             "type": "Line",
             "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(s25_times, sma25.values) if not pd.isna(v)],
@@ -368,140 +368,6 @@ def build_lwc_candle_chart(
                 "lastValueVisible": False,
             }
         })
-
-    return {"chart": _lwc_base_options(height=height), "series": series}
-
-def build_lwc_line_chart(
-    price_series: pd.Series, 
-    sma25: pd.Series = None, 
-    sma75: pd.Series = None, 
-    sma200: pd.Series = None, 
-    sma_fast: pd.Series = None, 
-    sma_slow: pd.Series = None, 
-    wvf_lit: pd.Series = None, 
-    volume_series = None, 
-    height: int = 160, 
-    is_jp: bool = True
-) -> dict:
-    if price_series is None or price_series.empty:
-        return {}
-
-    price_format = detect_price_format(price_series, is_jp=is_jp)
-
-    if sma75 is None and sma_fast is not None:
-        sma75 = sma_fast
-    if sma200 is None and sma_slow is not None:
-        sma200 = sma_slow
-
-    times = _to_lwc_time(price_series.index)
-
-    def _safe_get_times(s: pd.Series) -> list:
-        if s is None or s.empty:
-            return []
-        if isinstance(s.index, pd.DatetimeIndex) or (len(s.index) > 0 and hasattr(s.index[0], 'strftime')):
-            return _to_lwc_time(s.index)
-        if len(s) == len(times):
-            return times
-        return _to_lwc_time(s.index)
-
-    series = []
-
-    if sma200 is not None and not sma200.dropna().empty:
-        st_times = _safe_get_times(sma200)
-        series.append({
-            "type": "Line",
-            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(st_times, sma200.values) if not pd.isna(v)],
-            "options": {
-                "color": "rgba(171, 71, 188, 0.80)", 
-                "lineWidth": 1, 
-                "priceLineVisible": False, 
-                "lastValueVisible": False, 
-                "crosshairMarkerVisible": False,
-                "priceFormat": price_format,
-            },
-        })
-
-    if sma75 is not None and not sma75.dropna().empty:
-        ft_times = _safe_get_times(sma75)
-        series.append({
-            "type": "Line",
-            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(ft_times, sma75.values) if not pd.isna(v)],
-            "options": {
-                "color": "rgba(255, 167, 38, 0.75)", 
-                "lineWidth": 1, 
-                "priceLineVisible": False, 
-                "lastValueVisible": False, 
-                "crosshairMarkerVisible": False,
-                "priceFormat": price_format,
-            },
-        })
-
-    if sma25 is not None and not sma25.dropna().empty:
-        s25_times = _safe_get_times(sma25)
-        series.append({
-            "type": "Line",
-            "data": [{"time": t, "value": round(float(v), 2)} for t, v in zip(s25_times, sma25.values) if not pd.isna(v)],
-            "options": {
-                "color": "rgba(239, 83, 80, 0.75)", 
-                "lineWidth": 1, 
-                "priceLineVisible": False, 
-                "lastValueVisible": False, 
-                "crosshairMarkerVisible": False,
-                "priceFormat": price_format,
-            },
-        })
-
-    price_data = [
-        {"time": t, "value": round(float(v), 2)}
-        for t, v in zip(times, price_series.values) if not pd.isna(v)
-    ]
-
-    series.append({
-        "type": "Line",
-        "data": price_data,
-        "options": {
-            "color": "#42a5f5", 
-            "lineWidth": 2,
-            "priceLineVisible": False,
-            "lastValueVisible": True,
-            "crosshairMarkerVisible": True,
-            "priceFormat": price_format,
-        },
-    })
-
-    if volume_series is not None:
-        if isinstance(volume_series, list):
-            series.append({
-                "type": "Histogram",
-                "data": volume_series,
-                "options": {
-                    "priceFormat": {"type": "volume"},
-                    "priceScaleId": "",
-                    "priceLineVisible": False,
-                    "lastValueVisible": False,
-                }
-            })
-        elif isinstance(volume_series, pd.Series) and not volume_series.empty:
-            vol_times = _safe_get_times(volume_series)
-            price_diff = price_series.diff()
-            
-            vol_data = []
-            for t, val, diff in zip(vol_times, volume_series.values, price_diff.values):
-                if pd.isna(val):
-                    continue
-                color = "rgba(38, 166, 154, 0.2)" if (pd.isna(diff) or diff >= 0) else "rgba(239, 83, 80, 0.2)"
-                vol_data.append({"time": t, "value": float(val), "color": color})
-                
-            series.append({
-                "type": "Histogram",
-                "data": vol_data,
-                "options": {
-                    "priceFormat": {"type": "volume"},
-                    "priceScaleId": "",
-                    "priceLineVisible": False,
-                    "lastValueVisible": False,
-                }
-            })
 
     return {"chart": _lwc_base_options(height=height), "series": series}
 

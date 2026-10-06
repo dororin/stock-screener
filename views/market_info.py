@@ -21,6 +21,7 @@ from core.investor_type_collector import sync_jpx_investor_type_data
 from utils.ui_components import card_container, render_card_header, build_status_badge
 from utils.plotting import (
     _to_lwc_time,
+    _lwc_base_options, 
     render_lwc_dual_line_chart,
     render_lwc_area_chart,
     render_lwc_histogram_chart,
