@@ -15,7 +15,8 @@ from data_access.drive_api import (
     upload_to_drive_api,
     get_or_create_drive_folder,
     list_drive_diff_files,
-    delete_file_from_drive
+    delete_file_from_drive,
+    get_drive_service
 )
 
 def clear_local_parquet_cache(interval: str = None, is_jp: bool = True):
@@ -203,6 +204,29 @@ def save_price_db(df: pd.DataFrame, interval: str, is_jp: bool = True, is_raw: b
             except Exception as e:
                 return False, f"ローカル共有フォルダへの保存失敗: {e}"
         return True, ""
+    except Exception as e:
+        return False, str(e)
+
+def promote_temp_db_to_active(interval: str, is_jp: bool = False) -> tuple[bool, str]:
+    """検証済みの一時Parquet（_temp）を本番Active Parquetに昇格してGoogle Driveへ確定保存します。"""
+    temp_filename = get_db_filename(interval, is_jp=is_jp, is_raw=False, is_temp=True)
+    active_filename = get_db_filename(interval, is_jp=is_jp, is_raw=False, is_temp=False)
+    
+    temp_work_file = os.path.join(settings.WORK_DIR, temp_filename)
+    active_work_file = os.path.join(settings.WORK_DIR, active_filename)
+    
+    if not os.path.exists(temp_work_file):
+        return False, f"昇格対象の一時ファイルが見つかりません: {temp_filename}"
+        
+    try:
+        shutil.copy2(temp_work_file, active_work_file)
+        success, msg = upload_to_drive_api(active_filename, active_work_file)
+        if success:
+            try:
+                os.remove(temp_work_file)
+            except Exception:
+                pass
+        return success, msg
     except Exception as e:
         return False, str(e)
 
@@ -435,10 +459,22 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
 
     return {"success": False, "message": err_msg if err_msg else "マージ処理を安全に中断・ロールバックしました。"}
 
-def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_temp: bool = False, columns: list = None, filters: list = None) -> pd.DataFrame:
+def load_price_db(
+    interval: str, 
+    is_jp: bool = True, 
+    is_raw: bool = False, 
+    is_temp: bool = False, 
+    columns: list = None, 
+    filters: list = None,
+    force_reload: bool = False
+) -> pd.DataFrame:
     """
-    1m, 5m, 60m, 1d 等の本番Parquetファイルを投影ロード・フィルタリングロードします。
-    ローカルにない場合はGoogle Driveから自動取得します。
+    1m, 5m, 60m, 1d 等の本番Parquetファイルをロードします。
+    
+    【スマート同期仕様】
+    - force_reload=True の場合はローカルキャッシュを無視して必ずGoogle Driveから再取得します。
+    - force_reload=False の場合でも、Google Drive上の更新日時（modifiedTime）がローカルファイルより新しい場合は自動再取得します。
+    - ファイルに変更がない場合はローカルキャッシュをそのまま利用してミリ秒単位で高速返却します。
     """
     def _apply_pandas_filters_safe(df_target: pd.DataFrame) -> pd.DataFrame:
         if df_target.empty or not filters:
@@ -464,16 +500,16 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
                     min_date_limit = pd.to_datetime(val)
                     break
 
-    # 日本株（JP）のロード処理
+    # ─────────────────────────────────────────────────────────────
+    # 🇯🇵 日本株（JP）のロード処理
+    # ─────────────────────────────────────────────────────────────
     if is_jp:
         tf_folder_id = get_or_create_drive_folder(interval, settings.FOLDER_ID)
-        from data_access.drive_api import get_drive_service
         service = get_drive_service()
         if not service:
             return pd.DataFrame()
             
         try:
-            # 💡【重要防護】日足（1d）は完全一致指定、かつフォルダ・ショートカットを排除して最新順に取得
             if interval == "1d":
                 query = (
                     f"'{tf_folder_id}' in parents and name = 'price_jp_1d.parquet' and "
@@ -502,11 +538,11 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
         for b_file in base_files:
             b_name = b_file['name']
 
-            # 同名ファイルの多重ロード防止
             if b_name in downloaded_names:
                 continue
             downloaded_names.add(b_name)
             
+            # フィルタによる不要ファイルの事前スキップ
             if min_date_limit is not None:
                 m_ym = re.search(r'price_jp_\w+_(\d{4})_(\d{2})\.parquet', b_name)
                 if m_ym:
@@ -522,7 +558,19 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
                             continue
             
             local_path = os.path.join(settings.WORK_DIR, b_name)
-            if not os.path.exists(local_path):
+
+            # 💡【スマート判定】強制再取得、またはローカル非存在、またはDrive更新日時が新しい場合にダウンロード
+            need_download = force_reload or not os.path.exists(local_path)
+            if not need_download and 'modifiedTime' in b_file:
+                try:
+                    drive_mtime = pd.to_datetime(b_file['modifiedTime']).timestamp()
+                    local_mtime = os.path.getmtime(local_path)
+                    if local_mtime < drive_mtime:
+                        need_download = True
+                except Exception:
+                    pass
+
+            if need_download:
                 download_from_drive_api(b_name, local_path, parent_id=tf_folder_id)
                 
             if os.path.exists(local_path):
@@ -546,13 +594,15 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
                 combined = combined[combined["date"] >= min_date_limit]
         return combined.drop_duplicates(subset=["date", "ticker"], keep="last")
 
-    # 米国株（US）のロード処理
+    # ─────────────────────────────────────────────────────────────
+    # 🇺🇸 米国株（US）のロード処理
+    # ─────────────────────────────────────────────────────────────
     if interval in ["1m", "5m", "60m"]:
         pattern = get_db_filename_pattern(interval, is_jp, is_raw, is_temp)
         search_path = os.path.join(settings.WORK_DIR, pattern)
         files = glob.glob(search_path)
         
-        if not files and not is_temp:
+        if (not files or force_reload) and not is_temp:
             if interval == "60m":
                 now_y = pd.Timestamp.now().strftime("%Y")
                 temp_filename = get_db_filename(interval, is_jp, is_raw, is_temp, year=now_y)
@@ -566,7 +616,7 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
         if not files:
             mono_filename = get_db_filename(interval, is_jp, is_raw, is_temp)
             mono_work_file = os.path.join(settings.WORK_DIR, mono_filename)
-            if not os.path.exists(mono_work_file) and not is_temp:
+            if (not os.path.exists(mono_work_file) or force_reload) and not is_temp:
                 download_from_drive_api(mono_filename, mono_work_file)
             if os.path.exists(mono_work_file):
                 files = [mono_work_file]
@@ -612,7 +662,7 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
     # 米国株 日足（1d）
     filename = get_db_filename(interval, is_jp, is_raw, is_temp)
     work_file = os.path.join(settings.WORK_DIR, filename)
-    if not os.path.exists(work_file) and not is_temp:
+    if (not os.path.exists(work_file) or force_reload) and not is_temp:
         download_from_drive_api(filename, work_file)
 
     if os.path.exists(work_file):
@@ -631,11 +681,27 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
         return df
     return pd.DataFrame()
 
+def load_price_db_for_tickers(interval: str, tickers: list, is_jp: bool = False, is_raw: bool = False) -> pd.DataFrame:
+    """指定された銘柄リストのみをロードします。"""
+    df = load_price_db(interval, is_jp=is_jp, is_raw=is_raw)
+    if df.empty or not tickers:
+        return pd.DataFrame()
+    return df[df["ticker"].isin(tickers)].reset_index(drop=True)
+
+def load_price_db_excluding_tickers(interval: str, exclude_tickers: list, is_jp: bool = False, is_raw: bool = False) -> pd.DataFrame:
+    """指定された銘柄リスト以外のデータをロードします。"""
+    df = load_price_db(interval, is_jp=is_jp, is_raw=is_raw)
+    if df.empty:
+        return pd.DataFrame()
+    if not exclude_tickers:
+        return df
+    return df[~df["ticker"].isin(exclude_tickers)].reset_index(drop=True)
+
 # =====================================================================
 # ⚡ レイヤー1：材料（ロード）キャッシュ設計
 # =====================================================================
 
-def _fetch_price_data_internal(interval: str, limit_days: int, is_jp: bool) -> pd.DataFrame:
+def _fetch_price_data_internal(interval: str, limit_days: int, is_jp: bool, force_reload: bool = False) -> pd.DataFrame:
     limit_dt = pd.Timestamp.now() - pd.Timedelta(days=limit_days)
     limit_start_date = limit_dt.strftime("%Y-%m-%d %H:%M:%S")
     
@@ -649,7 +715,8 @@ def _fetch_price_data_internal(interval: str, limit_days: int, is_jp: bool) -> p
         interval=interval,
         is_jp=is_jp,
         columns=target_columns,
-        filters=filters
+        filters=filters,
+        force_reload=force_reload
     )
     if df.empty:
         return pd.DataFrame()
@@ -662,11 +729,11 @@ def _fetch_price_data_internal(interval: str, limit_days: int, is_jp: bool) -> p
 
 @st.cache_data(ttl=3600)
 def _get_price_data_1d_cached(limit_days: int, is_jp: bool) -> pd.DataFrame:
-    return _fetch_price_data_internal("1d", limit_days, is_jp)
+    return _fetch_price_data_internal("1d", limit_days, is_jp, force_reload=False)
 
 @st.cache_data(ttl=300)
 def _get_price_data_intraday_cached(interval: str, limit_days: int, is_jp: bool) -> pd.DataFrame:
-    return _fetch_price_data_internal(interval, limit_days, is_jp)
+    return _fetch_price_data_internal(interval, limit_days, is_jp, force_reload=False)
 
 def get_price_data_cached(interval: str, limit_days: int = None, is_jp: bool = True) -> pd.DataFrame:
     if limit_days is None:

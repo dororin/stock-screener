@@ -11,7 +11,11 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from config import settings
-from data_access.local_db import load_price_db, save_price_db
+from data_access.local_db import (
+    load_price_db, 
+    save_price_db, 
+    clear_local_parquet_cache
+)
 from data_access.drive_api import (
     download_from_drive_api,
     upload_to_drive_api,
@@ -371,7 +375,8 @@ def _verify_split_via_local_cliff_adjclose(ticker: str, cliff_dt, actual_dt,
 
 
 def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_val: float,
-                          daily_after_close: float, yf_cache: dict, status_callback=None) -> dict:
+                          daily_after_close: float, yf_cache: dict, status_callback=None,
+                          force_reload: bool = False) -> dict:
     """下位時間足（60m/5m/1m）の段差オートフォーカス走査。"""
     logger.debug(f"_scan_intraday_cliff: 開始 ticker={ticker}, interval={interval}, ex_date={ex_date}, actual_day_dt={actual_day_dt}, s_val={s_val}")
 
@@ -386,7 +391,8 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
             is_jp=True,
             is_raw=False,
             columns=["date", "ticker", "close", "patched_multiplier"],
-            filters=[("ticker", "==", ticker), ("date", ">=", lookback_start), ("date", "<=", lookback_end)]
+            filters=[("ticker", "==", ticker), ("date", ">=", lookback_start), ("date", "<=", lookback_end)],
+            force_reload=force_reload
         )
     except Exception as e:
         _emit(status_callback, f"  ⚠️ [{interval}] ピンポイント投影ロード失敗 (ticker={ticker}): {e}", level="warning", exc=True)
@@ -407,7 +413,6 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
         pass
     df_tf = df_tf.sort_values("date_dt").reset_index(drop=True)
 
-    # 💡【修正】1分足の約45営業日分（約15,000本）を確実にカバーできるように十分なサイズを確保
     tail_limits = {"1m": 25000, "5m": 8000, "60m": 2500}
     max_tail = tail_limits.get(interval, 25000)
     df_window = df_tf.tail(max_tail).reset_index(drop=True)
@@ -420,7 +425,6 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
     min_R, max_R = get_dynamic_threshold(s_val)
     rows = [{"dt": r["date_dt"], "close": r["close"]} for _, r in df_window.iterrows()]
     
-    # 💡【修正】連休（シルバーウィークやGWなど）を考慮し、日足走査と同じく15日までギャップを許容
     idx = _find_cliff_reverse(rows, min_R, max_R, max_gap_days=15)
 
     if idx == -1:
@@ -473,7 +477,11 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
     }
 
 
-def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
+def scan_jp_anomalies_with_yfinance(status_callback=None, force_reload: bool = False) -> pd.DataFrame:
+    """
+    日本株の株式分割段差スキャンを実行します。
+    force_reload=True の場合、Google Driveから最新の日足データを強制ダウンロードして検査します。
+    """
     def log(msg, level="info", exc=False):
         _emit(status_callback, msg, level=level, exc=exc)
 
@@ -485,7 +493,8 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
             interval="1d",
             is_jp=True,
             is_raw=False,
-            columns=["date", "ticker", "close", "patched_multiplier"]
+            columns=["date", "ticker", "close", "patched_multiplier"],
+            force_reload=force_reload
         )
     except Exception as e:
         log(f"❌ 日足データのロードに失敗しました: {e}", level="error", exc=True)
@@ -673,7 +682,8 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                                 s_val=s_val,
                                 daily_after_close=close_T_val,
                                 yf_cache=yf_cache,
-                                status_callback=status_callback
+                                status_callback=status_callback,
+                                force_reload=force_reload
                             )
                         except Exception as e:
                             log(f"  ❌ [{ticker}] {tf} 足のオートフォーカス走査中に予期しない例外: {e}", level="error", exc=True)
@@ -938,6 +948,7 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                     else:
                         logger.debug(f"  file={b_name}: マスク該当レコードが0件のため書き換えなし")
 
+                    # 💡 ローカルに残骸を残さないよう必ず削除
                     if os.path.exists(local_path):
                         os.remove(local_path)
 
@@ -949,6 +960,9 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
 
             results[interval] = f"正常に修復 ({applied_files_count}件)"
             logger.debug(f"interval={interval}: 完了。適用ファイル数={applied_files_count}")
+
+            # 💡 ローカルキャッシュをクリア
+            clear_local_parquet_cache(interval=interval, is_jp=True)
 
         except Exception as e:
             results[interval] = f"エラー: {str(e)}"
@@ -966,6 +980,7 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
         except Exception as e:
             log(f"⚠️ repair_log 記録中に例外が発生しました: {e}", level="error", exc=True)
 
+    # 💡 パッチ適用後はStreamlitキャッシュを完全クリア
     try:
         import streamlit as st
         if hasattr(st, "cache_data"):

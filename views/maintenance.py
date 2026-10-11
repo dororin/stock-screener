@@ -9,7 +9,12 @@ import re
 import calendar
 
 from config import settings
-from data_access.local_db import load_price_db, save_price_db, execute_jp_merge
+from data_access.local_db import (
+    load_price_db, 
+    save_price_db, 
+    execute_jp_merge,
+    clear_local_parquet_cache
+)
 from data_access.sheets_api import (
     load_extra_tickers_from_sheets,
     save_extra_tickers_to_sheets,
@@ -45,8 +50,8 @@ from core.us_price_corrector import (
     apply_bulk_selected_patches
 )
 
-# ── 日足の最新更新日の簡易取得 ──
-@st.cache_data(ttl=600)
+# ── 日足の最新更新日の簡易取得（TTLを短縮して即時反映） ──
+@st.cache_data(ttl=60)
 def get_db_last_update_cached(interval: str, is_jp: bool = True) -> str:
     try:
         df = load_price_db(interval, is_jp=is_jp, is_raw=False, columns=["date"])
@@ -703,6 +708,8 @@ def render_jp_manual_merge_center(is_jp: bool):
             st.session_state["jp_merge_running"] = False
             
             if result.get("success"):
+                # 💡 マージ後はキャッシュを完全無効化
+                clear_local_parquet_cache(interval=merge_tf, is_jp=True)
                 st.cache_data.clear()
                 status_box.update(label="🎉 統合マージおよび不要差分ファイルの自動消去が正常に完了しました！", state="complete")
                 st.session_state["jp_merge_success"] = True
@@ -746,6 +753,16 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
     if "jp_scan_is_running" not in st.session_state:
         st.session_state["jp_scan_is_running"] = False
 
+    # 💡【スマート制御】最新Drive強制再取得オプション（デフォルトON）
+    col_opt1, col_opt2 = st.columns([3, 1])
+    with col_opt1:
+        jp_scan_force_reload = st.checkbox(
+            "🔄 Google Driveから最新データを強制再取得してスキャン (force_reload)",
+            value=True,
+            key="chk_jp_scan_force_reload",
+            help="チェックをONにすると、ローカルキャッシュを無視してGoogle Driveの最新Parquetをダウンロードして検査します。"
+        )
+
     col_btn1, col_btn2 = st.columns([3, 1])
     with col_btn1:
         if st.button(
@@ -755,6 +772,8 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             use_container_width=True,
             disabled=st.session_state["jp_scan_is_running"]
         ):
+            # 💡 スキャン開始時に前回の古い結果を必ずクリア
+            st.session_state["jp_split_scan_result"] = None
             st.session_state["jp_scan_is_running"] = True
             st.rerun()
 
@@ -772,7 +791,10 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
 
             try:
                 from core.jp_price_corrector import scan_jp_anomalies_with_yfinance
-                scan_df = scan_jp_anomalies_with_yfinance(status_callback=on_scan_progress)
+                scan_df = scan_jp_anomalies_with_yfinance(
+                    status_callback=on_scan_progress,
+                    force_reload=jp_scan_force_reload
+                )
                 st.session_state["jp_split_scan_result"] = scan_df
                 status_box.update(label="🎉 スキャン完了！", state="complete")
             except Exception as e:
@@ -839,7 +861,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             for idx, r in selected_rows.iterrows():
                 orig = result_df.loc[idx]
                 ticker = orig["ticker"]
-                # 💡【重要修正】actual_date を patch_rows に含めて渡す
+                # 💡【境界確定】actual_date を patch_rows に含めて渡す
                 grouped.setdefault(ticker, []).append({
                     "interval": orig["interval"],
                     "cliff_date": orig["cliff_date"],
@@ -874,8 +896,11 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
                     st.warning(f"   ⏭️ [{ticker}] スキップまたはエラーが発生しました。（詳細: {results}）")
 
             status_box.update(label=f"🎉 完了：{repaired_count}銘柄を一括修復しました。", state="complete")
+            
+            # 💡 パッチ適用成功時は古いスキャン結果を必ず消去し、ローカルキャッシュも一掃
             if "jp_split_scan_result" in st.session_state:
                 del st.session_state["jp_split_scan_result"]
+            clear_local_parquet_cache(is_jp=True)
             st.cache_data.clear()
             time.sleep(1.0)
             st.rerun()
@@ -890,12 +915,22 @@ def render_parquet_data_inspector(is_jp: bool):
         "銘柄、時間足、および「表示開始日」を絞り込むことで、古いデータから順番に追跡できます。"
     )
 
-    inspect_interval = st.selectbox(
-        "時間足を選択", 
-        ["1d", "60m", "5m", "1m"], 
-        index=0, 
-        key="inspect_interval_select"
-    )
+    col_inspect_ctrl1, col_inspect_ctrl2 = st.columns([1, 1])
+    with col_inspect_ctrl1:
+        inspect_interval = st.selectbox(
+            "時間足を選択", 
+            ["1d", "60m", "5m", "1m"], 
+            index=0, 
+            key="inspect_interval_select"
+        )
+    with col_inspect_ctrl2:
+        # 💡【スマート制御】Drive強制再取得オプション（デフォルトON）
+        inspect_force_reload = st.checkbox(
+            "🔄 Google Driveから最新ファイルを強制再取得（force_reload）",
+            value=True,
+            key="chk_inspect_force_reload",
+            help="ローカルの作業キャッシュを破棄し、Google Driveに保存されている最新実体をダウンロードして表示します。"
+        )
 
     inspect_start_date = st.date_input(
         "表示開始日を指定（この日付以降のデータを表示）",
@@ -966,7 +1001,8 @@ def render_parquet_data_inspector(is_jp: bool):
                     is_jp=is_jp,
                     is_raw=False,
                     columns=target_cols,
-                    filters=filters
+                    filters=filters,
+                    force_reload=inspect_force_reload
                 )
 
                 if df_result.empty:
