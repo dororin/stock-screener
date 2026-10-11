@@ -1,4 +1,5 @@
 # data_access/drive_api.py
+
 import os
 from google.oauth2.credentials import Credentials as OAuth2Credentials
 from googleapiclient.discovery import build
@@ -38,7 +39,6 @@ def get_drive_credentials():
         return None
 
     try:
-        # 個人アカウント（authorized_user形式）として認証インスタンスを作成
         creds = OAuth2Credentials(
             token=None,
             refresh_token=cfg["refresh_token"],
@@ -63,19 +63,41 @@ def get_drive_service():
         return None
 
 def download_from_drive_api(filename: str, local_path: str, parent_id: str = None) -> bool:
-    """指定の親フォルダからファイルをローカルにダウンロードします。"""
+    """
+    指定の親フォルダ直下から、最新のファイルを安全にダウンロードします。
+    サブフォルダ内の同名ファイルやショートカットは厳格に除外します。
+    """
     service = get_drive_service()
     p_id = parent_id if parent_id else settings.FOLDER_ID
     if not service or not p_id:
         return False
     try:
-        query = f"name='{filename}' and '{p_id}' in parents and trashed=false"
-        results = service.files().list(q=query, fields="files(id, name)").execute()
+        # 💡 ショートカット・サブフォルダを除外し、親フォルダ直下のみ、かつ更新日時が最新のものを探索
+        query = (
+            f"name='{filename}' and '{p_id}' in parents and "
+            f"mimeType != 'application/vnd.google-apps.folder' and "
+            f"mimeType != 'application/vnd.google-apps.shortcut' and trashed=false"
+        )
+        results = service.files().list(
+            q=query, 
+            fields="files(id, name, parents, modifiedTime)",
+            orderBy="modifiedTime desc"
+        ).execute()
         items = results.get('files', [])
         if not items:
             return False
+
+        # 💡 親フォルダリストに p_id が直接含まれるものだけを厳密に特定
+        target_file = None
+        for item in items:
+            if item.get('parents') and p_id in item.get('parents'):
+                target_file = item
+                break
+
+        if not target_file:
+            return False
         
-        file_id = items[0]['id']
+        file_id = target_file['id']
         request = service.files().get_media(fileId=file_id)
         with open(local_path, "wb") as f:
             downloader = MediaIoBaseDownload(f, request)
@@ -83,11 +105,12 @@ def download_from_drive_api(filename: str, local_path: str, parent_id: str = Non
             while not done:
                 _, done = downloader.next_chunk()
         return True
-    except Exception:
+    except Exception as e:
+        print(f"❌ [drive_api] ダウンロード失敗 ({filename}): {e}")
         return False
 
 def upload_to_drive_api(filename: str, local_path: str, parent_id: str = None) -> tuple[bool, str]:
-    """指定のフォルダへファイルをアップロード（上書きまたは新規）します。"""
+    """指定の親フォルダ直下へファイルをアップロード（上書きまたは新規）します。"""
     service = get_drive_service()
     p_id = parent_id if parent_id else settings.FOLDER_ID
     if not service:
@@ -96,8 +119,16 @@ def upload_to_drive_api(filename: str, local_path: str, parent_id: str = None) -
         return False, "親フォルダIDが設定されていません。"
         
     try:
-        query = f"name='{filename}' and '{p_id}' in parents and trashed=false"
-        results = service.files().list(q=query, fields="files(id, name)").execute()
+        query = (
+            f"name='{filename}' and '{p_id}' in parents and "
+            f"mimeType != 'application/vnd.google-apps.folder' and "
+            f"mimeType != 'application/vnd.google-apps.shortcut' and trashed=false"
+        )
+        results = service.files().list(
+            q=query, 
+            fields="files(id, name, modifiedTime)",
+            orderBy="modifiedTime desc"
+        ).execute()
         items = results.get('files', [])
         
         media = MediaFileUpload(local_path, mimetype='application/octet-stream', resumable=True)
@@ -141,8 +172,16 @@ def list_drive_diff_files(parent_id: str) -> list:
     if not service:
         return []
     try:
-        query = f"'{parent_id}' in parents and name contains '_diff_' and name contains '.parquet' and trashed=false"
-        results = service.files().list(q=query, fields="files(id, name, createdTime)").execute()
+        query = (
+            f"'{parent_id}' in parents and name contains '_diff_' and name contains '.parquet' and "
+            f"mimeType != 'application/vnd.google-apps.folder' and "
+            f"mimeType != 'application/vnd.google-apps.shortcut' and trashed=false"
+        )
+        results = service.files().list(
+            q=query, 
+            fields="files(id, name, createdTime)",
+            orderBy="createdTime asc"
+        ).execute()
         return results.get('files', [])
     except Exception:
         return []

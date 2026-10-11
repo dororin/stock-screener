@@ -88,9 +88,10 @@ NIKKEI225JP_SAITEI_URL = "https://nikkei225jp.com/_data/_nfsDATA/json_DAY/daily_
 
 TIMEFRAMES = ["1d", "60m", "5m", "1m"]
 
+# 💡 1m, 5m のルックバック営業日数を30日に拡大
 SPLIT_SCAN_LOOKBACK_BDAYS = {
-    "1m": 9,
-    "5m": 15,
+    "1m": 30,
+    "5m": 30,
     "60m": 30,
     "1d": 30,
 }
@@ -101,34 +102,28 @@ REPAIR_LOG_SHEET_NAME = "repair_log"
 EXTRA_TICKERS_SHEET = "extra_tickers"
 HOLDINGS_SHEET_NAME = "my_holdings"
 EVENT_CALENDAR_SHEET_NAME = "event_calendar"
-INVESTOR_TYPE_SHEET_NAME = "investor_type_data"  # 💡 投資部門別売買動向用
+INVESTOR_TYPE_SHEET_NAME = "investor_type_data"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🌐 マクロ監視マスター辞書 ＆ 警戒ライン定義
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MACRO_WATCHLIST = {
-    # ── ① 通貨・流動性 ──
     "USD/JPY": {"symbol": "JPY=X", "name": "ドル円", "category": "為替"},
     "ドル指数": {"symbol": "DX-Y.NYB", "name": "ドルインデックス", "category": "為替"},
-    # ── ② 金利・債券 ──
     "米10年金利": {"symbol": "^TNX", "name": "米10年債利回り", "category": "金利"},
     "米2年金利": {"symbol": "^2YY", "name": "米2年債利回り", "category": "金利"},
-    # ── ③ 信用リスク・恐怖（CDS代用） ──
     "信用スプレッド": {"symbol": "HYG_LQD", "name": "HYG/LQDレシオ", "category": "信用リスク"},
     "VIX指数": {"symbol": "^VIX", "name": "株式恐怖指数", "category": "ボラティリティ"},
-    # ── ④ 主要株価指数 ──
     "S&P500": {"symbol": "^GSPC", "name": "S&P 500", "category": "株式指数"},
     "NASDAQ100": {"symbol": "^NDX", "name": "NASDAQ 100", "category": "株式指数"},
     "SOX指数": {"symbol": "^SOX", "name": "半導体株指数", "category": "株式指数"},
-    # ── ⑤ コモディティ ──
     "WTI原油": {"symbol": "CL=F", "name": "WTI原油先物", "category": "コモディティ"},
     "ゴールド": {"symbol": "GC=F", "name": "金先物", "category": "コモディティ"},
     "銅先物": {"symbol": "HG=F", "name": "銅先物(Dr.Copper)", "category": "コモディティ"},
 }
 
-# 裁定取引の危険警戒ライン（億円）
-SAITEI_ALERT_THRESHOLD_HIGH = 25000  # 2.5兆円（過熱・急落警戒）
-SAITEI_ALERT_THRESHOLD_LOW  = 5000   # 5,000億円（売り枯れ・大底圏）
+SAITEI_ALERT_THRESHOLD_HIGH = 25000
+SAITEI_ALERT_THRESHOLD_LOW  = 5000
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # --- セクター定義 ---

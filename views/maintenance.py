@@ -1,4 +1,4 @@
-# maintenance.py
+# views/maintenance.py
 
 import os
 import time
@@ -45,10 +45,9 @@ from core.us_price_corrector import (
     apply_bulk_selected_patches
 )
 
-# ── 日足の最新更新日の簡易取得 (投影ロード ＆ キャッシュによる超高速化) ──
+# ── 日足の最新更新日の簡易取得 ──
 @st.cache_data(ttl=600)
 def get_db_last_update_cached(interval: str, is_jp: bool = True) -> str:
-    """columns=['date'] を指定して日付列だけをロードするため、全列ロードに比べ約100倍高速に動作します。"""
     try:
         df = load_price_db(interval, is_jp=is_jp, is_raw=False, columns=["date"])
         if df.empty:
@@ -62,7 +61,6 @@ def get_db_last_update_cached(interval: str, is_jp: bool = True) -> str:
 # ── 📅 決算発表日・配当権利日マスタ一括更新コンポーネント ──
 @st.fragment
 def render_sync_event_calendar_ui(is_jp: bool):
-    """TradingView Screener APIから全監視銘柄の最新スケジュールを一括バルク取得・保存するコンポーネント"""
     with st.container(border=True):
         st.subheader("📅 決算発表日・配当権利日マスタ更新")
         st.caption("TradingViewから全監視銘柄の次回・直近決算日および配当権利日スケジュールを一括バルク取得します。")
@@ -81,7 +79,6 @@ def render_sync_event_calendar_ui(is_jp: bool):
         if c_info2.button(btn_label, key="btn_sync_events_calendar", type="primary", use_container_width=True):
             with st.spinner("TradingViewから全銘柄の決算・配当スケジュールを取得中..."):
                 try:
-                    # 1. スプレッドシートから既存の全監視銘柄コードを取得
                     if is_jp:
                         all_tickers = get_all_collection_tickers()
                     else:
@@ -92,14 +89,12 @@ def render_sync_event_calendar_ui(is_jp: bool):
                         st.error("❌ 対象銘柄リストが取得できませんでした。")
                         return
 
-                    # 2. TradingView Screener API からバルク取得
                     df_events = fetch_events_from_tradingview(all_tickers, is_jp=is_jp)
 
                     if df_events.empty:
                         st.warning("⚠️ TradingViewからイベントデータを取得できませんでした。")
                         return
 
-                    # 3. Google Sheets (event_calendar) およびローカルJSONへ書き込み
                     saved = save_events_to_sheets(df_events)
                     if saved:
                         st.cache_data.clear()
@@ -195,10 +190,9 @@ def render_etf_manager():
             st.caption("登録されている追加ETFはありません。")
 
 
-# ── 🔄 ETF構成銘柄の同期（結果が消えないように永続表示化） ──
+# ── 🔄 ETF構成銘柄の同期 ──
 @st.fragment
 def render_sync_etf_master_ui(is_jp: bool):
-    """ETFセクター構成の同期を実行し、結果をUI上に永続保持・表示するコンポーネント"""
     st.subheader("🔄 ETFセクター構成の同期（スプレッドシート連動）")
     st.caption("JPX公式上場企業マスタおよび各社ETFの最新構成銘柄を自動取得し、スプレッドシートを更新します。")
 
@@ -223,14 +217,12 @@ def render_sync_etf_master_ui(is_jp: bool):
                 st.session_state["etf_sync_error_msg"] = str(e)
                 st.session_state["etf_sync_result_data"] = None
 
-    # 同期エラーの永続表示
     if st.session_state["etf_sync_error_msg"]:
         st.error(f"❌ 同期に失敗しました: {st.session_state['etf_sync_error_msg']}")
         if st.button("🗑️ エラー表示をクリア", key="btn_clear_etf_sync_err", use_container_width=True):
             st.session_state["etf_sync_error_msg"] = None
             st.rerun(scope="fragment")
 
-    # 同期結果ログの永続表示（勝手に消えないようにする）
     if st.session_state["etf_sync_result_data"]:
         results = st.session_state["etf_sync_result_data"]
         sync_results_text = "\n".join([f"• {k}: {v}" for k, v in results.items()])
@@ -335,7 +327,7 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
         st.rerun(scope="fragment")
 
 
-# ── US専用：開発者機能（コミットUIのフラグメント化） ──
+# ── US専用：コミットUI ──
 @st.fragment
 def render_commit_verified_data_ui(is_jp: bool):
     if is_jp:
@@ -660,7 +652,7 @@ def render_full_rebuild_section(is_jp: bool, market_mode: str):
             st.rerun()
 
 
-# ─── 🚀 日本株専用手動上書きマージセンター（状態維持＆ログの永続表示化） ───
+# ─── 🚀 日本株専用手動上書きマージセンター ───
 def render_jp_manual_merge_center(is_jp: bool):
     if not is_jp:
         return
@@ -847,9 +839,11 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             for idx, r in selected_rows.iterrows():
                 orig = result_df.loc[idx]
                 ticker = orig["ticker"]
+                # 💡【重要修正】actual_date を patch_rows に含めて渡す
                 grouped.setdefault(ticker, []).append({
                     "interval": orig["interval"],
                     "cliff_date": orig["cliff_date"],
+                    "actual_date": orig.get("actual_date"),
                     "multiplier": orig["multiplier"],
                     "mode": orig["mode"],
                     "before_close": orig["before_close"],
@@ -889,10 +883,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
 
 @st.fragment
 def render_parquet_data_inspector(is_jp: bool):
-    """
-    指定された条件（時間足・開始日・特定年月・特定銘柄）に基づいて、
-    Parquetデータベースからピンポイントにデータをロードして軽量表示します。
-    """
     st.divider()
     st.subheader("📊 データベース生データ確認（ピンポイント表示）")
     st.write(
@@ -1036,40 +1026,25 @@ if st.session_state["sync_logs_history"]:
             st.rerun()
     st.divider()
 
-# 一時ファイルのコミットUI（US株選択時のみ有効化）
 render_commit_verified_data_ui(is_jp)
-
-# 🚀 日本株専用：手動上書きマージセンター（日本株選択時のみ）
 render_jp_manual_merge_center(is_jp)
-
-# 🚀 日本株専用：統合段差スキャン・一括自動修復（日本株選択時のみ）
 render_jp_split_scan_and_repair_ui(is_jp)
-
-# 📅 決算発表日・配当権利日マスタ一括更新コンポーネント
 render_sync_event_calendar_ui(is_jp)
-
-# 🔄 ETF構成銘柄の同期（結果が消えないように新設関数で呼出）
 render_sync_etf_master_ui(is_jp)
-
 st.divider()
 
-# ETFマスタ管理
 render_etf_manager()
 st.divider()
 
-# 1️⃣ 全体差分ダウンロード（日本株：説明のみ / 米国株：ダウンロード可能）
 render_full_sync_section(is_jp)
 st.divider()
 
-# 🔍 米国株専用：統合スキャン・自動修復エリア
 render_unified_scan_and_repair_ui(is_jp=is_jp)
 st.divider()
 
 if not is_jp:
-    # 物理削除パッチUI
     render_delete_before_date_ui(is_jp=False)
 
-    # 修復ログ一覧
     with st.expander("📋 修復ログ一覧", expanded=False):
         log_col1, log_col2 = st.columns([1, 1])
         with log_col1:
@@ -1102,7 +1077,6 @@ if not is_jp:
                 else:
                     st.dataframe(log_df, use_container_width=True, hide_index=True)
 
-    # 手動パッチマスタ一括適用（リビルド）
     st.write(" ")
     st.markdown("#### 🔄 **保存済みパッチのActiveクリーンリビルド適用**")
     if st.button("🔄 保存されているすべてのパッチをActiveへ一括適用（リビルド）", key="btn_apply_all_patches_manual", type="secondary", use_container_width=True):
@@ -1118,16 +1092,12 @@ if not is_jp:
                 st.error(f"パッチの一括適用中にエラーが発生しました: {e}")
 
     st.divider()
-
-    # 4️⃣ 全件一括フルダウンロード・再構築
     render_full_rebuild_section(is_jp=False, market_mode=market_mode)
 
-    # 非常用オーバーライドエリア
     with st.expander("⚙️ 手動修復（非常用・TradingView API停止時）", expanded=False):
         render_manual_repair_section(is_jp=False)
 
 if st.session_state.get("show_rebuild_dialog"):
     run_full_rebuild_dialog(rebuild_interval, is_jp=False, market_mode=market_mode)
 
-# 5. データベース生データ確認
 render_parquet_data_inspector(is_jp)

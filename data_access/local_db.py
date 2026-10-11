@@ -402,7 +402,6 @@ def execute_jp_merge(interval: str, status_callback=None) -> dict:
                 
                 up_success, up_msg = upload_to_drive_api(f_name, local_save_path, parent_id=tf_folder_id)
                 if up_success:
-                    # ローカル正規キャッシュファイルも最新版で上書き同期
                     pq.write_table(table, official_local_path, use_dictionary=False, compression="SNAPPY")
                     log(f"   ✅ [{f_name}] Googleドライブおよびローカル正規キャッシュを最新データに同期しました。({len(final_df):,}件)")
                     
@@ -474,15 +473,39 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
             return pd.DataFrame()
             
         try:
-            query = f"'{tf_folder_id}' in parents and name contains 'price_jp_' and not name contains '_diff_' and name contains '.parquet' and trashed=false"
-            results = service.files().list(q=query, fields="files(id, name)").execute()
+            # 💡【重要防護】日足（1d）は完全一致指定、かつフォルダ・ショートカットを排除して最新順に取得
+            if interval == "1d":
+                query = (
+                    f"'{tf_folder_id}' in parents and name = 'price_jp_1d.parquet' and "
+                    f"mimeType != 'application/vnd.google-apps.folder' and "
+                    f"mimeType != 'application/vnd.google-apps.shortcut' and trashed=false"
+                )
+            else:
+                query = (
+                    f"'{tf_folder_id}' in parents and name contains 'price_jp_' and "
+                    f"not name contains '_diff_' and name contains '.parquet' and "
+                    f"mimeType != 'application/vnd.google-apps.folder' and "
+                    f"mimeType != 'application/vnd.google-apps.shortcut' and trashed=false"
+                )
+            results = service.files().list(
+                q=query, 
+                fields="files(id, name, modifiedTime)",
+                orderBy="modifiedTime desc"
+            ).execute()
             base_files = results.get('files', [])
         except Exception:
             base_files = []
 
         dfs = []
+        downloaded_names = set()
+
         for b_file in base_files:
             b_name = b_file['name']
+
+            # 同名ファイルの多重ロード防止
+            if b_name in downloaded_names:
+                continue
+            downloaded_names.add(b_name)
             
             if min_date_limit is not None:
                 m_ym = re.search(r'price_jp_\w+_(\d{4})_(\d{2})\.parquet', b_name)
@@ -613,7 +636,6 @@ def load_price_db(interval: str, is_jp: bool = True, is_raw: bool = False, is_te
 # =====================================================================
 
 def _fetch_price_data_internal(interval: str, limit_days: int, is_jp: bool) -> pd.DataFrame:
-    """Parquetから必要なカラムと足切り期間だけを投影・フィルタリングロードします。"""
     limit_dt = pd.Timestamp.now() - pd.Timedelta(days=limit_days)
     limit_start_date = limit_dt.strftime("%Y-%m-%d %H:%M:%S")
     
@@ -647,20 +669,15 @@ def _get_price_data_intraday_cached(interval: str, limit_days: int, is_jp: bool)
     return _fetch_price_data_internal(interval, limit_days, is_jp)
 
 def get_price_data_cached(interval: str, limit_days: int = None, is_jp: bool = True) -> pd.DataFrame:
-    """
-    レイヤー1：材料ロードキャッシュ
-    時間足に応じた最大ロード期間（足切りバッファ）と必要最小限のカラム指定でParquetを部分ロードし、
-    DataFrameをメモリ上に一時保存・返却します。
-    """
     if limit_days is None:
         if interval == "1d":
-            limit_days = 3650  # 直近10年
+            limit_days = 3650
         elif interval == "60m":
-            limit_days = 180   # 直近6ヶ月
+            limit_days = 180
         elif interval == "5m":
-            limit_days = 14    # 直近2週間
+            limit_days = 14
         elif interval == "1m":
-            limit_days = 3     # 直近3日
+            limit_days = 3
             
     if interval == "1d":
         return _get_price_data_1d_cached(limit_days, is_jp)

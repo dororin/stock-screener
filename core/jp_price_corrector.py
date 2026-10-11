@@ -21,9 +21,6 @@ from data_access.drive_api import (
 
 # ══════════════════════════════════════════════════════════════════════════
 # 🪵 デバッグロギング設定
-#   ・コンソール（stdout）と、settings.WORK_DIR 配下のログファイルの両方に出力します。
-#   ・トラブル発生時は jp_price_corrector_debug.log を確認すれば、
-#     どのステップ・どの銘柄・どんな値で何が起きたかを追跡できます。
 # ══════════════════════════════════════════════════════════════════════════
 logger = logging.getLogger("jp_price_corrector")
 logger.setLevel(logging.DEBUG)
@@ -48,7 +45,6 @@ if not logger.handlers:
         _file_handler.setFormatter(_formatter)
         logger.addHandler(_file_handler)
     except Exception as _e:
-        # ログファイルが作成できない環境（権限等）でも処理自体は止めない
         logger.addHandler(logging.NullHandler())
         print(f"⚠️ [jp_price_corrector] デバッグログファイルの作成に失敗しました: {_e}")
 
@@ -56,12 +52,6 @@ logger.propagate = False
 
 
 def _emit(status_callback, msg: str, level: str = "info", exc: bool = False):
-    """
-    ログ出力の共通ヘルパー。
-    ・logger には常に指定levelで記録（DEBUGも含め、ファイル/コンソールに全て残る）
-    ・status_callback（Streamlit等のUI表示）には info 以上のみ転送（DEBUGでUIが埋もれるのを防止）
-    ・exc=True の場合はスタックトレース全文をログファイルに記録（例外解析用）
-    """
     level = level.lower()
     log_fn = {
         "debug": logger.debug,
@@ -76,35 +66,21 @@ def _emit(status_callback, msg: str, level: str = "info", exc: bool = False):
     else:
         log_fn(msg)
 
-    # 💡【最重要】UIコールバックより先に標準出力へ即座にフラッシュ出力する。
-    # UI側（Streamlit）が再描画やセッション切断でコンテキストを失っていても、
-    # バックエンドの走査・パッチ処理を絶対に停止させないための安全構造。
     print(f"[JP_PATCH_ENGINE/{level.upper()}] {msg}", flush=True)
 
     if status_callback and level != "debug":
         try:
             status_callback(msg)
         except Exception:
-            # UIコンテナが消滅している等でコールバックが失敗しても、バックエンドは巻き込まない
             pass
 
 
-# 突合の許容乖離率（仕様書Ⅰ-⑤）：これを超えると「不一致（暴落疑い）」として自動安全ロック
 VERIFY_DEVIATION_THRESHOLD_PCT = 2.0
-
-# 調整係数（生値÷Adj Close）が崖の前後でこれ以上変化していれば「既知の分割による説明がつく」と判定する閾値：
-# 変化がこれ未満（＝調整係数がほぼ一定のまま）の場合は、既知の分割では説明できない
-# 崖（暴落・データ異常の疑い）として扱う
 ADJCLOSE_JUMP_THRESHOLD_PCT = 3.0
-
-# 下位時間足オートフォーカス走査の対象（仕様書Ⅰ-④）
 INTRADAY_TIMEFRAMES = ["60m", "5m", "1m"]
 
 
 def get_dynamic_threshold(s: float) -> tuple:
-    """
-    公式の分割比率Sに応じて、許容する段差判定価格比R (前日Close / 当日Close) の範囲を返します。
-    """
     if s >= 2.0:
         result = (s * 0.85, s * 1.15)
     elif s >= 1.30:
@@ -116,12 +92,6 @@ def get_dynamic_threshold(s: float) -> tuple:
 
 
 def _find_cliff_reverse(rows: list, min_R: float, max_R: float, max_gap_days: float = 15) -> int:
-    """
-    価格系列（[{'dt':..., 'close':...}, ...] の昇順リスト）を最新から過去に向かって逆向き走査し、
-    動的バッファ閾値に合致する最初（＝Ex-Dateに最も近い）の段差インデックスを返します。
-    見つからない場合は -1 。
-    仕様書2.3：複数検出時のセーフガード（逆向き走査で最も新しい段差を採用）
-    """
     logger.debug(f"_find_cliff_reverse: 走査開始 rows={len(rows)}件, min_R={min_R:.4f}, max_R={max_R:.4f}, max_gap_days={max_gap_days}")
     checked = 0
     skipped_gap = 0
@@ -159,11 +129,6 @@ def _find_cliff_reverse(rows: list, min_R: float, max_R: float, max_gap_days: fl
 
 
 def _extract_close_series(df: pd.DataFrame):
-    """
-    yf.download() の戻りDataFrameから、MultiIndex/通常カラムいずれの形状にも対応して
-    "Close" 列を日本時間(JST)基準のtz-naiveなDatetimeIndexの1次元Seriesとして抽出する共通ヘルパー。
-    抽出できない場合は None を返す。
-    """
     if df is None or df.empty:
         return None
 
@@ -181,7 +146,6 @@ def _extract_close_series(df: pd.DataFrame):
         close_data = close_data.iloc[:, 0]
 
     idx = pd.to_datetime(close_data.index)
-    # 💡 タイムゾーンがついている場合は、日本時間に変換した上でtz情報を除去する
     try:
         if idx.tz is not None:
             idx = idx.tz_convert("Asia/Tokyo").tz_localize(None)
@@ -197,8 +161,8 @@ def _extract_close_series(df: pd.DataFrame):
     close_data.index = idx
     return close_data.sort_index()
 
+
 def _extract_close_on_date(df: pd.DataFrame, date_str: str):
-    """指定日付(YYYY-MM-DD)に一致する行から、最初の有効な正の値を抽出する。"""
     s = _extract_close_series(df)
     if s is None:
         return None
@@ -211,10 +175,6 @@ def _extract_close_on_date(df: pd.DataFrame, date_str: str):
 
 
 def _extract_close_at_timestamp(df: pd.DataFrame, target_ts, tolerance_minutes: int = 90):
-    """
-    指定タイムスタンプに最も近い時刻の値を抽出する（イントラデイ突合用）。
-    許容誤差(tolerance_minutes)を超えて最も近い行が離れている場合は None を返す。
-    """
     s = _extract_close_series(df)
     if s is None or s.empty:
         return None
@@ -226,7 +186,6 @@ def _extract_close_at_timestamp(df: pd.DataFrame, target_ts, tolerance_minutes: 
     if getattr(target_dt, "tz", None) is not None:
         target_dt = target_dt.tz_convert("Asia/Tokyo").tz_localize(None)
 
-    # 💡 PandasのDatetimeIndex同士で絶対時間差（分）を安全に計算
     diff_minutes = np.abs((s.index - target_dt).total_seconds()) / 60.0
     min_idx = int(np.argmin(diff_minutes))
 
@@ -234,13 +193,8 @@ def _extract_close_at_timestamp(df: pd.DataFrame, target_ts, tolerance_minutes: 
         return None
     return float(s.iloc[min_idx])
 
+
 def _find_floor_value(s: pd.Series, target_ts):
-    """
-    時系列Series(s)の中から、target_ts以前（含む）で最も近い行を「行インデックスとして」探す。
-    時刻の計算（何分前か等）ではなく、時系列上の並び順で位置を探すため、
-    取引時間外・休日・日またぎは意識する必要がない（データが存在する行だけを対象にするため）。
-    見つからない場合は (None, None) を返す。
-    """
     if s is None or s.empty:
         return None, None
     target_ts = pd.to_datetime(target_ts)
@@ -251,10 +205,6 @@ def _find_floor_value(s: pd.Series, target_ts):
 
 
 def _find_ceil_value(s: pd.Series, target_ts):
-    """
-    時系列Series(s)の中から、target_ts以降（含む）で最も近い行を探す（_find_floor_valueの逆）。
-    見つからない場合は (None, None) を返す。
-    """
     if s is None or s.empty:
         return None, None
     target_ts = pd.to_datetime(target_ts)
@@ -266,10 +216,6 @@ def _find_ceil_value(s: pd.Series, target_ts):
 
 def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: float, cache: dict,
                                          interval: str = "1d", s_val: float = 1.0) -> dict:
-    """
-    yfinance「純粋な取引値Close」との突合アサーション。
-    yfinanceの分足が当時の旧スケール生値（新スケールのs_val倍）で返ってきた場合も考慮して正確に判定します。
-    """
     target_ts = pd.to_datetime(target_dt)
     date_str = target_ts.strftime("%Y-%m-%d")
     cache_key = f"{ticker}_{interval}_{target_ts.strftime('%Y-%m-%d_%H%M')}"
@@ -320,14 +266,9 @@ def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: 
     if yf_close is None or pd.isna(yf_close) or yf_close <= 0 or detected_close is None or pd.isna(detected_close):
         return {"yf_close": None, "deviation_pct": None, "passed": False, "is_daily_fallback": is_daily_fallback}
 
-    # 💡 判定ロジックの改善：
-    # パターンA: yfinanceが新スケールに改定済みの場合 (|detected_close - yf_close|)
     dev_direct = abs(detected_close - yf_close) / yf_close * 100.0
-
-    # パターンB: yfinanceが当時の旧スケール生値のままの場合 (|detected_close * s_val - yf_close|)
     dev_scaled = abs(detected_close * s_val - yf_close) / yf_close * 100.0 if s_val > 0 else 999.0
 
-    # より合致している方を採用
     if dev_direct <= VERIFY_DEVIATION_THRESHOLD_PCT:
         deviation_pct = dev_direct
         passed = True
@@ -345,8 +286,7 @@ def _verify_against_yfinance_pure_close(ticker: str, target_dt, detected_close: 
         "is_daily_fallback": is_daily_fallback
     }
 
-# 調整整合性チェックで試す足の順序（細かい順→粗い順）。
-# yfinance側の取得可能期間外なら自動的に次の粗い足へフォールバックする。
+
 ADJ_VERIFY_FALLBACK_INTERVALS = ["1m", "5m", "60m", "1d"]
 
 
@@ -354,46 +294,8 @@ def _verify_split_via_local_cliff_adjclose(ticker: str, cliff_dt, actual_dt,
                                             before_close: float, after_close: float,
                                             cache: dict,
                                             match_tolerance_pct: float = ADJCLOSE_JUMP_THRESHOLD_PCT) -> dict:
-    """
-    仕様書Ⅰ-⑤拡張：DBで検出した崖の「まさにその前後2点」について、
-    ローカルDBの生値の変化率と、yfinanceのAdj Closeの変化率を比較する独立検証。
-
-    考え方：
-    ・崖の前後の変化率は、配信時の生値であろうとAdj Closeであろうと、
-      「その値動き自体が本物の値動きなら」同じ変化率になるはずである。
-    ・唯一これがズレるのは、DB側の変化が「既知の分割」に由来する場合。
-      その場合yfinanceのAdj Closeはその分割を遡及調整で吸収してしまっているため、
-      同じ2点で見てもAdj Close側にはほとんど変化が残らない。
-    ・つまり、DBの変化率とyfinance Adj Closeの変化率が「一致していれば暴落等の本物の値動き」、
-      「大きく乖離していれば（Adj Close側の変化が小さければ）分割による段差」と判定できる。
-
-    ⚠️【重要・足のフォールバック】cliff_dt/actual_dtと同じ足(interval)でyfinanceの
-    イントラデイデータが取得できればそれを使うのが最も正確だが、取得可能期間
-    （1mは約7〜8日、5mは約60日等）を超えている場合は自動的に一段粗い足へ切り替える
-    （1m→5m→60m→1d）。1dまで落ちた場合のみ、cliff_dtとactual_dtが同一カレンダー日か
-    どうかを事前確認する。同一日内であれば、日足では区別のしようがない
-    （前後とも同じ1本の日足Adj Closeになってしまい、必ず判定不能になる）ため、
-    無理に取得を試みず「判定不能」として明示する。
-
-    ⚠️【重要・floor/ceil探索】cliff_dt側は「その時刻以前で最も近い行」(floor)、
-    actual_dt側は「その時刻以降で最も近い行」(ceil)を、時刻の計算ではなく
-    時系列データの行インデックス（searchsorted）で探す。これにより、
-    取引時間外・休日・日またぎを個別に意識するコードを書く必要がなく、
-    データが存在する行だけを対象に自動的に正しい前後2点が選ばれる。
-
-    ⚠️ ex_dateからの絶対距離や「今日」のような遠い基準点に一切依存しない。
-    DBが検出した「まさにその日時」のペアだけで完結するため、収集ラグで崖がどこに
-    ズレていても、その崖自体が本物の値動きかどうかだけを直接判定できる
-    （ただし、崖の位置が公式ex_dateより前にズレている「先回り調整混入」ケースは対象外。
-    その期間はyfinance自身もまだ遡及調整の起点と認識していないため、Adj Closeにも
-    同じ変化が残ってしまい判定できない。このケースは呼び出し側で別途除外している）。
-
-    戻り値: {"yf_adj_ratio": float|None, "local_raw_ratio": float|None,
-             "ratio_gap_pct": float|None, "passed": bool, "used_interval": str|None}
-    """
     cliff_ts = pd.to_datetime(cliff_dt)
     actual_ts = pd.to_datetime(actual_dt)
-    # 💡 日付だけでなく時刻も含めたキャッシュキーにする（同日内の別時刻を取り違えないため）
     cache_key = f"adjpair_{ticker}_{cliff_ts.strftime('%Y-%m-%d_%H%M')}_{actual_ts.strftime('%Y-%m-%d_%H%M')}"
 
     if cache_key in cache:
@@ -414,8 +316,6 @@ def _verify_split_via_local_cliff_adjclose(ticker: str, cliff_dt, actual_dt,
 
     for interval in ADJ_VERIFY_FALLBACK_INTERVALS:
         if interval == "1d" and cliff_ts.normalize() == actual_ts.normalize():
-            # 💡 同一カレンダー日内の崖は、日足まで落としても前後で同じ1本になり判定不能。
-            # 無理に取得を試みず、ここで探索を打ち切る（結果は「判定不能」のまま）。
             logger.debug(
                 f"_verify_split_via_local_cliff_adjclose: cliff_dtとactual_dtが同日内のため"
                 f"日足フォールバックを断念（判定不能） cliff_ts={cliff_ts}, actual_ts={actual_ts}"
@@ -452,12 +352,9 @@ def _verify_split_via_local_cliff_adjclose(ticker: str, cliff_dt, actual_dt,
             continue
 
         yf_adj_ratio = adj_after / adj_before
-        # 変化率(%)ベースに揃えて差分を取る（比率のまま引き算するより解釈しやすいため）
         local_change_pct = (1.0 - local_raw_ratio) * 100.0
         yf_change_pct = (1.0 - yf_adj_ratio) * 100.0
         ratio_gap_pct = abs(local_change_pct - yf_change_pct)
-        # 💡【重要】gapが小さい＝Adj Closeでも同じだけ動いている＝本物の値動き（暴落）
-        #          gapが大きい＝Adj Closeではほとんど動いていない＝既知の分割で吸収済み＝本物の分割
         passed = ratio_gap_pct >= match_tolerance_pct
         result = {
             "yf_adj_ratio": round(yf_adj_ratio, 4),
@@ -472,11 +369,10 @@ def _verify_split_via_local_cliff_adjclose(ticker: str, cliff_dt, actual_dt,
     cache[cache_key] = result
     return result
 
+
 def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_val: float,
                           daily_after_close: float, yf_cache: dict, status_callback=None) -> dict:
-    """
-    下位時間足（60m/5m/1m）の段差オートフォーカス走査。
-    """
+    """下位時間足（60m/5m/1m）の段差オートフォーカス走査。"""
     logger.debug(f"_scan_intraday_cliff: 開始 ticker={ticker}, interval={interval}, ex_date={ex_date}, actual_day_dt={actual_day_dt}, s_val={s_val}")
 
     ex_date_ts = pd.to_datetime(ex_date)
@@ -511,7 +407,11 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
         pass
     df_tf = df_tf.sort_values("date_dt").reset_index(drop=True)
 
-    df_window = df_tf.tail(5000).reset_index(drop=True)
+    # 💡【修正】1分足の約45営業日分（約15,000本）を確実にカバーできるように十分なサイズを確保
+    tail_limits = {"1m": 25000, "5m": 8000, "60m": 2500}
+    max_tail = tail_limits.get(interval, 25000)
+    df_window = df_tf.tail(max_tail).reset_index(drop=True)
+
     if len(df_window) < 2:
         return {"mode": "メタデータのみ更新", "actual_dt": None, "cliff_dt": None,
                 "before_close": np.nan, "after_close": np.nan, "verify": {"yf_close": None, "deviation_pct": None, "passed": True},
@@ -519,7 +419,9 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
 
     min_R, max_R = get_dynamic_threshold(s_val)
     rows = [{"dt": r["date_dt"], "close": r["close"]} for _, r in df_window.iterrows()]
-    idx = _find_cliff_reverse(rows, min_R, max_R, max_gap_days=6)
+    
+    # 💡【修正】連休（シルバーウィークやGWなど）を考慮し、日足走査と同じく15日までギャップを許容
+    idx = _find_cliff_reverse(rows, min_R, max_R, max_gap_days=15)
 
     if idx == -1:
         return {"mode": "メタデータのみ更新", "actual_dt": None, "cliff_dt": None,
@@ -542,9 +444,7 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
                 "verify": {"yf_close": None, "deviation_pct": None, "passed": True},
                 "status": "[処理済み・スキップ]"}
 
-    # 💡 s_val を渡して、旧スケール生値（2806円など）でも正しく照合できるようにする
     verify = _verify_against_yfinance_pure_close(ticker, actual_dt, after_close, yf_cache, interval=interval, s_val=s_val)
-
     adjfactor = _verify_split_via_local_cliff_adjclose(ticker, cliff_dt, actual_dt, before_close, after_close, yf_cache)
     verify["split_explain_gap_pct"] = adjfactor["ratio_gap_pct"]
     verify["split_explain_gap_passed"] = adjfactor["passed"]
@@ -572,12 +472,8 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
         "status": status_label
     }
 
+
 def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
-    """
-    本番日足データ(price_jp_1d.parquet)から監視銘柄リストのデータをロードし、
-    yfinanceから公式の株式分割履歴を一時取得して、過去に遡ったルックバック走査診断を行います。
-    全候補に分割説明ギャップを計算し、選択ロックを行わず全件手動選択可能にして返します。
-    """
     def log(msg, level="info", exc=False):
         _emit(status_callback, msg, level=level, exc=exc)
 
@@ -716,11 +612,9 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                 close_T_val = row_T["close"]
                 close_prev_val = row_prev["close"]
 
-                # 生値突合
                 verify = _verify_against_yfinance_pure_close(ticker, actual_dt, close_T_val, yf_cache, interval="1d")
                 mode = "要パッチ"
 
-                # elifバイパスを廃止し、無条件で分割説明ギャップを計算
                 adjfactor = _verify_split_via_local_cliff_adjclose(ticker, cliff_dt, actual_dt, close_prev_val, close_T_val, yf_cache)
                 verify["split_explain_gap_pct"] = adjfactor["ratio_gap_pct"]
                 verify["split_explain_gap_passed"] = adjfactor["passed"]
@@ -749,7 +643,6 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                 status_label = "[正常分割]" if verify["passed"] else "[要確認：生値不一致]"
 
             if mode:
-                # 💡 選択不可ロックを廃止：すべての行を True（手動選択可能）にする
                 results.append({
                     "ticker": ticker,
                     "interval": "1d",
@@ -765,10 +658,9 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                     "deviation_pct": verify["deviation_pct"],
                     "split_explain_gap_pct": verify.get("split_explain_gap_pct"),
                     "status": status_label,
-                    "is_selectable": True,  # ロック廃止
+                    "is_selectable": True,
                 })
 
-                # 下位足（60m, 5m, 1m）の段差走査
                 if detected_idx != -1:
                     for tf in INTRADAY_TIMEFRAMES:
                         log(f"  🔬 [{ticker}] {tf} 足の段差オートフォーカス走査中...", level="info")
@@ -798,7 +690,6 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                             tf_cliff_dt = pd.to_datetime(f"{actual_dt.strftime('%Y-%m-%d')} 09:00:00")
                             tf_actual_dt = tf_cliff_dt
 
-                        # 💡 下位足も選択不可ロックを廃止し、全件選択可能にする
                         results.append({
                             "ticker": ticker,
                             "interval": tf,
@@ -814,7 +705,7 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
                             "deviation_pct": tf_verify.get("deviation_pct"),
                             "split_explain_gap_pct": tf_verify.get("split_explain_gap_pct"),
                             "status": tf_result["status"],
-                            "is_selectable": True,  # ロック廃止
+                            "is_selectable": True,
                         })
 
             time.sleep(1.0)
@@ -823,35 +714,15 @@ def scan_jp_anomalies_with_yfinance(status_callback=None) -> pd.DataFrame:
     log(f"🎉 日本株段差スキャン完了。自動検出された修正候補: {len(results)} 件（全時間足合算）", level="info")
     return pd.DataFrame(results)
 
+
 def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callback=None) -> dict:
-    """
-    日本株の全時間足（1d, 60m, 5m, 1m）の本番Parquetに対し、
-    安全かつ可逆的に遡及一括調整パッチを適用します。
-
-    仕様書Ⅱの①〜⑦の全ステップに対応：
-      ① 承認済み行の抽出（呼び出し側が管理者チェック済みの patch_rows を渡す）
-      ② 時間足ごとのParquetロードと条件抽出（不等号 '<' 処理）
-      ③ 価格・出来高の書き換え、および過去全レコードへの刻印
-      ④ インメモリ健全性アサーション検証
-      ⑤ Google Driveへの確定アップロード＆ローカル破棄
-      ⑥ Google Sheets「repair_log」への監査ログ永続記録
-      ⑦ キャッシュクリアと画面の自動リフレッシュ（Streamlit環境がある場合のみ）
-
-    patch_rows: この銘柄に対して管理者が承認した行のリスト。各要素は scan_jp_anomalies_with_yfinance
-                が返す行と同じ形式（少なくとも interval, cliff_date, multiplier, mode, before_close,
-                after_close, deviation_pct を含む）を想定。時間足ごとに個別の境界日時を使用します。
-
-    ※ トラブル時は settings.WORK_DIR/jp_price_corrector_debug.log を参照してください。
-       どのファイルの処理でエラーが起きたか、健全性チェックで何が引っかかったか、
-       Drive/Sheetsとの通信で何が起きたかがすべてDEBUGレベルで記録されています。
-    """
+    """日本株の全時間足（1d, 60m, 5m, 1m）の本番Parquetに対し、安全かつ可逆的に遡及一括調整パッチを適用します。"""
     def log(msg, level="info", exc=False):
         _emit(status_callback, msg, level=level, exc=exc)
 
     logger.debug(f"apply_jp_patch_to_all_timeframes: 開始 ticker={ticker}, patch_rows件数={len(patch_rows)}")
     logger.debug(f"apply_jp_patch_to_all_timeframes: patch_rows内容={patch_rows}")
 
-    # ── 仕様書Ⅱ-①：管理者が目視承認した行のみを対象に、異常値の物理アサーション ──
     patches_by_interval = {}
     for row in patch_rows:
         multiplier = row.get("multiplier")
@@ -874,13 +745,23 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
 
         log(f"⏱️ 【日本株 {interval}】パッチ適用処理中...", level="info")
 
-        cliff_date = patch["cliff_date"]
         multiplier = patch["multiplier"]
         mode = patch["mode"]
-        cliff_dt = pd.to_datetime(cliff_date)
-        cliff_year = cliff_dt.year
-        cliff_month = cliff_dt.month
-        logger.debug(f"interval={interval}: cliff_dt={cliff_dt}, multiplier={multiplier}, mode={mode}")
+        cliff_date = patch.get("cliff_date")
+        actual_date = patch.get("actual_date")
+
+        # 💡【境界日時設定】新スケール開始日時（actual_date）を最優先境界とする
+        if actual_date:
+            boundary_dt = pd.to_datetime(actual_date)
+        elif cliff_date:
+            boundary_dt = pd.to_datetime(cliff_date)
+        else:
+            logger.error(f"interval={interval}: 日時情報が存在しません。スキップします。")
+            continue
+
+        boundary_year = boundary_dt.year
+        boundary_month = boundary_dt.month
+        logger.debug(f"interval={interval}: boundary_dt={boundary_dt}, multiplier={multiplier}, mode={mode}")
 
         try:
             tf_folder_id = get_or_create_drive_folder(interval, settings.FOLDER_ID)
@@ -889,7 +770,6 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
             if not service:
                 raise ConnectionError("Google Driveサービスにアクセスできません。")
 
-            # 本番 parquet ファイル（_diff_ を含まないもの）を一覧取得
             query = f"'{tf_folder_id}' in parents and name contains 'price_jp_' and name contains '.parquet' and not name contains '_diff_' and trashed=false"
             logger.debug(f"interval={interval}: Drive files().list query={query}")
             drive_results = service.files().list(q=query, fields="files(id, name)").execute()
@@ -905,7 +785,6 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                 all_records = False
                 conditional_records = False
 
-                # ── 仕様書Ⅱ-②：時間足ごとの判定ルール（不等号 '<' 処理） ──
                 if interval == "1d":
                     if b_name == "price_jp_1d.parquet":
                         should_process = True
@@ -915,10 +794,10 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                     m_y = re.search(r'price_jp_60m_(\d{4})\.parquet', b_name)
                     if m_y:
                         file_year = int(m_y.group(1))
-                        if file_year < cliff_year:
+                        if file_year < boundary_year:
                             should_process = True
                             all_records = True
-                        elif file_year == cliff_year:
+                        elif file_year == boundary_year:
                             should_process = True
                             conditional_records = True
 
@@ -928,15 +807,15 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                         file_year = int(m_ym.group(1))
                         file_month = int(m_ym.group(2))
 
-                        if (file_year < cliff_year) or (file_year == cliff_year and file_month < cliff_month):
+                        if (file_year < boundary_year) or (file_year == boundary_year and file_month < boundary_month):
                             should_process = True
                             all_records = True
-                        elif file_year == cliff_year and file_month == cliff_month:
+                        elif file_year == boundary_year and file_month == boundary_month:
                             should_process = True
                             conditional_records = True
 
                 if not should_process:
-                    logger.debug(f"  file={b_name}: 対象外（cliff_year={cliff_year}, cliff_month={cliff_month} と不一致）のためスキップ")
+                    logger.debug(f"  file={b_name}: 対象外のためスキップ")
                     continue
 
                 logger.debug(f"  file={b_name}: 処理対象 (all_records={all_records}, conditional_records={conditional_records})")
@@ -967,13 +846,16 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                     try:
                         df["date_dt"] = df["date_dt"].dt.tz_localize(None)
                     except Exception:
-                        logger.debug(f"  file={b_name}: tz_localize(None) をスキップ（すでにtz-naive）", exc_info=True)
+                        pass
 
+                    # 💡【重要修正】actual_date があれば `< boundary_dt`、cliff_date だけなら `<= boundary_dt` を適用して直前バーを確実に含める
                     if all_records:
                         mask = (df["ticker"] == ticker)
                     elif conditional_records:
-                        # 時間足ごとに個別特定された「実質段差日時」を境界として使用（不等号 '<' 適用）
-                        mask = (df["ticker"] == ticker) & (df["date_dt"] < cliff_dt)
+                        if actual_date:
+                            mask = (df["ticker"] == ticker) & (df["date_dt"] < boundary_dt)
+                        else:
+                            mask = (df["ticker"] == ticker) & (df["date_dt"] <= boundary_dt)
                     else:
                         mask = pd.Series([False] * len(df))
 
@@ -993,10 +875,9 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                         else:
                             logger.debug(f"  file={b_name}: mode={mode} のため価格・出来高は書き換えず、メタデータのみ更新")
 
-                        # multiplierの履歴を過去レコード1つ1つに累積（実施済みマーク）
                         df.loc[mask, "patched_multiplier"] = df.loc[mask, "patched_multiplier"] * multiplier
 
-                        # ── 仕様書Ⅱ-④：インメモリ健全性アサーション検証 ──
+                        # ── インメモリ健全性アサーション検証 ──
                         health_ok = True
                         health_reason = ""
                         if df.empty:
@@ -1027,7 +908,6 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                                 os.remove(local_path)
                             continue
 
-                        # ── 仕様書Ⅱ-⑤：Google Driveへの確定アップロードと一時ファイル破棄 ──
                         df_cleaned = df.drop(columns=["date_dt"], errors="ignore")
                         table = pa.Table.from_pandas(df_cleaned, preserve_index=False)
                         pq.write_table(table, local_path, use_dictionary=False, compression="SNAPPY")
@@ -1046,7 +926,7 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                                 "executed_at": executed_at,
                                 "ticker": ticker,
                                 "market": "JP",
-                                "cliff_date": cliff_date,
+                                "cliff_date": cliff_date or actual_date,
                                 "interval": interval,
                                 "before_close": patch.get("before_close"),
                                 "after_close": patch.get("after_close"),
@@ -1074,7 +954,6 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
             results[interval] = f"エラー: {str(e)}"
             log(f"❌ 【{interval}】 一括書き換え適用失敗: {e}", level="error", exc=True)
 
-    # ── 仕様書Ⅱ-⑥：Google Sheets「repair_log」への監査ログ永続記録（完全可逆性の担保） ──
     if repair_log_rows:
         logger.debug(f"repair_log 書き込み対象: {repair_log_rows}")
         try:
@@ -1086,10 +965,7 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                 log("⚠️ repair_log シートへの記録に失敗しました（スプレッドシート接続を確認してください）。", level="warning")
         except Exception as e:
             log(f"⚠️ repair_log 記録中に例外が発生しました: {e}", level="error", exc=True)
-    else:
-        logger.debug("repair_log 書き込み対象なし（適用済みパッチが0件）")
 
-    # ── 仕様書Ⅱ-⑦：キャッシュクリアと画面の自動リフレッシュ（Streamlit実行環境の場合のみ） ──
     try:
         import streamlit as st
         if hasattr(st, "cache_data"):
@@ -1099,7 +975,7 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
             logger.debug("st.rerun() を実行します。")
             st.rerun()
     except Exception:
-        logger.debug("Streamlit環境ではない、またはrerun中の例外のため、キャッシュクリア/リフレッシュをスキップしました。", exc_info=True)
+        pass
 
     elapsed = time.time() - run_started_at
     logger.debug(f"apply_jp_patch_to_all_timeframes: 終了 ticker={ticker}, 所要時間={elapsed:.2f}秒, results={results}")
