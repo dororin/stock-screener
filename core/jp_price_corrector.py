@@ -17,9 +17,9 @@ from data_access.local_db import (
     clear_local_parquet_cache
 )
 from data_access.drive_api import (
-    download_from_drive_api,
-    upload_to_drive_api,
-    get_or_create_drive_folder,
+    download_from_drive_api, 
+    upload_to_drive_api, 
+    get_or_create_drive_folder, 
     get_drive_service
 )
 
@@ -399,7 +399,7 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
         df_tf = pd.DataFrame()
 
     if df_tf is None or df_tf.empty:
-        return {"mode": "メタデータのみ更新", "actual_dt": None, "cliff_dt": None,
+        return {"mode": None, "actual_dt": None, "cliff_dt": None,
                 "before_close": np.nan, "after_close": np.nan, "verify": {"yf_close": None, "deviation_pct": None, "passed": True},
                 "status": "[データ無し・スキップ]"}
 
@@ -418,7 +418,7 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
     df_window = df_tf.tail(max_tail).reset_index(drop=True)
 
     if len(df_window) < 2:
-        return {"mode": "メタデータのみ更新", "actual_dt": None, "cliff_dt": None,
+        return {"mode": None, "actual_dt": None, "cliff_dt": None,
                 "before_close": np.nan, "after_close": np.nan, "verify": {"yf_close": None, "deviation_pct": None, "passed": True},
                 "status": "[データ不足・スキップ]"}
 
@@ -428,7 +428,8 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
     idx = _find_cliff_reverse(rows, min_R, max_R, max_gap_days=15)
 
     if idx == -1:
-        return {"mode": "メタデータのみ更新", "actual_dt": None, "cliff_dt": None,
+        # 💡 下位足に段差がない場合は修復不要なので mode=None でスキップ
+        return {"mode": None, "actual_dt": None, "cliff_dt": None,
                 "before_close": np.nan, "after_close": np.nan, "verify": {"yf_close": None, "deviation_pct": None, "passed": True},
                 "status": "[正常分割（段差未検出＝調整済み）]"}
 
@@ -639,19 +640,12 @@ def scan_jp_anomalies_with_yfinance(status_callback=None, force_reload: bool = F
                 else:
                     status_label = "[要確認：分割説明ギャップ乖離疑い]"
             else:
-                mode = "メタデータのみ更新"
-                actual_dt = planned_dt
-                cliff_dt = planned_dt
+                # 💡 段差が検出されなかった（すでに解消済み・正常分割）の場合は mode=None としてスキップ
+                mode = None
+                status_label = "[正常分割]"
 
-                row_T = df_ticker.iloc[ex_date_idx]
-                close_T_val = row_T["close"]
-                if ex_date_idx > 0:
-                    close_prev_val = df_ticker.iloc[ex_date_idx - 1]["close"]
-
-                verify = _verify_against_yfinance_pure_close(ticker, actual_dt, close_T_val, yf_cache, interval="1d")
-                status_label = "[正常分割]" if verify["passed"] else "[要確認：生値不一致]"
-
-            if mode:
+            # 💡 実際に価格に段差が存在する「要パッチ」のデータのみテーブルに追加
+            if mode == "要パッチ":
                 results.append({
                     "ticker": ticker,
                     "interval": "1d",
@@ -670,6 +664,7 @@ def scan_jp_anomalies_with_yfinance(status_callback=None, force_reload: bool = F
                     "is_selectable": True,
                 })
 
+                # 下位時間足の走査
                 if detected_idx != -1:
                     for tf in INTRADAY_TIMEFRAMES:
                         log(f"  🔬 [{ticker}] {tf} 足の段差オートフォーカス走査中...", level="info")
@@ -689,16 +684,13 @@ def scan_jp_anomalies_with_yfinance(status_callback=None, force_reload: bool = F
                             log(f"  ❌ [{ticker}] {tf} 足のオートフォーカス走査中に予期しない例外: {e}", level="error", exc=True)
                             continue
 
-                        if tf_result["mode"] is None:
+                        # 💡 下位足でも「要パッチ」のもののみ追加
+                        if tf_result.get("mode") != "要パッチ":
                             continue
 
                         tf_actual_dt = tf_result["actual_dt"]
                         tf_cliff_dt = tf_result["cliff_dt"]
                         tf_verify = tf_result["verify"]
-
-                        if tf_result["mode"] == "メタデータのみ更新" and tf_actual_dt is None:
-                            tf_cliff_dt = pd.to_datetime(f"{actual_dt.strftime('%Y-%m-%d')} 09:00:00")
-                            tf_actual_dt = tf_cliff_dt
 
                         results.append({
                             "ticker": ticker,
@@ -858,7 +850,7 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                     except Exception:
                         pass
 
-                    # 💡【重要修正】actual_date があれば `< boundary_dt`、cliff_date だけなら `<= boundary_dt` を適用して直前バーを確実に含める
+                    # 💡 actual_date があれば `< boundary_dt`、cliff_date だけなら `<= boundary_dt`
                     if all_records:
                         mask = (df["ticker"] == ticker)
                     elif conditional_records:
@@ -948,7 +940,6 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                     else:
                         logger.debug(f"  file={b_name}: マスク該当レコードが0件のため書き換えなし")
 
-                    # 💡 ローカルに残骸を残さないよう必ず削除
                     if os.path.exists(local_path):
                         os.remove(local_path)
 
@@ -961,7 +952,6 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
             results[interval] = f"正常に修復 ({applied_files_count}件)"
             logger.debug(f"interval={interval}: 完了。適用ファイル数={applied_files_count}")
 
-            # 💡 ローカルキャッシュをクリア
             clear_local_parquet_cache(interval=interval, is_jp=True)
 
         except Exception as e:
@@ -980,11 +970,12 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
         except Exception as e:
             log(f"⚠️ repair_log 記録中に例外が発生しました: {e}", level="error", exc=True)
 
-    # 💡 パッチ適用後はStreamlitキャッシュを完全クリア
+    # 💡 パッチ適用後はキャッシュクリアのみ行い、rerunはUI側に委ねる（st.rerun()の削除）
     try:
         import streamlit as st
         if hasattr(st, "cache_data"):
             st.cache_data.clear()
+            logger.debug("st.cache_data.clear() を実行しました。")
     except Exception:
         pass
 
