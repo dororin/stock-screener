@@ -480,10 +480,24 @@ def main():
         logs_accumulator.append(line)
 
     try:
-        tickers = load_all_collection_tickers_from_sheets()
-        if not tickers:
+        raw_tickers = load_all_collection_tickers_from_sheets()
+        if not raw_tickers:
             log("❌ 収集対象の銘柄が1件も存在しないため、終了します。")
             return
+
+        # ── 💡【新設】東証全上場商品マスタ（全個別株＋全ETF・ETN）による事前バリデーション（水際対策） ──
+        from core.collector import get_jpx_truly_all_symbols
+        jpx_active_set = get_jpx_truly_all_symbols()
+
+        if jpx_active_set:
+            tickers = [t for t in raw_tickers if t in jpx_active_set]
+            invalid_tickers = [t for t in raw_tickers if t not in jpx_active_set]
+            if invalid_tickers:
+                log(f"⚠️ 【上場廃止事前検知】以下の銘柄は東証上場マスタに存在しないため、リクエストから除外しました: {invalid_tickers}")
+            log(f"  🎯 事前バリデーション通過: {len(tickers):,} 銘柄（上場廃止除外: {len(invalid_tickers)} 銘柄）")
+        else:
+            log("⚠️ JPX全上場マスタが取得できなかったため、シートの全銘柄をそのまま使用します。")
+            tickers = raw_tickers
 
         excel = None
         wb = None
@@ -506,7 +520,7 @@ def main():
             return excel.Workbooks.Add()
         wb = execute_com_safely(create_wb)
 
-        # 1. 各時間足の株価データを順次収集
+        # 1. 各時間足の株価データを順次収集（※エラー時はフェイルファストで即時停止）
         for interval in TIMEFRAMES:
             log(f"⏱️ 【{interval}】のデータ収集を開始します...")
             

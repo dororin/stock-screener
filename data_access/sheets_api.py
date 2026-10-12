@@ -860,6 +860,64 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
             r["memo"],
             r["etf"]
         ])
+
+    # ── [新設] 既存 sector_JP からの脱落銘柄検知 & 自動退避・上場廃止パージ ──
+    if is_jp:
+        try:
+            from core.collector import get_jpx_truly_all_symbols
+            active_jpx_set = get_jpx_truly_all_symbols()
+
+            # 1. 同期前の sector_JP の登録コード一覧
+            old_sector_codes = set()
+            old_sector_records = ws_out.get_all_values()
+            if old_sector_records and len(old_sector_records) > 1:
+                for r in old_sector_records[1:]:
+                    if len(r) > 1:
+                        c = str(r[1]).strip().split(".")[0].upper()
+                        if c and c not in ["CODE", "コード", "SYMBOL", "銘柄コード"]:
+                            old_sector_codes.add(c)
+
+            # 2. 今回新しく生成された sector_JP のコード一覧
+            new_sector_codes = {r["code"] for r in final_rows}
+
+            # 3. 今回外れた（脱落した）銘柄を特定
+            dropped_codes = old_sector_codes - new_sector_codes
+
+            # 4. extra_tickers シートの更新
+            extra_df = load_extra_tickers_from_sheets()
+            existing_extra_codes = set(extra_df["銘柄コード"].dropna().astype(str).str.strip().str.upper())
+
+            # 4-A. 東証に現役上場している脱落銘柄 ➔ extra_tickers へ自動追加（退避）
+            rows_to_add = []
+            for d_code in dropped_codes:
+                if d_code in active_jpx_set and d_code not in existing_extra_codes:
+                    rows_to_add.append({
+                        "セクター名": "旧ETF構成",
+                        "銘柄コード": d_code,
+                        "備考": jpx_name_map.get(d_code, "旧ETF構成（自動退避）"),
+                        "ETFコード": "",
+                        "ファンド": "",
+                        "非表示": "OFF"
+                    })
+
+            if rows_to_add:
+                extra_df = pd.concat([extra_df, pd.DataFrame(rows_to_add)], ignore_index=True)
+                print(f"📦 [ETF同期] 外れた現役銘柄 {len(rows_to_add)} 件を extra_tickers へ自動退避しました: {[r['銘柄コード'] for r in rows_to_add]}")
+                sync_results["脱落銘柄自動退避"] = f"{len(rows_to_add)} 銘柄を extra_tickers へ救済追加"
+
+            # 4-B. 東証から消滅した上場廃止銘柄 ➔ extra_tickers から自動削除
+            if active_jpx_set and not extra_df.empty:
+                before_count = len(extra_df)
+                extra_df = extra_df[extra_df["銘柄コード"].isin(active_jpx_set)].reset_index(drop=True)
+                purged_count = before_count - len(extra_df)
+                if purged_count > 0:
+                    print(f"🧹 [ETF同期] 東証上場マスタに存在しない上場廃止銘柄 {purged_count} 件を extra_tickers から自動削除しました。")
+                    sync_results["上場廃止パージ"] = f"{purged_count} 銘柄を extra_tickers から自動削除"
+
+            save_extra_tickers_to_sheets(extra_df)
+
+        except Exception as e_evict:
+            print(f"⚠️ [ETF同期] 脱落銘柄の自動退避・パージ処理中にエラー: {e_evict}")
         
     ws_out.clear()
     ws_out.update(output_values, "A1")

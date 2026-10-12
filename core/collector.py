@@ -226,6 +226,31 @@ def _read_excel_safely(file_path_or_bytes) -> pd.DataFrame:
             continue
     return pd.DataFrame()
 
+def get_jpx_truly_all_symbols() -> set:
+    """
+    東証に上場している【すべての個別株（プライム/スタンダード/グロース）＋全ETF・ETN】
+    の銘柄コードをSet形式で返します。市場区分や規模区分のフィルターは一切適用しません。
+    """
+    jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xlsx")
+    
+    if not os.path.exists(jpx_save_path) or os.path.getsize(jpx_save_path) < 10000:
+        _download_jpx_file(jpx_save_path)
+
+    df_full = _read_excel_safely(jpx_save_path)
+    if df_full.empty or df_full.shape[1] < 2:
+        return set()
+
+    # 第1列（銘柄コード列）をフィルターなしで全行抽出
+    code_series = df_full.iloc[:, 1].dropna().astype(str).str.strip()
+    
+    clean_codes = set()
+    for c in code_series:
+        code_clean = c.split(".")[0].upper()
+        if code_clean.isalnum() and code_clean not in ["CODE", "コード", "SYMBOL", "証券コード"]:
+            clean_codes.add(code_clean)
+            
+    return clean_codes
+
 def get_topix500_tickers() -> list:
     """JPX公式ExcelからTOPIX500（Core/Large/Mid）の株式コードを取得します。"""
     cache_path = os.path.join(settings.WORK_DIR, "jpx_ticker_cache.json")
@@ -343,3 +368,4 @@ def load_tickers_from_file(file_path: str) -> list:
         os.path.join("/content/drive/MyDrive/stock_data_hub", file_path),
         os.path.join(os.getcwd(), file_path)
     ]
+    return []
