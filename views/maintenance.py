@@ -50,7 +50,7 @@ from core.us_price_corrector import (
     apply_bulk_selected_patches
 )
 
-# ── 日足の最新更新日の簡易取得（TTLを短縮して即時反映） ──
+# ── 日足の最新更新日の簡易取得 ──
 @st.cache_data(ttl=60)
 def get_db_last_update_cached(interval: str, is_jp: bool = True) -> str:
     try:
@@ -104,8 +104,6 @@ def render_sync_event_calendar_ui(is_jp: bool):
                     if saved:
                         st.cache_data.clear()
                         st.success(f"✅ {len(df_events)} 銘柄のスケジュールを正常に更新しました！")
-                        time.sleep(1.0)
-                        st.rerun(scope="fragment")
                     else:
                         st.error("❌ スプレッドシートへの保存に失敗しました。")
                 except Exception as ex:
@@ -160,7 +158,6 @@ def render_etf_manager():
                                 save_extra_tickers_to_sheets(df)
                                 sync_extra_tickers_to_local()
                                 st.success(f"{code_str} を追加しました。")
-                                time.sleep(0.3)
                                 st.rerun(scope="fragment")
                 else:
                     st.caption(f"「{q}」の候補なし")
@@ -189,7 +186,6 @@ def render_etf_manager():
                 save_extra_tickers_to_sheets(df)
                 sync_extra_tickers_to_local()
                 st.success("削除しました。")
-                time.sleep(0.3)
                 st.rerun(scope="fragment")
         else:
             st.caption("登録されている追加ETFはありません。")
@@ -250,6 +246,9 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
         "「異常データスキャン」と「データベース健康診断」を統合。日足の段差・マイナス転換を自動検出し、"
         "TradingViewの正しい終値と自動照合して「真の倍率」を算出します。"
     )
+
+    if "us_patch_run_logs" not in st.session_state:
+        st.session_state["us_patch_run_logs"] = []
 
     if st.button("🔍 統合スキャンを実行", key="btn_unified_scan", type="primary", use_container_width=True):
         with st.spinner("全時間足（1d/60m/5m/1m）の段差検出とTradingViewデータ照合を実行中..."):
@@ -312,6 +311,7 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
     st.caption(f"現在 {len(selected_rows)} 件が選択されています。")
 
     if st.button("🚀 選択したパッチをすべて本番適用（一括実行）", key="btn_bulk_apply_selected", type="primary", use_container_width=True, disabled=selected_rows.empty):
+        st.session_state["us_patch_run_logs"] = []
         patches = [
             {"ticker": r["銘柄"], "patch_date": r["要補正Close日時（適用基準）"], "multiplier": r["真の倍率(true_multiplier)"]}
             for _, r in selected_rows.iterrows()
@@ -320,6 +320,8 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
         with status_box:
             def update_bulk_status(msg):
                 st.write(msg)
+                st.session_state["us_patch_run_logs"].append(str(msg))
+
             summary = apply_bulk_selected_patches(patches, status_callback=update_bulk_status)
             status_box.update(
                 label=f"🎉 完了：{summary['repaired']}件修復、{summary['skipped']}件スキップ",
@@ -328,8 +330,13 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
         st.success(f"✅ {summary['repaired']}件修復、{summary['skipped']}件スキップしました。")
         del st.session_state["unified_scan_result"]
         st.cache_data.clear()
-        time.sleep(1.0)
-        st.rerun(scope="fragment")
+
+    if st.session_state.get("us_patch_run_logs"):
+        with st.expander("📝 米国株パッチ適用 実行ログ詳細", expanded=True):
+            st.code("\n".join(st.session_state["us_patch_run_logs"]), language="text")
+            if st.button("🗑️ 実行ログを閉じる", key="btn_clear_us_patch_logs", use_container_width=True):
+                st.session_state["us_patch_run_logs"] = []
+                st.rerun(scope="fragment")
 
 
 # ── US専用：コミットUI ──
@@ -406,8 +413,6 @@ def render_commit_verified_data_ui(is_jp: bool):
             if success_count > 0:
                 st.cache_data.clear()
                 status_box.update(label=f"🎉 計 {success_count} 個の時間足データの本番同期が完了しました！", state="complete")
-                time.sleep(1.0)
-                st.rerun(scope="fragment")
 
     if col_btn_clear.button("🗑️ 検証一時データを破棄する", key="btn_clear_verified_data_cache", type="secondary", use_container_width=True):
         for tf in settings.TIMEFRAMES:
@@ -430,7 +435,6 @@ def render_commit_verified_data_ui(is_jp: bool):
             del st.session_state["temp_manual_repair_payload"]
             
         st.warning("メモリ上およびディスク上の一時データを消去しました。")
-        time.sleep(0.5)
         st.rerun(scope="fragment")
 
 
@@ -576,8 +580,6 @@ def render_full_sync_section(is_jp: bool):
                 all_tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AMD", "AVGO", "QCOM", "MU", "INTC", "JPM", "BAC", "GS", "MS", "WFC", "XOM", "CVX", "COP", "SLB", "TSLA", "HD", "MCD", "NFLX", "NEE", "LIN"]
                 update_price_database(is_jp=False, target_tickers=all_tickers, status_callback=update_status_on_screen, dry_run=True)
                 status_box.update(label="🎉 テスト検証が完了しました！", state="complete")
-                time.sleep(1.0)
-                st.rerun(scope="fragment")
             except Exception as e:
                 st.error(f"エラー: {e}")
 
@@ -658,6 +660,7 @@ def render_full_rebuild_section(is_jp: bool, market_mode: str):
 
 
 # ─── 🚀 日本株専用手動上書きマージセンター ───
+@st.fragment
 def render_jp_manual_merge_center(is_jp: bool):
     if not is_jp:
         return
@@ -693,7 +696,7 @@ def render_jp_manual_merge_center(is_jp: bool):
             st.session_state["jp_merge_finished"] = False
             st.session_state["jp_merge_result_msg"] = None
             st.session_state["jp_merge_success"] = False
-            st.rerun()
+            st.rerun(scope="fragment")
 
     if st.session_state["jp_merge_running"] and not st.session_state["jp_merge_finished"]:
         status_box = st.status(f"🔄 【{merge_tf}】の上書き累積マージ処理を実行中...", expanded=True)
@@ -708,7 +711,6 @@ def render_jp_manual_merge_center(is_jp: bool):
             st.session_state["jp_merge_running"] = False
             
             if result.get("success"):
-                # 💡 マージ後はキャッシュを完全無効化
                 clear_local_parquet_cache(interval=merge_tf, is_jp=True)
                 st.cache_data.clear()
                 status_box.update(label="🎉 統合マージおよび不要差分ファイルの自動消去が正常に完了しました！", state="complete")
@@ -719,7 +721,7 @@ def render_jp_manual_merge_center(is_jp: bool):
                 st.session_state["jp_merge_success"] = False
                 st.session_state["jp_merge_result_msg"] = result.get("message")
             
-            st.rerun()
+            st.rerun(scope="fragment")
 
     if st.session_state["jp_merge_finished"]:
         if st.session_state["jp_merge_success"]:
@@ -735,10 +737,11 @@ def render_jp_manual_merge_center(is_jp: bool):
                 st.session_state["jp_merge_finished"] = False
                 st.session_state["jp_merge_result_msg"] = None
                 st.session_state["jp_merge_success"] = False
-                st.rerun()
+                st.rerun(scope="fragment")
 
 
 # ─── 🚀 日本株専用：統合段差スキャン・一括自動修復 ───
+@st.fragment
 def render_jp_split_scan_and_repair_ui(is_jp: bool):
     if not is_jp:
         return
@@ -752,8 +755,9 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
 
     if "jp_scan_is_running" not in st.session_state:
         st.session_state["jp_scan_is_running"] = False
+    if "jp_patch_run_logs" not in st.session_state:
+        st.session_state["jp_patch_run_logs"] = []
 
-    # 💡【スマート制御】最新Drive強制再取得オプション（デフォルトON）
     col_opt1, col_opt2 = st.columns([3, 1])
     with col_opt1:
         jp_scan_force_reload = st.checkbox(
@@ -772,16 +776,15 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             use_container_width=True,
             disabled=st.session_state["jp_scan_is_running"]
         ):
-            # 💡 スキャン開始時に前回の古い結果を必ずクリア
             st.session_state["jp_split_scan_result"] = None
             st.session_state["jp_scan_is_running"] = True
-            st.rerun()
+            st.rerun(scope="fragment")
 
     with col_btn2:
         if st.session_state.get("jp_split_scan_result") is not None:
             if st.button("🗑️ 結果クリア", key="btn_clear_jp_scan", use_container_width=True):
                 st.session_state["jp_split_scan_result"] = None
-                st.rerun()
+                st.rerun(scope="fragment")
 
     if st.session_state["jp_scan_is_running"]:
         status_box = st.status("📡 日本株 統合段差スキャンを実行中...", expanded=True)
@@ -803,7 +806,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             finally:
                 st.session_state["jp_scan_is_running"] = False
 
-        st.rerun()
+        st.rerun(scope="fragment")
 
     result_df = st.session_state.get("jp_split_scan_result")
     if result_df is None:
@@ -853,6 +856,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
     st.caption(f"現在 {len(selected_rows)} 件が適用対象として選択されています。")
 
     if st.button("🚀 選択した日本株パッチを一括本番適用", key="btn_bulk_apply_jp_selected", type="primary", use_container_width=True, disabled=selected_rows.empty):
+        st.session_state["jp_patch_run_logs"] = []
         status_box = st.status("📡 日本株一括修復パッチを実行中...", expanded=True)
         with status_box:
             from core.jp_price_corrector import apply_jp_patch_to_all_timeframes
@@ -861,7 +865,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             for idx, r in selected_rows.iterrows():
                 orig = result_df.loc[idx]
                 ticker = orig["ticker"]
-                # 💡【境界確定】actual_date を patch_rows に含めて渡す
                 grouped.setdefault(ticker, []).append({
                     "interval": orig["interval"],
                     "cliff_date": orig["cliff_date"],
@@ -877,33 +880,49 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             repaired_count = 0
             for ticker, patch_rows in grouped.items():
                 intervals_str = ", ".join(p["interval"] for p in patch_rows)
-                st.write(f"🔧 [{ticker}] {intervals_str} の各境界日以前を一括パッチ適用中...")
+                msg_start = f"🔧 [{ticker}] {intervals_str} の各境界日以前を一括パッチ適用中..."
+                st.write(msg_start)
+                st.session_state["jp_patch_run_logs"].append(msg_start)
 
                 def _status_cb(msg, _ticker=ticker):
-                    st.write(f"　　{msg}")
+                    line = f"　　{msg}"
+                    st.write(line)
+                    st.session_state["jp_patch_run_logs"].append(line)
 
                 try:
                     results = apply_jp_patch_to_all_timeframes(ticker, patch_rows, status_callback=_status_cb)
                 except Exception as ex:
-                    st.error(f"   ❌ [{ticker}] パッチ適用中に例外が発生しました: {ex}")
+                    err_msg = f"   ❌ [{ticker}] パッチ適用中に例外が発生しました: {ex}"
+                    st.error(err_msg)
+                    st.session_state["jp_patch_run_logs"].append(err_msg)
                     continue
 
                 applied_intervals = [iv for iv, msg in results.items() if "正常に修復" in str(msg)]
                 if applied_intervals:
                     repaired_count += 1
-                    st.success(f"   ✅ [{ticker}] パッチ適用完了 ({', '.join(applied_intervals)})")
+                    ok_msg = f"   ✅ [{ticker}] パッチ適用完了 ({', '.join(applied_intervals)})"
+                    st.success(ok_msg)
+                    st.session_state["jp_patch_run_logs"].append(ok_msg)
                 else:
-                    st.warning(f"   ⏭️ [{ticker}] スキップまたはエラーが発生しました。（詳細: {results}）")
+                    skip_msg = f"   ⏭️ [{ticker}] スキップまたはエラーが発生しました。（詳細: {results}）"
+                    st.warning(skip_msg)
+                    st.session_state["jp_patch_run_logs"].append(skip_msg)
 
             status_box.update(label=f"🎉 完了：{repaired_count}銘柄を一括修復しました。", state="complete")
             
-            # 💡 パッチ適用成功時は古いスキャン結果を必ず消去し、ローカルキャッシュも一掃
+            # キャッシュをクリア
             if "jp_split_scan_result" in st.session_state:
                 del st.session_state["jp_split_scan_result"]
             clear_local_parquet_cache(is_jp=True)
             st.cache_data.clear()
-            time.sleep(1.0)
-            st.rerun()
+
+    # 💡 処理完了ログが残っている場合は、ユーザーが閉じるまで常時表示
+    if st.session_state.get("jp_patch_run_logs"):
+        with st.expander("📝 日本株パッチ適用 実行ログ詳細", expanded=True):
+            st.code("\n".join(st.session_state["jp_patch_run_logs"]), language="text")
+            if st.button("🗑️ 実行ログを閉じる", key="btn_clear_jp_patch_logs", use_container_width=True):
+                st.session_state["jp_patch_run_logs"] = []
+                st.rerun(scope="fragment")
 
 
 @st.fragment
@@ -924,7 +943,6 @@ def render_parquet_data_inspector(is_jp: bool):
             key="inspect_interval_select"
         )
     with col_inspect_ctrl2:
-        # 💡【スマート制御】Drive強制再取得オプション（デフォルトON）
         inspect_force_reload = st.checkbox(
             "🔄 Google Driveから最新ファイルを強制再取得（force_reload）",
             value=True,
@@ -1019,7 +1037,7 @@ def render_parquet_data_inspector(is_jp: bool):
                         st.warning(
                             f"⚠️ 条件に該当するデータが多いため（{len(df_result):,}件）、"
                             f"指定開始日を起点とした先頭 {MAX_DISPLAY_ROWS:,} 件のみを表示しています。\n\n"
-                            f"これより後ろの（より新しい）データを確認したい場合は、表示開始日を後ろにずらしてください。"
+                            f"これより後ろのデータを確認したい場合は、表示開始日を後ろにずらしてください。"
                         )
                         df_display = df_result.head(MAX_DISPLAY_ROWS)
                     else:

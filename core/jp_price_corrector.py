@@ -985,10 +985,6 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
         import streamlit as st
         if hasattr(st, "cache_data"):
             st.cache_data.clear()
-            logger.debug("st.cache_data.clear() を実行しました。")
-        if hasattr(st, "rerun"):
-            logger.debug("st.rerun() を実行します。")
-            st.rerun()
     except Exception:
         pass
 
