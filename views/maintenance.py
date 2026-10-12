@@ -158,7 +158,7 @@ def render_etf_manager():
                                 save_extra_tickers_to_sheets(df)
                                 sync_extra_tickers_to_local()
                                 st.success(f"{code_str} を追加しました。")
-                                st.rerun(scope="fragment")
+                                st.rerun()
                 else:
                     st.caption(f"「{q}」の候補なし")
         elif len(q) == 1:
@@ -186,7 +186,7 @@ def render_etf_manager():
                 save_extra_tickers_to_sheets(df)
                 sync_extra_tickers_to_local()
                 st.success("削除しました。")
-                st.rerun(scope="fragment")
+                st.rerun()
         else:
             st.caption("登録されている追加ETFはありません。")
 
@@ -222,7 +222,7 @@ def render_sync_etf_master_ui(is_jp: bool):
         st.error(f"❌ 同期に失敗しました: {st.session_state['etf_sync_error_msg']}")
         if st.button("🗑️ エラー表示をクリア", key="btn_clear_etf_sync_err", use_container_width=True):
             st.session_state["etf_sync_error_msg"] = None
-            st.rerun(scope="fragment")
+            st.rerun()
 
     if st.session_state["etf_sync_result_data"]:
         results = st.session_state["etf_sync_result_data"]
@@ -231,7 +231,7 @@ def render_sync_etf_master_ui(is_jp: bool):
 
         if st.button("🗑️ 同期結果表示を閉じる", key="btn_clear_etf_sync_res", use_container_width=True):
             st.session_state["etf_sync_result_data"] = None
-            st.rerun(scope="fragment")
+            st.rerun()
 
 
 # ── 🔍 US専用：統合データスキャン ──
@@ -254,7 +254,6 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
         with st.spinner("全時間足（1d/60m/5m/1m）の段差検出とTradingViewデータ照合を実行中..."):
             st.session_state.unified_scan_result = scan_and_diagnose_cliffs_with_tv()
         st.success("統合スキャンが完了しました。")
-        st.rerun(scope="fragment")
 
     result_df = st.session_state.get("unified_scan_result")
     if result_df is None:
@@ -336,7 +335,7 @@ def render_unified_scan_and_repair_ui(is_jp: bool):
             st.code("\n".join(st.session_state["us_patch_run_logs"]), language="text")
             if st.button("🗑️ 実行ログを閉じる", key="btn_clear_us_patch_logs", use_container_width=True):
                 st.session_state["us_patch_run_logs"] = []
-                st.rerun(scope="fragment")
+                st.rerun()
 
 
 # ── US専用：コミットUI ──
@@ -435,7 +434,7 @@ def render_commit_verified_data_ui(is_jp: bool):
             del st.session_state["temp_manual_repair_payload"]
             
         st.warning("メモリ上およびディスク上の一時データを消去しました。")
-        st.rerun(scope="fragment")
+        st.rerun()
 
 
 # ── US専用：手動ピンポイント一括安全修復 ──
@@ -554,7 +553,7 @@ def render_delete_before_date_ui(is_jp: bool):
                 for interval, msg in del_results.items():
                     st.write(f" **{interval}**: {msg}")
             st.cache_data.clear()
-            st.rerun(scope="fragment")
+            st.rerun()
 
 
 # ── US専用：全体差分ダウンロード ──
@@ -676,10 +675,6 @@ def render_jp_manual_merge_center(is_jp: bool):
 
     if "jp_merge_logs_list" not in st.session_state:
         st.session_state["jp_merge_logs_list"] = []
-    if "jp_merge_running" not in st.session_state:
-        st.session_state["jp_merge_running"] = False
-    if "jp_merge_finished" not in st.session_state:
-        st.session_state["jp_merge_finished"] = False
     if "jp_merge_result_msg" not in st.session_state:
         st.session_state["jp_merge_result_msg"] = None
     if "jp_merge_success" not in st.session_state:
@@ -689,55 +684,44 @@ def render_jp_manual_merge_center(is_jp: bool):
     with col_m1:
         st.caption(f"※実行ボタンを押すと、Google Drive上の【{merge_tf}】時間足フォルダ直下の差分を一括統合マージします。")
     with col_m2:
-        btn_disabled = st.session_state["jp_merge_running"]
-        if st.button("🚀 マージを実行する", key="btn_execute_jp_manual_merge", type="primary", use_container_width=True, disabled=btn_disabled):
+        if st.button("🚀 マージを実行する", key="btn_execute_jp_manual_merge", type="primary", use_container_width=True):
             st.session_state["jp_merge_logs_list"] = []
-            st.session_state["jp_merge_running"] = True
-            st.session_state["jp_merge_finished"] = False
             st.session_state["jp_merge_result_msg"] = None
             st.session_state["jp_merge_success"] = False
-            st.rerun(scope="fragment")
 
-    if st.session_state["jp_merge_running"] and not st.session_state["jp_merge_finished"]:
-        status_box = st.status(f"🔄 【{merge_tf}】の上書き累積マージ処理を実行中...", expanded=True)
-        with status_box:
-            def on_status(msg):
-                st.session_state["jp_merge_logs_list"].append(msg)
-                st.write(msg)
+            status_box = st.status(f"🔄 【{merge_tf}】の上書き累積マージ処理を実行中...", expanded=True)
+            with status_box:
+                def on_status(msg):
+                    st.session_state["jp_merge_logs_list"].append(str(msg))
+                    st.write(msg)
+                    
+                result = execute_jp_merge(merge_tf, status_callback=on_status)
                 
-            result = execute_jp_merge(merge_tf, status_callback=on_status)
-            
-            st.session_state["jp_merge_finished"] = True
-            st.session_state["jp_merge_running"] = False
-            
-            if result.get("success"):
-                clear_local_parquet_cache(interval=merge_tf, is_jp=True)
-                st.cache_data.clear()
-                status_box.update(label="🎉 統合マージおよび不要差分ファイルの自動消去が正常に完了しました！", state="complete")
-                st.session_state["jp_merge_success"] = True
-                st.session_state["jp_merge_result_msg"] = result.get("message")
-            else:
-                status_box.update(label="❌ マージ処理中にエラーが発生しました", state="error")
-                st.session_state["jp_merge_success"] = False
-                st.session_state["jp_merge_result_msg"] = result.get("message")
-            
-            st.rerun(scope="fragment")
+                if result.get("success"):
+                    clear_local_parquet_cache(interval=merge_tf, is_jp=True)
+                    st.cache_data.clear()
+                    status_box.update(label="🎉 統合マージおよび不要差分ファイルの自動消去が正常に完了しました！", state="complete")
+                    st.session_state["jp_merge_success"] = True
+                    st.session_state["jp_merge_result_msg"] = result.get("message")
+                else:
+                    status_box.update(label="❌ マージ処理中にエラーが発生しました", state="error")
+                    st.session_state["jp_merge_success"] = False
+                    st.session_state["jp_merge_result_msg"] = result.get("message")
 
-    if st.session_state["jp_merge_finished"]:
+    if st.session_state["jp_merge_result_msg"]:
         if st.session_state["jp_merge_success"]:
             st.success(f"🎉 成功: {st.session_state['jp_merge_result_msg']}")
         else:
             st.error(f"❌ 失敗: {st.session_state['jp_merge_result_msg']}")
 
+    if st.session_state["jp_merge_logs_list"]:
         with st.expander("📝 実行ログ詳細", expanded=True):
             st.code("\n".join(st.session_state["jp_merge_logs_list"]), language="text")
-            
             if st.button("🗑️ ログを閉じてクリアする", key="btn_clear_jp_merge_logs", use_container_width=True):
                 st.session_state["jp_merge_logs_list"] = []
-                st.session_state["jp_merge_finished"] = False
                 st.session_state["jp_merge_result_msg"] = None
                 st.session_state["jp_merge_success"] = False
-                st.rerun(scope="fragment")
+                st.rerun()
 
 
 # ─── 🚀 日本株専用：統合段差スキャン・一括自動修復 ───
@@ -753,8 +737,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         "予定日の過去45日間におよぶ「面」のルックバック走査により、収集ズレや先回り調整された不整合（崖）も確実に見つけ出します。"
     )
 
-    if "jp_scan_is_running" not in st.session_state:
-        st.session_state["jp_scan_is_running"] = False
     if "jp_patch_run_logs" not in st.session_state:
         st.session_state["jp_patch_run_logs"] = []
 
@@ -769,45 +751,38 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
 
     col_btn1, col_btn2 = st.columns([3, 1])
     with col_btn1:
+        # 💡 ボタン押下時に直接スキャンを実行（無駄なst.rerunによるStreamlitAPIExceptionを根絶）
         if st.button(
             "🔍 日本株 統合段差スキャンを実行",
             key="btn_jp_split_scan",
             type="primary",
-            use_container_width=True,
-            disabled=st.session_state["jp_scan_is_running"]
+            use_container_width=True
         ):
             st.session_state["jp_split_scan_result"] = None
-            st.session_state["jp_scan_is_running"] = True
-            st.rerun(scope="fragment")
+            status_box = st.status("📡 日本株 統合段差スキャンを実行中...", expanded=True)
+            with status_box:
+                def on_scan_progress(msg):
+                    st.write(msg)
+
+                try:
+                    from core.jp_price_corrector import scan_jp_anomalies_with_yfinance
+                    scan_df = scan_jp_anomalies_with_yfinance(
+                        status_callback=on_scan_progress,
+                        force_reload=jp_scan_force_reload
+                    )
+                    st.session_state["jp_split_scan_result"] = scan_df
+                    status_box.update(label=f"🎉 スキャン完了！検出数: {len(scan_df)}件", state="complete")
+                except Exception as e:
+                    st.error(f"❌ スキャン中にエラーが発生しました: {e}")
+                    st.session_state["jp_split_scan_result"] = pd.DataFrame()
 
     with col_btn2:
         if st.session_state.get("jp_split_scan_result") is not None:
             if st.button("🗑️ 結果クリア", key="btn_clear_jp_scan", use_container_width=True):
                 st.session_state["jp_split_scan_result"] = None
-                st.rerun(scope="fragment")
+                st.rerun()
 
-    if st.session_state["jp_scan_is_running"]:
-        status_box = st.status("📡 日本株 統合段差スキャンを実行中...", expanded=True)
-        with status_box:
-            def on_scan_progress(msg):
-                st.write(msg)
-
-            try:
-                from core.jp_price_corrector import scan_jp_anomalies_with_yfinance
-                scan_df = scan_jp_anomalies_with_yfinance(
-                    status_callback=on_scan_progress,
-                    force_reload=jp_scan_force_reload
-                )
-                st.session_state["jp_split_scan_result"] = scan_df
-                status_box.update(label="🎉 スキャン完了！", state="complete")
-            except Exception as e:
-                st.error(f"❌ スキャン中にエラーが発生しました: {e}")
-                st.session_state["jp_split_scan_result"] = pd.DataFrame()
-            finally:
-                st.session_state["jp_scan_is_running"] = False
-
-        st.rerun(scope="fragment")
-
+    # 💡 スキャン結果が存在する場合のみテーブルを展開
     result_df = st.session_state.get("jp_split_scan_result")
     if result_df is None:
         return
@@ -922,7 +897,7 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
             st.code("\n".join(st.session_state["jp_patch_run_logs"]), language="text")
             if st.button("🗑️ 実行ログを閉じる", key="btn_clear_jp_patch_logs", use_container_width=True):
                 st.session_state["jp_patch_run_logs"] = []
-                st.rerun(scope="fragment")
+                st.rerun()
 
 
 @st.fragment
