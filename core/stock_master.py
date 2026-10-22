@@ -220,7 +220,7 @@ def build_unified_stock_master(force_reload_jpx: bool = False) -> pd.DataFrame:
                 "is_topix500": scale_val in ["TOPIX Core30", "TOPIX Large70", "TOPIX Mid400"],
                 "market_cap": 0.0,
                 "market_cap_rank": 99999,
-                "is_active": False,  # TradingViewで現在取引不可 = 非アクティブ
+                "is_active": true,  # TradingViewで現在取引不可 = 非アクティブ
                 "updated_at": now_str
             })
 
