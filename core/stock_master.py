@@ -259,35 +259,46 @@ def load_stock_master_from_sheets() -> pd.DataFrame:
 
 
 def get_stock_master(force_reload: bool = False) -> pd.DataFrame:
-    """
-    💡【改善】メモリキャッシュ ➔ ローカルParquet ➔ Google Sheets ➔ 再構築 の4段階フォールバック
-    クラウド（Streamlit）で更新されたマスターをローカルPCが確実に同期します。
-    """
     global _STOCK_MASTER_MEMORY_CACHE, _STOCK_MASTER_CACHE_TIME
 
     now = time.time()
-    if not force_reload and _STOCK_MASTER_MEMORY_CACHE is not None and (now - _STOCK_MASTER_CACHE_TIME < CACHE_TTL_SECONDS):
-        return _STOCK_MASTER_MEMORY_CACHE.copy()
+    print(f"\n    📂 [DEBUG_STOCK_MASTER] get_stock_master 呼出 (force_reload={force_reload})")
 
     local_path = os.path.join(settings.WORK_DIR, PARQUET_FILE_NAME)
+    if os.path.exists(local_path):
+        mtime = os.path.getmtime(local_path)
+        age_sec = now - mtime
+        mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"    📂 [DEBUG_STOCK_MASTER] ローカルParquetファイル存在: {local_path}")
+        print(f"        作成/更新日時: {mtime_str} ({age_sec:.1f} 秒前 / TTL制限: {CACHE_TTL_SECONDS} 秒)")
+    else:
+        print(f"    📂 [DEBUG_STOCK_MASTER] ローカルParquetファイルは存在しません: {local_path}")
 
-    # 1. ローカルParquetの有効期限チェック
+    # 1. メモリキャッシュ
+    if not force_reload and _STOCK_MASTER_MEMORY_CACHE is not None and (now - _STOCK_MASTER_CACHE_TIME < CACHE_TTL_SECONDS):
+        print("    👉 [DEBUG_STOCK_MASTER] 採用ルート: メモリキャッシュ")
+        return _STOCK_MASTER_MEMORY_CACHE.copy()
+
+    # 2. ローカルParquet
     if not force_reload and os.path.exists(local_path):
         try:
             file_age = now - os.path.getmtime(local_path)
             if file_age < CACHE_TTL_SECONDS:
                 df = pd.read_parquet(local_path)
                 if not df.empty:
+                    print(f"    👉 [DEBUG_STOCK_MASTER] 採用ルート: 有効期限内のローカルParquetファイル (行数: {len(df):,})")
                     _STOCK_MASTER_MEMORY_CACHE = df.copy()
                     _STOCK_MASTER_CACHE_TIME = now
                     return df
-        except Exception:
-            pass
+        except Exception as e_p:
+            print(f"    ⚠️ [DEBUG_STOCK_MASTER] Parquet読込失敗: {e_p}")
 
-    # 2. 💡 クラウド（Google Sheets）からのフェッチを最優先試行
+    # 3. Google Sheets からのフェッチ
     if not force_reload:
+        print("    🔎 [DEBUG_STOCK_MASTER] Google Sheets (stock_master) からの直接フェッチを試行中...")
         df_sheets = load_stock_master_from_sheets()
         if not df_sheets.empty and len(df_sheets) >= 3000:
+            print(f"    👉 [DEBUG_STOCK_MASTER] 採用ルート: Google Sheets (行数: {len(df_sheets):,})")
             try:
                 os.makedirs(settings.WORK_DIR, exist_ok=True)
                 df_sheets.to_parquet(local_path, index=False, compression="SNAPPY")
@@ -295,11 +306,14 @@ def get_stock_master(force_reload: bool = False) -> pd.DataFrame:
                 pass
             _STOCK_MASTER_MEMORY_CACHE = df_sheets.copy()
             _STOCK_MASTER_CACHE_TIME = now
-            print(f"☁️ [stock_master] Google Sheetsから最新の統合マスターを同期ロードしました ({len(df_sheets)}件)")
             return df_sheets
+        else:
+            print(f"    ⚠️ [DEBUG_STOCK_MASTER] Google Sheets のデータが空または不足: {len(df_sheets)} 行")
 
-    # 3. どちらも無ければフル再構築
+    # 4. 新規再構築
+    print("    🔨 [DEBUG_STOCK_MASTER] 採用ルート: sync_stock_master_to_storage() 新規フル再構築を実行")
     success, msg = sync_stock_master_to_storage(force_reload_jpx=force_reload)
+    print(f"    🔨 [DEBUG_STOCK_MASTER] フル再構築完了: success={success}, msg={msg}")
     if _STOCK_MASTER_MEMORY_CACHE is not None:
         return _STOCK_MASTER_MEMORY_CACHE.copy()
 

@@ -211,14 +211,39 @@ def _read_excel_safely(file_path_or_bytes) -> pd.DataFrame:
 def get_jpx_truly_all_symbols() -> set:
     """
     東証に上場している【すべての個別株＋全ETF・ETN】の銘柄コードをSet形式で返します。
-    自律型統合マスター（stock_master）の is_active == True な銘柄コードを直接返します。
     """
     try:
         from core.stock_master import get_stock_master
+        print("\n  🔎 [DEBUG_COLLECTOR] get_stock_master() を呼び出します...")
         df_master = get_stock_master()
-        if not df_master.empty and "is_active" in df_master.columns and "symbol" in df_master.columns:
-            active_symbols = df_master[df_master["is_active"] == True]["symbol"].dropna().astype(str).str.strip().str.upper()
+        print(f"  🔎 [DEBUG_COLLECTOR] df_master ロード完了: 総行数={len(df_master):,} 件, カラム={list(df_master.columns)}")
+
+        if not df_master.empty and "symbol" in df_master.columns:
+            # 💡 1329 と 1348 の実態を直接ピンポイント調査
+            for test_code in ["1329", "1348"]:
+                match = df_master[df_master["symbol"].astype(str).str.strip().str.upper() == test_code]
+                if not match.empty:
+                    row_dict = match.iloc[0].to_dict()
+                    is_act_val = row_dict.get("is_active")
+                    print(f"  🔎 [DEBUG_COLLECTOR] 銘柄 [{test_code}] をマスタ内で発見: is_active={is_act_val} (データ型: {type(is_act_val).__name__})")
+                    print(f"      詳細行データ: {row_dict}")
+                else:
+                    print(f"  🚨 [DEBUG_COLLECTOR] 銘柄 [{test_code}] はマスタ内に存在しません（0件）！")
+
+            # 💡 文字列('TRUE', 'True', '1')とブール値(True)の型不一致を両対応で吸収
+            if "is_active" in df_master.columns:
+                act_mask = (
+                    df_master["is_active"].astype(str).str.upper().isin(["TRUE", "1", "YES"])
+                ) | (df_master["is_active"] == True)
+                active_symbols = df_master[act_mask]["symbol"].dropna().astype(str).str.strip().str.upper()
+            else:
+                active_symbols = df_master["symbol"].dropna().astype(str).str.strip().str.upper()
+
             res_set = set(active_symbols[active_symbols.str.isalnum()])
+            print(f"  🔎 [DEBUG_COLLECTOR] アクティブ判定を通過した総銘柄数: {len(res_set):,} 件")
+            for test_code in ["1329", "1348"]:
+                print(f"  🔎 [DEBUG_COLLECTOR] 最終返却セットに [{test_code}] は含まれているか? ➔ {test_code in res_set}")
+
             if res_set:
                 return res_set
     except Exception as ex:
