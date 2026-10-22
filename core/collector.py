@@ -1,4 +1,5 @@
 # core/collector.py
+
 import os
 import json
 import requests
@@ -167,7 +168,7 @@ def get_download_symbol(ticker: str, is_jp: bool = True) -> str:
     return pure_ticker
 
 def _download_jpx_file(save_path: str) -> bool:
-    """JPX公式Excelをブラウザ偽装ヘッダー付きでダウンロードします（詳細デバッグログ付き）。"""
+    """JPX公式Excelをブラウザ偽装ヘッダー付きでダウンロードします。"""
     import traceback
 
     headers = {
@@ -176,43 +177,20 @@ def _download_jpx_file(save_path: str) -> bool:
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
     }
     url = settings.JPX_URL
-    print(f"[DEBUG] [JPX_DL] ダウンロード要求送信: {url}")
-    print(f"[DEBUG] [JPX_DL] 保存先パス: {save_path}")
-
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         status = resp.status_code
         content_len = len(resp.content) if resp.content else 0
-        content_type = resp.headers.get("Content-Type", "unknown")
-        
-        print(f"[DEBUG] [JPX_DL] HTTPステータス: {status}, Content-Type: {content_type}, サイズ: {content_len:,} bytes")
 
-        if status != 200:
-            print(f"❌ [JPX_DL] HTTPエラー返却: status={status}")
-            if content_len > 0:
-                print(f"   ↳ レスポンス抜粋: {resp.text[:300]}")
-            return False
-
-        if content_len < 10000:
-            print(f"⚠️ [JPX_DL] ファイルサイズが小さすぎます ({content_len:,} bytes < 10KB)。")
-            print(f"   ↳ 返却内容（HTMLエラーページの可能性）: {resp.text[:300]}")
+        if status != 200 or content_len < 10000:
             return False
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         with open(save_path, "wb") as f:
             f.write(resp.content)
-        print(f"✅ [JPX_DL] ダウンロードおよび保存成功 ({content_len:,} bytes): {save_path}")
         return True
 
-    except requests.exceptions.Timeout:
-        print("❌ [JPX_DL] 接続タイムアウト (15秒経過)")
-        return False
-    except requests.exceptions.RequestException as e_req:
-        print(f"❌ [JPX_DL] 通信エラー: {e_req}")
-        return False
-    except Exception as e:
-        print(f"❌ [JPX_DL] 予期しない例外が発生しました: {e}")
-        print(traceback.format_exc())
+    except Exception:
         return False
 
 def _read_excel_safely(file_path_or_bytes) -> pd.DataFrame:
@@ -226,13 +204,28 @@ def _read_excel_safely(file_path_or_bytes) -> pd.DataFrame:
             continue
     return pd.DataFrame()
 
+# =====================================================================
+# 🚀 【改修】統合マスター (stock_master) 連携関数群
+# =====================================================================
+
 def get_jpx_truly_all_symbols() -> set:
     """
-    東証に上場している【すべての個別株（プライム/スタンダード/グロース）＋全ETF・ETN】
-    の銘柄コードをSet形式で返します。市場区分や規模区分のフィルターは一切適用しません。
+    東証に上場している【すべての個別株＋全ETF・ETN】の銘柄コードをSet形式で返します。
+    自律型統合マスター（stock_master）の is_active == True な銘柄コードを直接返します。
     """
+    try:
+        from core.stock_master import get_stock_master
+        df_master = get_stock_master()
+        if not df_master.empty and "is_active" in df_master.columns and "symbol" in df_master.columns:
+            active_symbols = df_master[df_master["is_active"] == True]["symbol"].dropna().astype(str).str.strip().str.upper()
+            res_set = set(active_symbols[active_symbols.str.isalnum()])
+            if res_set:
+                return res_set
+    except Exception as ex:
+        print(f"⚠️ [collector] stock_masterからのアクティブ銘柄取得失敗、ファイルへフォールバック: {ex}")
+
+    # フォールバック（従来処理）
     jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xlsx")
-    
     if not os.path.exists(jpx_save_path) or os.path.getsize(jpx_save_path) < 10000:
         _download_jpx_file(jpx_save_path)
 
@@ -240,9 +233,7 @@ def get_jpx_truly_all_symbols() -> set:
     if df_full.empty or df_full.shape[1] < 2:
         return set()
 
-    # 第1列（銘柄コード列）をフィルターなしで全行抽出
     code_series = df_full.iloc[:, 1].dropna().astype(str).str.strip()
-    
     clean_codes = set()
     for c in code_series:
         code_clean = c.split(".")[0].upper()
@@ -252,7 +243,23 @@ def get_jpx_truly_all_symbols() -> set:
     return clean_codes
 
 def get_topix500_tickers() -> list:
-    """JPX公式ExcelからTOPIX500（Core/Large/Mid）の株式コードを取得します。"""
+    """
+    TOPIX500（Core/Large/Mid）の株式コードを取得します。
+    統合マスター（stock_master）から is_topix500 == True かつ is_active == True な銘柄を返します。
+    """
+    try:
+        from core.stock_master import get_stock_master
+        df_master = get_stock_master()
+        if not df_master.empty and "is_topix500" in df_master.columns:
+            active_mask = (df_master["is_active"] == True) if "is_active" in df_master.columns else True
+            topix_df = df_master[(df_master["is_topix500"] == True) & active_mask]
+            codes = topix_df["symbol"].dropna().astype(str).str.strip().str.upper().tolist()
+            if codes:
+                return [c for c in codes if c.isalnum()]
+    except Exception as ex:
+        print(f"⚠️ [collector] stock_masterからのTOPIX500取得失敗、ファイルへフォールバック: {ex}")
+
+    # フォールバック（従来処理）
     cache_path = os.path.join(settings.WORK_DIR, "jpx_ticker_cache.json")
     today_str = datetime.now().strftime("%Y-%m-%d")
     if os.path.exists(cache_path):
@@ -286,36 +293,44 @@ def get_topix500_tickers() -> list:
     return []
 
 def get_jpx_scale_map() -> dict:
-    """JPXのキャッシュファイルから {銘柄コード: 規模区分} の辞書を構築します。"""
+    """
+    {銘柄コード: 規模区分} の辞書を構築します。
+    統合マスター（stock_master）から即時取得します。
+    """
+    try:
+        from core.stock_master import get_stock_master
+        df_master = get_stock_master()
+        if not df_master.empty and "symbol" in df_master.columns and "scale_type" in df_master.columns:
+            scale_map = dict(zip(
+                df_master["symbol"].dropna().astype(str).str.strip().str.upper(),
+                df_master["scale_type"].dropna().astype(str).str.strip()
+            ))
+            if scale_map:
+                return scale_map
+    except Exception as ex:
+        print(f"⚠️ [collector] stock_masterからの規模区分取得失敗、ファイルへフォールバック: {ex}")
+
+    # フォールバック（従来処理）
     jpx_save_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xlsx")
-    
     file_exists = os.path.exists(jpx_save_path)
     file_size = os.path.getsize(jpx_save_path) if file_exists else 0
-    print(f"[DEBUG] [JPX_SCALE] キャッシュ確認: 存在={file_exists}, サイズ={file_size:,} bytes, パス={jpx_save_path}")
 
     if not file_exists or file_size < 10000:
-        print("📥 JPX銘柄リストが存在しないか破損しているため、新規ダウンロードします...")
         success = _download_jpx_file(jpx_save_path)
         if not success:
-            print("⚠️ [get_jpx_scale_map] JPXリストのダウンロードに失敗しました。")
             return {}
 
     df_full = _read_excel_safely(jpx_save_path)
     if df_full.empty:
-        print("❌ [get_jpx_scale_map] Excelファイルの読み込み結果が空(Empty)でした。")
         return {}
 
-    print(f"[DEBUG] [JPX_SCALE] Excel読み込み成功: 形状={df_full.shape}")
     if df_full.shape[1] >= 10:
         df_scale = df_full.iloc[:, [1, 9]].copy()
         df_scale.columns = ['symbol', 'scale_type']
         df_scale['symbol'] = df_scale['symbol'].astype(str).str.strip().str.split('.').str[0]
         df_scale['scale_type'] = df_scale['scale_type'].astype(str).str.strip()
-        result_map = dict(zip(df_scale['symbol'], df_scale['scale_type']))
-        print(f"✅ [get_jpx_scale_map] 規模区分マッピング生成完了: {len(result_map):,} 件")
-        return result_map
+        return dict(zip(df_scale['symbol'], df_scale['scale_type']))
         
-    print(f"⚠️ [get_jpx_scale_map] 列数が不足しています (列数: {df_full.shape[1]} < 10)")
     return {}
 
 def get_extra_tickers() -> list:
@@ -325,6 +340,7 @@ def sync_extra_tickers_to_local() -> tuple:
     return [], None
 
 def get_all_collection_tickers() -> list:
+    """収集対象となる全銘柄（TOPIX500 ＋ sector_JP構成銘柄）を返します。"""
     from data_access.sheets_api import get_sector_spreadsheet
     topix = get_topix500_tickers()
     sector_tickers = []
@@ -355,17 +371,11 @@ def get_all_collection_tickers() -> list:
     cleaned = []
     seen = set()
     for t in merged:
-        t_clean = str(t).strip()
+        t_clean = str(t).strip().upper()
         if t_clean and t_clean not in seen:
             seen.add(t_clean)
             cleaned.append(t_clean)
     return cleaned
 
 def load_tickers_from_file(file_path: str) -> list:
-    possible_paths = [
-        file_path,
-        os.path.join("/content/drive/MyDrive", file_path),
-        os.path.join("/content/drive/MyDrive/stock_data_hub", file_path),
-        os.path.join(os.getcwd(), file_path)
-    ]
     return []

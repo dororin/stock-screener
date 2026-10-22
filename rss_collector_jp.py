@@ -34,7 +34,7 @@ from data_access.sheets_api import (
     load_holdings_from_sheets,
     upload_sync_log_to_drive
 )
-# 💡 分離した保有株収集コア関数をインポート
+# 分離した保有株収集コア関数をインポート
 from sync_holdings_jp import collect_and_save_holdings
 
 # ─── データ収集の設定パラメータ ───
@@ -117,14 +117,14 @@ def load_all_collection_tickers_from_sheets() -> list:
     try:
         sector_master = load_sector_master_from_sheets(is_jp=True)
         for sname, t_list in sector_master.items():
-            for t in t_list: tickers.add(str(t).strip())
+            for t in t_list: tickers.add(str(t).strip().upper())
     except Exception as e:
         print(f"  ⚠️ sector_JPシートの読み込みスキップ: {e}")
 
     try:
         extra_df = load_extra_tickers_from_sheets()
         if not extra_df.empty:
-            for t in extra_df["銘柄コード"].dropna(): tickers.add(str(t).strip())
+            for t in extra_df["銘柄コード"].dropna(): tickers.add(str(t).strip().upper())
     except Exception as e:
         print(f"  ⚠️ extra_tickersシートの読み込みスキップ: {e}")
 
@@ -134,21 +134,21 @@ def load_all_collection_tickers_from_sheets() -> list:
             ws_topix = sh.worksheet("topix500")
             records = ws_topix.get_all_records()
             for r in records:
-                code = str(r.get("銘柄コード", "")).strip()
+                code = str(r.get("銘柄コード", "")).strip().upper()
                 if code: tickers.add(code)
     except Exception as e:
         print(f"  ⚠️ topix500シートの読み込みスキップ: {e}")
 
-    # 保有銘柄シート（my_holdings）の銘柄コードも監視対象へ合流（チャート確実描画用）
+    # 保有銘柄シート（my_holdings）の銘柄コードも監視対象へ合流
     try:
         holdings_df = load_holdings_from_sheets()
         if not holdings_df.empty and "銘柄コード" in holdings_df.columns:
             for t in holdings_df["銘柄コード"].dropna():
-                tickers.add(str(t).strip())
+                tickers.add(str(t).strip().upper())
     except Exception as e:
         print(f"  ⚠️ my_holdingsシートの読み込みスキップ: {e}")
 
-    cleaned_list = sorted(list(tickers))
+    cleaned_list = sorted([t for t in tickers if t and t.isalnum()])
     print(f"  ✅ 監視ティッカーの統合マージ完了。総計: {len(cleaned_list)} 銘柄")
     return cleaned_list
 
@@ -373,6 +373,7 @@ def collect_data_via_excel_rss(tickers: list, interval: str, limit_bars: int, lo
                 if unloaded_tickers:
                     log_func(f"      ⏳ ロード未完了（待機中）: 残り {len(unloaded_tickers)} / {len(chunk)} 銘柄 {unloaded_tickers[:10]}...")
 
+                # 💡【柱4：フェイルファスト設計の維持】タイムアウト時は例外を送出し、無応答銘柄を検知
                 if elapsed > timeout:
                     raise TimeoutError(
                         f"バッチ {batch_num} のデータ展開が制限時間（{timeout}秒）内に完了しませんでした。\n"
@@ -485,7 +486,8 @@ def main():
             log("❌ 収集対象の銘柄が1件も存在しないため、終了します。")
             return
 
-        # ── 💡【新設】東証全上場商品マスタ（全個別株＋全ETF・ETN）による事前バリデーション（水際対策） ──
+        # ── 💡【自律型統合マスター（stock_master）による事前バリデーション（水際対策）】 ──
+        # ※新上場銘柄（642A等）もTradingView即時照合により正常に通過
         from core.collector import get_jpx_truly_all_symbols
         jpx_active_set = get_jpx_truly_all_symbols()
 
@@ -493,10 +495,10 @@ def main():
             tickers = [t for t in raw_tickers if t in jpx_active_set]
             invalid_tickers = [t for t in raw_tickers if t not in jpx_active_set]
             if invalid_tickers:
-                log(f"⚠️ 【上場廃止事前検知】以下の銘柄は東証上場マスタに存在しないため、リクエストから除外しました: {invalid_tickers}")
+                log(f"⚠️ 【上場廃止事前検知】以下の銘柄はアクティブ上場マスタに存在しないため除外しました: {invalid_tickers}")
             log(f"  🎯 事前バリデーション通過: {len(tickers):,} 銘柄（上場廃止除外: {len(invalid_tickers)} 銘柄）")
         else:
-            log("⚠️ JPX全上場マスタが取得できなかったため、シートの全銘柄をそのまま使用します。")
+            log("⚠️ 上場アクティブマスタが取得できなかったため、シートの全銘柄をそのまま使用します。")
             tickers = raw_tickers
 
         excel = None
@@ -555,7 +557,7 @@ def main():
                 pass
         wb = None
 
-        # 3. 💡 株価収集完了後、既存のExcel接続を再利用して保有株を一括同期！
+        # 3. 株価収集完了後、保有株を一括同期
         log("\n💼 続いて、保有銘柄（my_holdings）の自動同期を実行します...")
         collect_and_save_holdings(excel=excel, log_func=log)
 

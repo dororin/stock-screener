@@ -10,17 +10,26 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from config import settings
 from data_access.local_db import (
     load_price_db, 
     save_price_db, 
-    clear_local_parquet_cache
+    clear_local_parquet_cache,
+    load_price_db_ledger,
+    save_price_db_ledger
 )
 from data_access.drive_api import (
     download_from_drive_api, 
     upload_to_drive_api, 
     get_or_create_drive_folder, 
     get_drive_service
+)
+from data_access.sheets_api import (
+    get_sector_spreadsheet,
+    save_repair_log_to_sheets
 )
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -428,7 +437,6 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
     idx = _find_cliff_reverse(rows, min_R, max_R, max_gap_days=15)
 
     if idx == -1:
-        # 💡 下位足に段差がない場合は修復不要なので mode=None でスキップ
         return {"mode": None, "actual_dt": None, "cliff_dt": None,
                 "before_close": np.nan, "after_close": np.nan, "verify": {"yf_close": None, "deviation_pct": None, "passed": True},
                 "status": "[正常分割（段差未検出＝調整済み）]"}
@@ -440,7 +448,6 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
     before_close = row_prev["close"]
     after_close = row_T["close"]
 
-    # 重複判定
     mult_T = row_T["patched_multiplier"]
     mult_prev = row_prev["patched_multiplier"]
     if mult_T > 0 and abs((mult_prev / mult_T) - 1.0) > 0.15:
@@ -481,7 +488,6 @@ def _scan_intraday_cliff(ticker: str, interval: str, ex_date, actual_day_dt, s_v
 def scan_jp_anomalies_with_yfinance(status_callback=None, force_reload: bool = False) -> pd.DataFrame:
     """
     日本株の株式分割段差スキャンを実行します。
-    force_reload=True の場合、Google Driveから最新の日足データを強制ダウンロードして検査します。
     """
     def log(msg, level="info", exc=False):
         _emit(status_callback, msg, level=level, exc=exc)
@@ -597,7 +603,6 @@ def scan_jp_anomalies_with_yfinance(status_callback=None, force_reload: bool = F
 
             M = 1.0 / s_val
 
-            # パッチ適用済みチェック
             check_idx = detected_idx if detected_idx != -1 else ex_date_idx
             check_prev_idx = max(0, check_idx - 1)
             mult_T = df_ticker.loc[check_idx, "patched_multiplier"]
@@ -640,11 +645,9 @@ def scan_jp_anomalies_with_yfinance(status_callback=None, force_reload: bool = F
                 else:
                     status_label = "[要確認：分割説明ギャップ乖離疑い]"
             else:
-                # 💡 段差が検出されなかった（すでに解消済み・正常分割）の場合は mode=None としてスキップ
                 mode = None
                 status_label = "[正常分割]"
 
-            # 💡 実際に価格に段差が存在する「要パッチ」のデータのみテーブルに追加
             if mode == "要パッチ":
                 results.append({
                     "ticker": ticker,
@@ -664,7 +667,6 @@ def scan_jp_anomalies_with_yfinance(status_callback=None, force_reload: bool = F
                     "is_selectable": True,
                 })
 
-                # 下位時間足の走査
                 if detected_idx != -1:
                     for tf in INTRADAY_TIMEFRAMES:
                         log(f"  🔬 [{ticker}] {tf} 足の段差オートフォーカス走査中...", level="info")
@@ -684,7 +686,6 @@ def scan_jp_anomalies_with_yfinance(status_callback=None, force_reload: bool = F
                             log(f"  ❌ [{ticker}] {tf} 足のオートフォーカス走査中に予期しない例外: {e}", level="error", exc=True)
                             continue
 
-                        # 💡 下位足でも「要パッチ」のもののみ追加
                         if tf_result.get("mode") != "要パッチ":
                             continue
 
@@ -723,7 +724,6 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
         _emit(status_callback, msg, level=level, exc=exc)
 
     logger.debug(f"apply_jp_patch_to_all_timeframes: 開始 ticker={ticker}, patch_rows件数={len(patch_rows)}")
-    logger.debug(f"apply_jp_patch_to_all_timeframes: patch_rows内容={patch_rows}")
 
     patches_by_interval = {}
     for row in patch_rows:
@@ -742,7 +742,6 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
     for interval in timeframes:
         patch = patches_by_interval.get(interval)
         if not patch:
-            logger.debug(f"interval={interval}: 承認済みパッチが無いためスキップ")
             continue
 
         log(f"⏱️ 【日本株 {interval}】パッチ適用処理中...", level="info")
@@ -752,31 +751,25 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
         cliff_date = patch.get("cliff_date")
         actual_date = patch.get("actual_date")
 
-        # 💡【境界日時設定】新スケール開始日時（actual_date）を最優先境界とする
         if actual_date:
             boundary_dt = pd.to_datetime(actual_date)
         elif cliff_date:
             boundary_dt = pd.to_datetime(cliff_date)
         else:
-            logger.error(f"interval={interval}: 日時情報が存在しません。スキップします。")
             continue
 
         boundary_year = boundary_dt.year
         boundary_month = boundary_dt.month
-        logger.debug(f"interval={interval}: boundary_dt={boundary_dt}, multiplier={multiplier}, mode={mode}")
 
         try:
             tf_folder_id = get_or_create_drive_folder(interval, settings.FOLDER_ID)
-            logger.debug(f"interval={interval}: Driveフォルダ取得 tf_folder_id={tf_folder_id}")
             service = get_drive_service()
             if not service:
                 raise ConnectionError("Google Driveサービスにアクセスできません。")
 
             query = f"'{tf_folder_id}' in parents and name contains 'price_jp_' and name contains '.parquet' and not name contains '_diff_' and trashed=false"
-            logger.debug(f"interval={interval}: Drive files().list query={query}")
             drive_results = service.files().list(q=query, fields="files(id, name)").execute()
             base_files = drive_results.get('files', [])
-            logger.debug(f"interval={interval}: 対象候補ファイル {len(base_files)}件 -> {[f['name'] for f in base_files]}")
 
             applied_files_count = 0
 
@@ -817,29 +810,20 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                             conditional_records = True
 
                 if not should_process:
-                    logger.debug(f"  file={b_name}: 対象外のためスキップ")
                     continue
 
-                logger.debug(f"  file={b_name}: 処理対象 (all_records={all_records}, conditional_records={conditional_records})")
-
                 local_path = os.path.join(settings.WORK_DIR, b_name)
-                t_dl = time.time()
                 dl_success = download_from_drive_api(b_name, local_path, parent_id=tf_folder_id)
-                logger.debug(f"  file={b_name}: ダウンロード{'成功' if dl_success else '失敗'} ({time.time() - t_dl:.2f}秒)")
                 if not dl_success or not os.path.exists(local_path):
                     log(f"  ⚠️ ファイル {b_name} のダウンロードに失敗しました。", level="warning")
                     continue
 
                 try:
-                    import pyarrow as pa
-                    import pyarrow.parquet as pq
                     df = pd.read_parquet(local_path)
                     if df.empty:
-                        logger.debug(f"  file={b_name}: 読み込んだデータフレームが空のためスキップ")
                         continue
 
                     original_row_count = len(df)
-                    logger.debug(f"  file={b_name}: 読み込み完了 {original_row_count}行, columns={list(df.columns)}")
 
                     if "patched_multiplier" not in df.columns:
                         df["patched_multiplier"] = 1.0
@@ -850,7 +834,6 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                     except Exception:
                         pass
 
-                    # 💡 actual_date があれば `< boundary_dt`、cliff_date だけなら `<= boundary_dt`
                     if all_records:
                         mask = (df["ticker"] == ticker)
                     elif conditional_records:
@@ -861,25 +844,19 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                     else:
                         mask = pd.Series([False] * len(df))
 
-                    n_affected_preview = int(mask.sum())
-                    logger.debug(f"  file={b_name}: マスク対象レコード数={n_affected_preview}")
-
                     if mask.any():
                         n_affected = int(mask.sum())
 
                         if mode == "要パッチ":
                             price_cols = [c for c in ["open", "high", "low", "close"] if c in df.columns]
-                            logger.debug(f"  file={b_name}: 価格列を multiplier={multiplier} で書き換え中 (対象列={price_cols})")
                             for col in price_cols:
                                 df.loc[mask, col] = df.loc[mask, col] * multiplier
                             if "volume" in df.columns:
                                 df.loc[mask, "volume"] = df.loc[mask, "volume"] / multiplier
-                        else:
-                            logger.debug(f"  file={b_name}: mode={mode} のため価格・出来高は書き換えず、メタデータのみ更新")
 
                         df.loc[mask, "patched_multiplier"] = df.loc[mask, "patched_multiplier"] * multiplier
 
-                        # ── インメモリ健全性アサーション検証 ──
+                        # 健全性検証
                         health_ok = True
                         health_reason = ""
                         if df.empty:
@@ -902,10 +879,8 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                                 health_ok = False
                                 health_reason = "close列に0以下の不正な価格が混入しました。"
 
-                        logger.debug(f"  file={b_name}: 健全性検証結果 health_ok={health_ok} reason='{health_reason}'")
-
                         if not health_ok:
-                            log(f"  🛑 [安全ロック] {b_name} の健全性検証に失敗したため、保存・アップロードを中断しました: {health_reason}", level="error")
+                            log(f"  🛑 [安全ロック] {b_name} の健全性検証に失敗したため中断: {health_reason}", level="error")
                             if os.path.exists(local_path):
                                 os.remove(local_path)
                             continue
@@ -913,11 +888,8 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                         df_cleaned = df.drop(columns=["date_dt"], errors="ignore")
                         table = pa.Table.from_pandas(df_cleaned, preserve_index=False)
                         pq.write_table(table, local_path, use_dictionary=False, compression="SNAPPY")
-                        logger.debug(f"  file={b_name}: ローカルParquet再書き出し完了")
 
-                        t_up = time.time()
                         up_success, up_msg = upload_to_drive_api(b_name, local_path, parent_id=tf_folder_id)
-                        logger.debug(f"  file={b_name}: アップロード{'成功' if up_success else '失敗'} ({time.time() - t_up:.2f}秒) msg={up_msg}")
                         if up_success:
                             applied_files_count += 1
                             log(f"  ✅ パッチ適用完了 ({b_name} | 対象: {n_affected:,}件)", level="info")
@@ -937,8 +909,6 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                             })
                         else:
                             log(f"  ❌ アップロード同期失敗 ({b_name}): {up_msg}", level="error")
-                    else:
-                        logger.debug(f"  file={b_name}: マスク該当レコードが0件のため書き換えなし")
 
                     if os.path.exists(local_path):
                         os.remove(local_path)
@@ -950,8 +920,6 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
                     continue
 
             results[interval] = f"正常に修復 ({applied_files_count}件)"
-            logger.debug(f"interval={interval}: 完了。適用ファイル数={applied_files_count}")
-
             clear_local_parquet_cache(interval=interval, is_jp=True)
 
         except Exception as e:
@@ -959,26 +927,233 @@ def apply_jp_patch_to_all_timeframes(ticker: str, patch_rows: list, status_callb
             log(f"❌ 【{interval}】 一括書き換え適用失敗: {e}", level="error", exc=True)
 
     if repair_log_rows:
-        logger.debug(f"repair_log 書き込み対象: {repair_log_rows}")
         try:
-            from data_access.sheets_api import save_repair_log_to_sheets
             saved = save_repair_log_to_sheets(repair_log_rows)
             if saved:
                 log(f"📝 repair_log シートへ {len(repair_log_rows)} 件の監査ログを記録しました。", level="info")
-            else:
-                log("⚠️ repair_log シートへの記録に失敗しました（スプレッドシート接続を確認してください）。", level="warning")
         except Exception as e:
             log(f"⚠️ repair_log 記録中に例外が発生しました: {e}", level="error", exc=True)
 
-    # 💡 パッチ適用後はキャッシュクリアのみ行い、rerunはUI側に委ねる（st.rerun()の削除）
     try:
         import streamlit as st
         if hasattr(st, "cache_data"):
             st.cache_data.clear()
-            logger.debug("st.cache_data.clear() を実行しました。")
     except Exception:
         pass
 
     elapsed = time.time() - run_started_at
     logger.debug(f"apply_jp_patch_to_all_timeframes: 終了 ticker={ticker}, 所要時間={elapsed:.2f}秒, results={results}")
     return results
+
+# =====================================================================
+# 🚀 【新設】銘柄コード・過去データ継承バックエンドエンジン
+# =====================================================================
+def execute_ticker_migration(
+    old_ticker: str, 
+    new_ticker: str, 
+    ratio: float = 1.0, 
+    status_callback=None
+) -> dict:
+    """
+    単独株式移転・持株会社化に伴い、旧銘柄の全時間足過去データを新銘柄へ安全に合流・継承します。
+    
+    1. 入力値バリデーション (old != new, ratio > 0)
+    2. 全時間足 (1d, 60m, 5m, 1m) のParquetファイルを巡回・合流
+    3. 台帳 (ledger_jp_*.json) のキー引き継ぎ
+    4. Google Sheets ('topix500', 'sector_JP', 'extra_tickers', 'watchlist', 'my_holdings') の置換
+    5. repair_log への監査ログ自動記録
+    6. キャッシュ全クリア
+    """
+    def log(msg, level="info"):
+        _emit(status_callback, msg, level=level)
+
+    old_t = str(old_ticker).strip().upper()
+    new_t = str(new_ticker).strip().upper()
+
+    if not old_t or not new_t:
+        return {"success": False, "message": "旧コードおよび新コードを両方指定してください。"}
+    if old_t == new_t:
+        return {"success": False, "message": "旧コードと新コードに同一のコードは指定できません。"}
+    if ratio <= 0.0:
+        return {"success": False, "message": "割当比率には 0 より大きい数値を指定してください。"}
+
+    log(f"🔄 銘柄データ継承セッション開始: [{old_t}] ➔ [{new_t}] (割当比率: {ratio})")
+    timeframes = ["1d", "60m", "5m", "1m"]
+
+    migrated_files_count = 0
+    total_migrated_records = 0
+
+    # 割当比率に応じた過去株価の乗算倍率 (新株価 = 旧株価 / ratio なので、倍率は 1.0 / ratio)
+    scale_multiplier = 1.0 / ratio
+
+    # ── 1. 全時間足Parquetファイルの巡回とデータ合流 ──
+    for interval in timeframes:
+        log(f"⏱️ 【{interval}】Parquetファイルの合流処理を開始中...")
+        try:
+            tf_folder_id = get_or_create_drive_folder(interval, settings.FOLDER_ID)
+            service = get_drive_service()
+            if not service:
+                raise ConnectionError("Google Driveサービスにアクセスできません。")
+
+            query = (
+                f"'{tf_folder_id}' in parents and name contains 'price_jp_' and name contains '.parquet' and "
+                f"not name contains '_diff_' and trashed=false"
+            )
+            drive_results = service.files().list(q=query, fields="files(id, name)").execute()
+            base_files = drive_results.get('files', [])
+
+            for b_file in base_files:
+                b_name = b_file['name']
+                local_path = os.path.join(settings.WORK_DIR, b_name)
+
+                dl_success = download_from_drive_api(b_name, local_path, parent_id=tf_folder_id)
+                if not dl_success or not os.path.exists(local_path):
+                    continue
+
+                try:
+                    df = pd.read_parquet(local_path)
+                    if df.empty or "ticker" not in df.columns:
+                        if os.path.exists(local_path): os.remove(local_path)
+                        continue
+
+                    mask_old = (df["ticker"] == old_t)
+                    if not mask_old.any():
+                        if os.path.exists(local_path): os.remove(local_path)
+                        continue
+
+                    old_rows = df[mask_old].copy()
+                    n_old = len(old_rows)
+
+                    # 新銘柄コードへ置換
+                    old_rows["ticker"] = new_t
+
+                    # 割当比率の反映（ratio != 1.0 の場合）
+                    if abs(scale_multiplier - 1.0) > 1e-5:
+                        price_cols = [c for c in ["open", "high", "low", "close"] if c in old_rows.columns]
+                        for p_col in price_cols:
+                            old_rows[p_col] = old_rows[p_col] * scale_multiplier
+                        if "volume" in old_rows.columns:
+                            old_rows["volume"] = old_rows["volume"] / scale_multiplier
+                        if "patched_multiplier" in old_rows.columns:
+                            old_rows["patched_multiplier"] = old_rows["patched_multiplier"] * scale_multiplier
+
+                    # 既存ファイル内の新銘柄データ（もしあれば）と結合・重複排除
+                    df_remaining = df[~mask_old].copy()
+                    df_combined = pd.concat([df_remaining, old_rows], ignore_index=True)
+                    df_combined = df_combined.drop_duplicates(subset=["date", "ticker"], keep="last")
+                    df_combined = df_combined.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+                    # ローカル書き出し＆アップロード
+                    table = pa.Table.from_pandas(df_combined, preserve_index=False)
+                    pq.write_table(table, local_path, use_dictionary=False, compression="SNAPPY")
+
+                    up_success, up_msg = upload_to_drive_api(b_name, local_path, parent_id=tf_folder_id)
+                    if up_success:
+                        migrated_files_count += 1
+                        total_migrated_records += n_old
+                        log(f"  ✅ [{b_name}] {old_t} ➔ {new_t} 合流完了 ({n_old:,} 件)")
+
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+
+                except Exception as ex_p:
+                    log(f"  ❌ [{b_name}] パース・合流エラー: {ex_p}", level="error")
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+
+            clear_local_parquet_cache(interval=interval, is_jp=True)
+
+        except Exception as e_tf:
+            log(f"❌ 【{interval}】合流処理中に例外: {e_tf}", level="error")
+
+    # ── 2. 台帳 (ledger_jp_*.json) の引き継ぎ ──
+    for interval in timeframes:
+        try:
+            ledger = load_price_db_ledger(interval, is_jp=True, is_raw=False)
+            updates_map = ledger.get("last_updates_map", {})
+            if old_t in updates_map:
+                old_val = updates_map[old_t]
+                new_val = updates_map.get(new_t)
+                # 新しい方の日時を採用
+                if new_val:
+                    updates_map[new_t] = max(old_val, new_val)
+                else:
+                    updates_map[new_t] = old_val
+                save_price_db_ledger(ledger, interval, is_jp=True, is_raw=False)
+                log(f"  📖 [{interval}] 台帳の最終更新日時を引き継ぎました ({new_t} = {updates_map[new_t]})")
+        except Exception as e_led:
+            log(f"⚠️ 台帳引き継ぎ警告 ({interval}): {e_led}")
+
+    # ── 3. Google Sheets 各シート内の銘柄コード自動置換 ──
+    try:
+        sh = get_sector_spreadsheet()
+        if sh:
+            target_sheets = [
+                settings.WATCHLIST_SHEET_NAME,
+                "topix500",
+                "sector_JP",
+                settings.EXTRA_TICKERS_SHEET,
+                getattr(settings, "HOLDINGS_SHEET_NAME", "my_holdings")
+            ]
+            for s_title in target_sheets:
+                try:
+                    ws = sh.worksheet(s_title)
+                    vals = ws.get_all_values()
+                    if vals and len(vals) > 1:
+                        replaced = False
+                        new_vals = []
+                        for row in vals:
+                            new_row = []
+                            for cell in row:
+                                if str(cell).strip().upper() == old_t:
+                                    new_row.append(new_t)
+                                    replaced = True
+                                else:
+                                    new_row.append(cell)
+                            new_vals.append(new_row)
+                        if replaced:
+                            ws.clear()
+                            ws.update(values=new_vals, range_name="A1")
+                            log(f"  📝 スプレッドシート [{s_title}] 内の '{old_t}' を '{new_t}' に自動置換しました。")
+                except Exception:
+                    pass
+    except Exception as e_sheet:
+        log(f"⚠️ スプレッドシート置換中に警告: {e_sheet}")
+
+    # ── 4. 監査ログの記録 (repair_log) ──
+    try:
+        repair_log_rows = [{
+            "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ticker": f"{old_t}->{new_t}",
+            "market": "JP",
+            "cliff_date": datetime.now().strftime("%Y-%m-%d"),
+            "interval": "all",
+            "before_close": "",
+            "after_close": "",
+            "multiplier": ratio,
+            "memo": f"単独株式移転に伴うデータ継承 ({old_t} -> {new_t}, 比率:{ratio})",
+        }]
+        save_repair_log_to_sheets(repair_log_rows)
+        log("📝 repair_log シートへデータ継承の監査ログを保存しました。")
+    except Exception as e_log:
+        log(f"⚠️ 監査ログ記録失敗: {e_log}")
+
+    # ── 5. 全キャッシュクリア ──
+    clear_local_parquet_cache(is_jp=True)
+    try:
+        import streamlit as st
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+    summary_msg = f"🎉 銘柄データ継承完了: {old_t} ➔ {new_t} （合流ファイル: {migrated_files_count}件 / 累計レコード: {total_migrated_records:,}行）"
+    log(summary_msg)
+
+    return {
+        "success": True,
+        "old_ticker": old_t,
+        "new_ticker": new_t,
+        "migrated_files": migrated_files_count,
+        "migrated_records": total_migrated_records,
+        "message": summary_msg
+    }

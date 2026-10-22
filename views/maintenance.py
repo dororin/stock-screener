@@ -49,6 +49,12 @@ from core.us_price_corrector import (
     scan_and_diagnose_cliffs_with_tv,
     apply_bulk_selected_patches
 )
+from core.jp_price_corrector import (
+    scan_jp_anomalies_with_yfinance,
+    apply_jp_patch_to_all_timeframes,
+    execute_ticker_migration
+)
+from utils.ui_components import card_container
 
 # ── 日足の最新更新日の簡易取得 ──
 @st.cache_data(ttl=60)
@@ -194,16 +200,16 @@ def render_etf_manager():
 # ── 🔄 ETF構成銘柄の同期 ──
 @st.fragment
 def render_sync_etf_master_ui(is_jp: bool):
-    st.subheader("🔄 ETFセクター構成の同期（スプレッドシート連動）")
-    st.caption("JPX公式上場企業マスタおよび各社ETFの最新構成銘柄を自動取得し、スプレッドシートを更新します。")
+    st.subheader("🔄 ETFセクター構成・TOPIX500の同期（統合マスター連動）")
+    st.caption("TradingViewのリアルタイム上場情報およびJPX規模区分を合流した統合マスターをもとに、スプレッドシートを更新します。")
 
     if "etf_sync_result_data" not in st.session_state:
         st.session_state["etf_sync_result_data"] = None
     if "etf_sync_error_msg" not in st.session_state:
         st.session_state["etf_sync_error_msg"] = None
 
-    if st.button("🚀 ETF構成銘柄を同期する", key="btn_sync_etf_master", use_container_width=True, type="primary"):
-        with st.spinner("スプレッドシートおよび構成銘柄マスタを更新中..."):
+    if st.button("🚀 ETF構成銘柄およびTOPIX500を同期する", key="btn_sync_etf_master", use_container_width=True, type="primary"):
+        with st.spinner("統合マスターおよびスプレッドシートを更新中..."):
             try:
                 from data_access.sheets_api import sync_etf_sectors_consolidated
                 results = sync_etf_sectors_consolidated(is_jp=is_jp)
@@ -751,7 +757,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
 
     col_btn1, col_btn2 = st.columns([3, 1])
     with col_btn1:
-        # 💡 ボタン押下時に直接スキャンを実行（無駄なst.rerunによるStreamlitAPIExceptionを根絶）
         if st.button(
             "🔍 日本株 統合段差スキャンを実行",
             key="btn_jp_split_scan",
@@ -765,7 +770,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
                     st.write(msg)
 
                 try:
-                    from core.jp_price_corrector import scan_jp_anomalies_with_yfinance
                     scan_df = scan_jp_anomalies_with_yfinance(
                         status_callback=on_scan_progress,
                         force_reload=jp_scan_force_reload
@@ -782,7 +786,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
                 st.session_state["jp_split_scan_result"] = None
                 st.rerun()
 
-    # 💡 スキャン結果が存在する場合のみテーブルを展開
     result_df = st.session_state.get("jp_split_scan_result")
     if result_df is None:
         return
@@ -834,8 +837,6 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
         st.session_state["jp_patch_run_logs"] = []
         status_box = st.status("📡 日本株一括修復パッチを実行中...", expanded=True)
         with status_box:
-            from core.jp_price_corrector import apply_jp_patch_to_all_timeframes
-
             grouped = {}
             for idx, r in selected_rows.iterrows():
                 orig = result_df.loc[idx]
@@ -885,13 +886,11 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
 
             status_box.update(label=f"🎉 完了：{repaired_count}銘柄を一括修復しました。", state="complete")
             
-            # キャッシュをクリア
             if "jp_split_scan_result" in st.session_state:
                 del st.session_state["jp_split_scan_result"]
             clear_local_parquet_cache(is_jp=True)
             st.cache_data.clear()
 
-    # 💡 処理完了ログが残っている場合は、ユーザーが閉じるまで常時表示
     if st.session_state.get("jp_patch_run_logs"):
         with st.expander("📝 日本株パッチ適用 実行ログ詳細", expanded=True):
             st.code("\n".join(st.session_state["jp_patch_run_logs"]), language="text")
@@ -900,6 +899,89 @@ def render_jp_split_scan_and_repair_ui(is_jp: bool):
                 st.rerun()
 
 
+# ─── 🔄 【新設】日本株専用：銘柄コード・過去データ継承ツール ───
+@st.fragment
+def render_jp_ticker_migration_ui(is_jp: bool):
+    if not is_jp:
+        return
+
+    st.divider()
+    st.subheader("🔄 銘柄コード・過去データ継承ツール (単独株式移転・持株会社化)")
+    st.write(
+        "持株会社化などに伴う銘柄コード変更（例：九州電力 `9508` ➔ キューデンHD `642A`）の際、"
+        "旧銘柄の全時間足（1d/60m/5m/1m）の過去データを新銘柄コードへ安全に合流・引き継ぎます。\n\n"
+        "実行すると、Parquetファイル内の過去データ合流、台帳（ledger）の更新、"
+        "およびGoogle Sheets（topix500, sector_JP, extra_tickers, watchlist, my_holdings）内のコード置換が一括で完了します。"
+    )
+
+    if "migration_logs_list" not in st.session_state:
+        st.session_state["migration_logs_list"] = []
+
+    with card_container(border=True):
+        col_m1, col_m2, col_m3 = st.columns([2, 2, 1.5])
+        with col_m1:
+            mig_old = st.text_input("旧銘柄コード", placeholder="例: 9508", key="mig_old_input").strip().upper()
+        with col_m2:
+            mig_new = st.text_input("新銘柄コード", placeholder="例: 642A", key="mig_new_input").strip().upper()
+        with col_m3:
+            mig_ratio_str = st.text_input("割当比率", value="1.0", help="通常は1.0。旧1株に対して新株が2株なら2.0", key="mig_ratio_input").strip()
+
+        col_chk, col_btn = st.columns([3, 2])
+        with col_chk:
+            mig_confirm = st.checkbox(
+                "⚠️ 実行内容および対象銘柄を確認しました（安全ロック）", 
+                value=False, 
+                key="chk_mig_confirm"
+            )
+        with col_btn:
+            btn_exec_migration = st.button(
+                "🚀 過去データを新銘柄へ安全に合流・継承する",
+                key="btn_exec_migration",
+                type="primary",
+                disabled=not (mig_old and mig_new and mig_confirm),
+                use_container_width=True
+            )
+
+    if btn_exec_migration:
+        st.session_state["migration_logs_list"] = []
+        try:
+            ratio_val = float(mig_ratio_str)
+            if ratio_val <= 0:
+                st.error("❌ 割当比率には 0 より大きい数値を指定してください。")
+                return
+        except ValueError:
+            st.error("❌ 割当比率は半角数値で入力してください。")
+            return
+
+        status_box = st.status(f"🔄 [{mig_old}] ➔ [{mig_new}] への過去データ継承・統合を実行中...", expanded=True)
+        with status_box:
+            def on_mig_status(msg):
+                st.write(msg)
+                st.session_state["migration_logs_list"].append(str(msg))
+
+            res = execute_ticker_migration(
+                old_ticker=mig_old,
+                new_ticker=mig_new,
+                ratio=ratio_val,
+                status_callback=on_mig_status
+            )
+
+            if res.get("success"):
+                status_box.update(label="🎉 過去データの継承・統合が正常に完了しました！", state="complete")
+                st.success(res.get("message"))
+            else:
+                status_box.update(label="❌ 継承処理中にエラーが発生しました", state="error")
+                st.error(res.get("message"))
+
+    if st.session_state.get("migration_logs_list"):
+        with st.expander("📝 データ継承 実行ログ詳細", expanded=True):
+            st.code("\n".join(st.session_state["migration_logs_list"]), language="text")
+            if st.button("🗑️ 実行ログを閉じる", key="btn_clear_mig_logs", use_container_width=True):
+                st.session_state["migration_logs_list"] = []
+                st.rerun()
+
+
+# ── 生データ確認インスペクター ──
 @st.fragment
 def render_parquet_data_inspector(is_jp: bool):
     st.divider()
@@ -949,7 +1031,7 @@ def render_parquet_data_inspector(is_jp: bool):
 
     inspect_ticker_raw = st.text_input(
         "銘柄コードを入力（1件指定）", 
-        placeholder="例: 7203 や AAPL", 
+        placeholder="例: 7203 や 642A", 
         key="inspect_ticker_input"
     ).strip()
 
@@ -1058,6 +1140,7 @@ if st.session_state["sync_logs_history"]:
 render_commit_verified_data_ui(is_jp)
 render_jp_manual_merge_center(is_jp)
 render_jp_split_scan_and_repair_ui(is_jp)
+render_jp_ticker_migration_ui(is_jp)  # 👈 新設コンポーネント配置
 render_sync_event_calendar_ui(is_jp)
 render_sync_etf_master_ui(is_jp)
 st.divider()

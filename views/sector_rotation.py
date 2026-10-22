@@ -47,14 +47,30 @@ if CUSTOM_SECTOR_KEY not in st.session_state:
     st.session_state[CUSTOM_SECTOR_KEY] = load_watchlist_from_sheets()
 
 # =====================================================================
-# 🏷️ 【東証全銘柄・日本語社名マスタ】
+# 🏷️ 【改修】東証全銘柄・日本語社名マスタ（stock_master 連携）
 # =====================================================================
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=3600)
 def get_all_stock_names_map(is_jp: bool = True) -> dict:
     name_map = {}
     if not is_jp:
         return name_map
 
+    # 1. 自律型統合マスター (stock_master) から最新社名を高速取得
+    try:
+        from core.stock_master import get_stock_master
+        df_master = get_stock_master()
+        if not df_master.empty and "symbol" in df_master.columns and "name" in df_master.columns:
+            for _, r in df_master.iterrows():
+                c = str(r["symbol"]).strip().upper()
+                n = str(r["name"]).strip()
+                if c and n and c not in ["CODE", "コード", "SYMBOL", "証券コード"]:
+                    name_map[c] = n
+            if name_map:
+                return name_map
+    except Exception as ex:
+        print(f"⚠️ [sector_rotation] stock_masterからの社名取得失敗、フォールバック実行: {ex}")
+
+    # 2. フォールバック: sector_JP シートからの取得
     try:
         from data_access.sheets_api import get_sector_spreadsheet
         sh = get_sector_spreadsheet()
@@ -72,39 +88,6 @@ def get_all_stock_names_map(is_jp: bool = True) -> dict:
                             m = str(row[memo_idx]).strip()
                             if c and m:
                                 name_map[c] = m
-    except Exception:
-        pass
-
-    try:
-        jpx_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xls")
-        need_download = not os.path.exists(jpx_path)
-        if not need_download:
-            file_age_days = (time.time() - os.path.getmtime(jpx_path)) / 86400.0
-            if file_age_days > 7.0:
-                need_download = True
-
-        if need_download:
-            try:
-                import requests
-                headers = {"User-Agent": "Mozilla/5.0"}
-                resp = requests.get(settings.JPX_URL, headers=headers, timeout=10)
-                if resp.status_code == 200 and len(resp.content) > 10000:
-                    with open(jpx_path, "wb") as f:
-                        f.write(resp.content)
-            except Exception:
-                pass
-
-        if os.path.exists(jpx_path):
-            df_full = pd.read_excel(jpx_path)
-            if df_full.shape[1] >= 3:
-                for _, r in df_full.iterrows():
-                    code_raw = str(r.iloc[1]).strip()
-                    if code_raw.endswith(".0"):
-                        code_raw = code_raw[:-2]
-                    code_clean = code_raw.upper()
-                    name_raw = str(r.iloc[2]).strip()
-                    if code_clean and name_raw and code_clean not in ["CODE", "コード", "SYMBOL", "証券コード"]:
-                        name_map[code_clean] = name_raw
     except Exception:
         pass
 
@@ -157,7 +140,7 @@ def show_constituents_dialog(
                 # 指定期間（period_days）でスライス
                 df_display = df_calc[df_calc["date"] >= display_start].copy().reset_index(drop=True) if not df_calc.empty else pd.DataFrame()
                 
-                # 💡 スライス後のdf_displayからbb_dictを生成することで、X軸の期間が完全に一致
+                # スライス後のdf_displayからbb_dictを生成
                 bb_dict = extract_bb_dict(df_display)
 
                 wvf_badge_html = build_wvf_badge_html(wvf_summary)
@@ -205,7 +188,7 @@ def render_watchlist_editor_fragment():
     
     search_query = st.text_input(
         "銘柄コード・名前で検索",
-        placeholder="例: 7203 / トヨタ / 三菱",
+        placeholder="例: 7203 / トヨタ / キューデン / 642A",
         key="watch_search_input"
     )
     q = search_query.strip() if search_query else ""
@@ -213,8 +196,8 @@ def render_watchlist_editor_fragment():
     if len(q) >= 2:
         jpx_df = get_jpx_full_list()
         if jpx_df.empty:
-            st.caption("⚠️ JPXリスト取得失敗。コードを直接入力してください。")
-            if q.isdigit():
+            st.caption("⚠️ リスト取得失敗。コードを直接入力してください。")
+            if q.isalnum():
                 if st.button(f"➕ {q} を追加", key="btn_add_direct", use_container_width=True):
                     st.session_state[CUSTOM_SECTOR_KEY][q] = q
                     save_watchlist_to_sheets(st.session_state[CUSTOM_SECTOR_KEY])
@@ -223,7 +206,7 @@ def render_watchlist_editor_fragment():
         else:
             mask = (
                 jpx_df["name"].str.contains(q, na=False, case=False) |
-                jpx_df["symbol"].str.contains(q, na=False)
+                jpx_df["symbol"].str.contains(q, na=False, case=False)
             )
             found = jpx_df[mask].head(8)
             if not found.empty:
@@ -251,8 +234,8 @@ def render_watchlist_editor_fragment():
                     else:
                         st.caption(f"✅ {sel_code} はすでに登録済みです")
             else:
-                st.caption(f"「{q}」の候補なし（TOPIX500内で検索中）")
-                if q.isdigit():
+                st.caption(f"「{q}」の候補なし")
+                if q.isalnum():
                     if st.button(f"➕ {q} をコードとして追加", key="btn_add_direct_num", use_container_width=True):
                         st.session_state[CUSTOM_SECTOR_KEY][q] = q
                         save_watchlist_to_sheets(st.session_state[CUSTOM_SECTOR_KEY])
@@ -374,7 +357,6 @@ def render_overlay_chart_fragment(is_jp: bool):
 def _format_sector_title(title: str, max_chars: int = 15) -> str:
     """タイトルが長すぎる場合にスマートに短縮・省略します。"""
     t = str(title).strip()
-    # 頻出する冗長な名称の省略
     t = t.replace("NEXT FUNDS ", "NF ").replace("NEXT FUNDS", "NF")
     t = t.replace("iシェアーズ・コア ", "iSコア ").replace("上場投信", "")
     t = t.strip()
@@ -385,10 +367,8 @@ def _format_sector_title(title: str, max_chars: int = 15) -> str:
 
 @st.fragment
 def render_sector_mini_charts_fragment(is_jp: bool):
-    # 💡 セクターヘッダー用：枠なしスリムボタンスタイル注入
     st.markdown("""
     <style>
-    /* セクターカード用枠なしボタンスタイル */
     div[data-testid="stColumn"] button[kind="tertiary"] {
         padding: 0px 4px !important;
         border: none !important;
@@ -485,7 +465,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                         badge_e = "🟢" if etf_mom >= 0 else "🔴"
                         color_e = "#26a69a" if etf_mom >= 0 else "#ef5350"
 
-                        # 💡 枠なしスリムヘッダー配置（左: 枠なしタイトル / 中: 騰落率 / 右: ×ボタン）
                         h_col1, h_col2, h_col3 = st.columns([3.6, 1.1, 0.4])
 
                         with h_col1:
@@ -566,7 +545,6 @@ def render_sector_mini_charts_fragment(is_jp: bool):
                             badge_t = "🟢" if last_ret >= 0 else "🔴"
                             color_t = "#26a69a" if last_ret >= 0 else "#ef5350"
 
-                            # 💡 枠なしスリムヘッダー配置（左: 枠なしタイトル / 中: 騰落率 / 右: ×ボタン）
                             h_col1, h_col2, h_col3 = st.columns([3.6, 1.1, 0.4])
 
                             with h_col1:

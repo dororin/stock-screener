@@ -596,7 +596,17 @@ ETF_MASTER_COLUMNS = ["ETFコード", "セクター名", "フィルターポリ�
 SECTOR_JP_COLUMNS = ["セクター名", "銘柄コード", "備考", "ETFコード"]
 TOPIX500_OUT_COLUMNS = ["銘柄コード", "銘柄名", "規模区分"]
 
+# =====================================================================
+# 🔄 【改修】ETFセクター構成・TOPIX500自律統合同期
+# =====================================================================
 def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
+    """
+    統合マスター（core.stock_master）を起点として、
+    1. 'topix500' シートの完全同期（新銘柄・持株会社化の救済を含む）
+    2. 各社ETF構成銘柄のダウンロード＆規模区分フィルター適用
+    3. 'sector_JP' シートの更新および脱落銘柄の自動退避・上場廃止パージ
+    を一括実行します。
+    """
     sh = get_sector_spreadsheet()
     if sh is None:
         return {"error": "スプレッドシートを開けませんでした。"}
@@ -637,94 +647,43 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
 
     sync_results = {}
 
+    # ─── 🚀 【新方式】統合マスター (core.stock_master) から情報を取得 ───
     jpx_name_map = {}
+    scale_map = {}
+    active_jpx_set = set()
+
     if is_jp:
-        import requests
-        import io
-        import traceback
         try:
-            print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] JPX公式サイトから全上場銘柄マスタをダウンロード中... URL={settings.JPX_URL}")
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
-            }
-            resp = requests.get(settings.JPX_URL, headers=headers, timeout=15)
-            status = resp.status_code
-            content_len = len(resp.content) if resp.content else 0
-            content_type = resp.headers.get("Content-Type", "unknown")
-            print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] JPXレスポンス: status={status}, Content-Type={content_type}, サイズ={content_len:,} bytes")
-            
-            df_jpx = None
-            if status == 200 and content_len > 10000:
-                for eng in ["openpyxl", None, "xlrd"]:
-                    try:
-                        df_jpx = pd.read_excel(io.BytesIO(resp.content), engine=eng)
-                        if df_jpx is not None and not df_jpx.empty:
-                            print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] pd.read_excel 成功 (エンジン: {eng or 'default'}, 形状: {df_jpx.shape})")
-                            break
-                    except Exception as e_engine:
-                        print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] pd.read_excel 失敗 (エンジン: {eng or 'default'}): {e_engine}")
-                        continue
-                        
-                jpx_cache_path = os.path.join(settings.DRIVE_DIR, "jpx_stock_list_raw.xlsx")
-                try:
-                    os.makedirs(os.path.dirname(jpx_cache_path), exist_ok=True)
-                    with open(jpx_cache_path, "wb") as f:
-                        f.write(resp.content)
-                    print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] JPXファイルキャッシュ保存完了: {jpx_cache_path}")
-                except Exception as e_save:
-                    print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ⚠️ JPXキャッシュ保存失敗: {e_save}")
-            else:
-                reason = f"status={status}" if status != 200 else f"サイズ不足({content_len:,} bytes)"
-                print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ⚠️ JPXダウンロード失敗判定: {reason}")
-                if content_len > 0:
-                    print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] レスポンス冒頭: {resp.text[:250]}")
+            from core.stock_master import get_stock_master
+            print("[CONSOLE_DEBUG] [SHEETS_SYNC] 自律型統合マスター (stock_master) を構築・再読み込み中...")
+            df_master = get_stock_master(force_reload=True)
 
-            if df_jpx is not None and not df_jpx.empty and df_jpx.shape[1] >= 3:
-                for _, row_jpx in df_jpx.iterrows():
-                    c_raw = str(row_jpx.iloc[1]).strip()
-                    if c_raw.endswith(".0"):
-                        c_raw = c_raw[:-2]
-                    c_clean = c_raw.upper()
-                    n_raw = str(row_jpx.iloc[2]).strip()
-                    if c_clean and n_raw and c_clean not in ["CODE", "コード", "SYMBOL", "証券コード"]:
-                        jpx_name_map[c_clean] = n_raw
+            if not df_master.empty:
+                # 辞書マッピングの生成
+                for _, r_m in df_master.iterrows():
+                    sym_c = str(r_m["symbol"]).strip().upper()
+                    n_c = str(r_m["name"]).strip()
+                    s_c = str(r_m["scale_type"]).strip()
+                    jpx_name_map[sym_c] = n_c
+                    scale_map[sym_c] = s_c
+                    if bool(r_m.get("is_active", True)):
+                        active_jpx_set.add(sym_c)
 
-                print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ✅ JPX日本語社名マスタ構築完了: {len(jpx_name_map):,} 銘柄")
-
-                df_scale = df_jpx.iloc[:, [1, 2, 9]].copy()
-                df_scale.columns = ['symbol', 'name', 'scale_type']
-                target_scales = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
-                
-                topix500_df = df_scale[df_scale['scale_type'].isin(target_scales)].copy()
-                
-                def clean_symbol(val):
-                    if pd.isna(val):
-                        return ""
-                    val_str = str(val).strip()
-                    if val_str.endswith(".0"):
-                        val_str = val_str[:-2]
-                    return val_str
-
-                topix500_df['symbol'] = topix500_df['symbol'].apply(clean_symbol)
-                topix500_df = topix500_df[topix500_df['symbol'].str.match(r'^[0-9A-Za-z]{4}$')].copy()
-                topix500_df['symbol'] = topix500_df['symbol'].str.upper()
-                topix500_df = topix500_df.fillna("")
-                
+                # 1. 'topix500' シートの更新（時価総額セーフティネット救済銘柄を含む）
+                topix500_df = df_master[df_master["is_topix500"] == True].copy()
                 topix500_values = [TOPIX500_OUT_COLUMNS]
                 for _, r in topix500_df.iterrows():
                     topix500_values.append([r['symbol'], r['name'], r['scale_type']])
-                
+
                 ws_topix500.clear()
                 ws_topix500.update(topix500_values, "A1")
-                sync_results["TOPIX500 (JPX)"] = f"同期成功 ({len(topix500_df)}銘柄を 'topix500' シートへ保存完了)"
+                sync_results["TOPIX500 (統合マスター)"] = f"同期成功 ({len(topix500_df)}銘柄を 'topix500' シートへ保存完了)"
+                print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ✅ topix500 シート更新完了: {len(topix500_df)} 銘柄")
             else:
-                fail_detail = f"status={resp.status_code}, size={len(resp.content):,} bytes" if 'resp' in locals() else "不明"
-                sync_results["TOPIX500 (JPX)"] = f"⚠️ JPXダウンロードまたはパースに失敗しました ({fail_detail})"
-        except Exception as e:
-            print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ❌ JPX自動取得例外: {e}\n{traceback.format_exc()}")
-            sync_results["TOPIX500 (JPX)"] = f"❌ JPX自動取得中にエラー: {e}"
+                sync_results["TOPIX500 (統合マスター)"] = "⚠️ 統合マスターが空でした。"
+        except Exception as e_master:
+            print(f"[CONSOLE_DEBUG] [SHEETS_SYNC] ❌ 統合マスター取得例外: {e_master}")
+            sync_results["TOPIX500 (統合マスター)"] = f"❌ 統合マスター取得エラー: {e_master}"
 
     master_values = ws_master.get_all_values()
     if not master_values or len(master_values) < 2:
@@ -754,8 +713,7 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
                     "fund_val": fund_val
                 })
                 
-    from core.collector import fetch_etf_constituents, get_jpx_scale_map
-    scale_map = get_jpx_scale_map()
+    from core.collector import fetch_etf_constituents
     
     auto_rows = []
     downloaded_cache = {}
@@ -864,9 +822,6 @@ def sync_etf_sectors_consolidated(is_jp: bool = True) -> dict:
     # ── [新設] 既存 sector_JP からの脱落銘柄検知 & 自動退避・上場廃止パージ ──
     if is_jp:
         try:
-            from core.collector import get_jpx_truly_all_symbols
-            active_jpx_set = get_jpx_truly_all_symbols()
-
             # 1. 同期前の sector_JP の登録コード一覧
             old_sector_codes = set()
             old_sector_records = ws_out.get_all_values()

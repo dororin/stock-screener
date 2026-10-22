@@ -9,7 +9,23 @@ from config import settings
 
 @st.cache_data(ttl=86400)
 def get_jpx_list() -> pd.DataFrame:
-    """規模区分に基づくスクリーニング基礎銘柄マスタをJPXからDL取得します。失敗時は即座に例外を送出します。"""
+    """
+    規模区分に基づくスクリーニング基礎銘柄マスタ（TOPIX500対象）を取得します。
+    自律型統合マスター（stock_master）から即時取得します。
+    """
+    try:
+        from core.stock_master import get_stock_master
+        df_master = get_stock_master()
+        if not df_master.empty and "is_topix500" in df_master.columns:
+            active_mask = (df_master["is_active"] == True) if "is_active" in df_master.columns else True
+            topix500_df = df_master[(df_master["is_topix500"] == True) & active_mask][["symbol", "name"]].copy()
+            if not topix500_df.empty:
+                topix500_df["symbol"] = topix500_df["symbol"].astype(str).str.strip().str.upper()
+                return topix500_df.reset_index(drop=True)
+    except Exception as ex:
+        print(f"⚠️ [screener] stock_masterからのTOPIX500リスト取得失敗、ファイルへフォールバック: {ex}")
+
+    # フォールバック（従来処理）
     url = getattr(settings, "JPX_URL", "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx")
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -17,32 +33,43 @@ def get_jpx_list() -> pd.DataFrame:
     }
     
     resp = requests.get(url, headers=headers, timeout=15)
-    if resp.status_code != 200:
-        raise RuntimeError(f"JPX銘柄リストのダウンロードに失敗しました (HTTP {resp.status_code}): {url}")
-    
-    if len(resp.content) < 10000:
-        raise RuntimeError(f"JPXから取得したファイルサイズが不正です ({len(resp.content)} bytes): {url}")
+    if resp.status_code != 200 or len(resp.content) < 10000:
+        return pd.DataFrame(columns=['symbol', 'name'])
 
     df = pd.read_excel(io.BytesIO(resp.content))
     if df.shape[1] < 10:
-        raise ValueError(f"JPX Excelデータの列数が不足しています (列数: {df.shape[1]} < 10)")
+        return pd.DataFrame(columns=['symbol', 'name'])
 
-    # 1: コード, 2: 銘柄名, 3: 市場・商品区分, 9: 規模区分
     scale_col_name = df.columns[9]
     target = ['TOPIX Core30', 'TOPIX Large70', 'TOPIX Mid400']
     
     df_filtered = df[df[scale_col_name].isin(target)].iloc[:, [1, 2]].copy()
     df_filtered.columns = ['symbol', 'name']
-    df_filtered['symbol'] = pd.to_numeric(df_filtered['symbol'], errors='coerce')
+    df_filtered['symbol'] = df_filtered['symbol'].astype(str).str.strip().str.split('.').str[0].str.upper()
     df_filtered = df_filtered.dropna(subset=['symbol'])
-    df_filtered['symbol'] = df_filtered['symbol'].astype(int).astype(str)
     
     return df_filtered.reset_index(drop=True)
 
 
 @st.cache_data(ttl=86400)
 def get_jpx_full_list() -> pd.DataFrame:
-    """ETFやCore/Large/Midすべてのティッカー情報が内包された完全マスタを取得します。失敗時は即座に例外を送出します。"""
+    """
+    ETFや全上場銘柄のティッカー情報が内包された完全マスタを取得します（検索サジェスト用）。
+    自律型統合マスター（stock_master）から即時取得します。
+    """
+    try:
+        from core.stock_master import get_stock_master
+        df_master = get_stock_master()
+        if not df_master.empty and "symbol" in df_master.columns and "name" in df_master.columns:
+            active_mask = (df_master["is_active"] == True) if "is_active" in df_master.columns else True
+            full_df = df_master[active_mask][["symbol", "name"]].copy()
+            if not full_df.empty:
+                full_df["symbol"] = full_df["symbol"].astype(str).str.strip().str.upper()
+                return full_df.drop_duplicates(subset=["symbol"]).reset_index(drop=True)
+    except Exception as ex:
+        print(f"⚠️ [screener] stock_masterからの全銘柄リスト取得失敗、ファイルへフォールバック: {ex}")
+
+    # フォールバック（従来処理）
     url = getattr(settings, "JPX_URL", "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx")
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -50,15 +77,12 @@ def get_jpx_full_list() -> pd.DataFrame:
     }
     
     resp = requests.get(url, headers=headers, timeout=15)
-    if resp.status_code != 200:
-        raise RuntimeError(f"JPX銘柄リストのダウンロードに失敗しました (HTTP {resp.status_code}): {url}")
-    
-    if len(resp.content) < 10000:
-        raise RuntimeError(f"JPXから取得したファイルサイズが不正です ({len(resp.content)} bytes): {url}")
+    if resp.status_code != 200 or len(resp.content) < 10000:
+        return pd.DataFrame(columns=['symbol', 'name'])
 
     df_full = pd.read_excel(io.BytesIO(resp.content))
     if df_full.shape[1] < 10:
-        raise ValueError(f"JPX Excelデータの列数が不足しています (列数: {df_full.shape[1]} < 10)")
+        return pd.DataFrame(columns=['symbol', 'name'])
 
     df_scale = df_full.iloc[:, [1, 2, 9]].copy()
     df_scale.columns = ['symbol', 'name', 'scale_type']
@@ -70,9 +94,8 @@ def get_jpx_full_list() -> pd.DataFrame:
     etf = df_market[df_market['market'] == 'ETF・ETN'][['symbol', 'name']]
     
     combined = pd.concat([topix, etf]).drop_duplicates(subset=['symbol'])
-    combined['symbol'] = pd.to_numeric(combined['symbol'], errors='coerce')
+    combined['symbol'] = combined['symbol'].astype(str).str.strip().str.split('.').str[0].str.upper()
     combined = combined.dropna(subset=['symbol'])
-    combined['symbol'] = combined['symbol'].astype(int).astype(str)
     
     return combined.reset_index(drop=True)
 
